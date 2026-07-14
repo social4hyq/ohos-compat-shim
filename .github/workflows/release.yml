@@ -1,0 +1,111 @@
+name: Release
+
+# Fully cloud-built: no Homebrew formula, no self-hosted build runner. A
+# GitHub-hosted x86 runner cross-compiles libohos_compat.so with the OHOS
+# NDK clang and self-signs it with ohos-bst-light's self-sign.py (the
+# device-only binary-sign-tool/ohos-signpost don't run on a stock cloud
+# runner). Only the smoke-test step needs a real HarmonyOS device, since
+# the cloud runner can't execute an OHOS binary itself — that step gates
+# both the GitHub Release and the npm publish.
+
+on:
+  release:
+    types: [created, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build aarch64-unknown-linux-ohos
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup OpenHarmony SDK
+        uses: Boshen/setup-ohos-sdk@edb865a89a712f1f15dbad932dfa9cfce849d95c # v1.0.0
+
+      - name: Build libohos_compat.so + smoke test binary
+        run: |
+          CLANG="${OHOS_SDK_NATIVE}/llvm/bin/clang --target=aarch64-linux-ohos --sysroot=${OHOS_SDK_NATIVE}/sysroot"
+          $CLANG -O2 -g -Wall -Wextra -shared -fPIC src/ohos_compat_shim.c -o libohos_compat.so -ldl
+          $CLANG -O2 -g -Wall -Wextra test/smoke.c -o smoke -ldl
+          file libohos_compat.so smoke
+
+      - name: Self-sign both artifacts
+        run: |
+          python3 scripts/ohos/self-sign.py libohos_compat.so
+          python3 scripts/ohos/self-sign.py smoke
+          chmod +x libohos_compat.so smoke
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ohos-compat-shim-aarch64-unknown-linux-ohos
+          path: |
+            libohos_compat.so
+            smoke
+
+  smoke-test:
+    name: Real-device smoke test
+    needs: build
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ohos-compat-shim-aarch64-unknown-linux-ohos
+
+      - name: Baseline (no shim) — expected to show the known HM sandbox failures
+        run: |
+          chmod +x ./smoke
+          ./smoke || true
+
+      - name: With LD_PRELOAD — all three checks must pass
+        run: |
+          LD_PRELOAD="$(pwd)/libohos_compat.so" ./smoke
+
+  release:
+    needs: [build, smoke-test]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ohos-compat-shim-aarch64-unknown-linux-ohos
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: libohos_compat.so
+          fail_on_unmatched_files: true
+
+  publish-npm:
+    name: Publish @ohos-ports/compat-shim
+    needs: [build, smoke-test]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ohos-compat-shim-aarch64-unknown-linux-ohos
+          path: lib
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+
+      - name: Prune smoke test binary from the npm payload
+        run: rm -f lib/smoke
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish

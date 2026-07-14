@@ -1,0 +1,11 @@
+# Build artifacts (local make; CI builds fresh via release.yml)
+*.so
+test/smoke
+test/functional
+test/bench
+test/real_vs_fallback
+lib/
+
+# Editor/tool caches
+.arts/
+node_modules/

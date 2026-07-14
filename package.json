@@ -1,0 +1,41 @@
+{
+	"name": "@ohos-ports/compat-shim",
+	"version": "0.1.0",
+	"description": "LD_PRELOAD compatibility shim for HarmonyOS-sandboxed aarch64/musl binaries — close_range, getpwuid_r, tmpfile, getcwd fallbacks with no source-level rebuild required",
+	"main": "index.js",
+	"types": "index.d.ts",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/social4hyq/ohos-compat-shim.git"
+	},
+	"homepage": "https://github.com/social4hyq/ohos-compat-shim#readme",
+	"bugs": {
+		"url": "https://github.com/social4hyq/ohos-compat-shim/issues"
+	},
+	"license": "MIT",
+	"keywords": [
+		"harmonyos",
+		"openharmony",
+		"ohos",
+		"ld_preload",
+		"close_range",
+		"musl",
+		"compat",
+		"shim",
+		"sandbox"
+	],
+	"os": ["linux"],
+	"cpu": ["arm64"],
+	"files": [
+		"index.js",
+		"index.d.ts",
+		"lib/libohos_compat.so",
+		"src/ohos_compat_shim.c",
+		"README.md",
+		"LICENSE"
+	],
+	"publishConfig": {
+		"access": "public"
+	}
+}
