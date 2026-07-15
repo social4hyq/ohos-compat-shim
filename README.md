@@ -11,7 +11,7 @@
 | `close_range()` / `syscall(SYS_close_range)` | `SIGSYS` —— 直接杀死进程 | 开启 |
 | `getpwuid_r()` | `rc=0, *result=NULL` —— Node 的 `os.userInfo()` 抛异常 | 开启 |
 | `tmpfile()` | 返回 `NULL`，`errno=EPERM` —— 沙箱内 `P_tmpdir` 不可写 | 开启 |
-| `getcwd()` | cwd 被删除后返回 `NULL`，`errno=ENOENT`（常见于生命周期脚本） | 开启 |
+| `getcwd()` | hmdfs/tmpfs 父目录缺 `+x` 时 `EACCES`，或 cwd 被 rmdir 后 `ENOENT`（常见于生命周期脚本、`bun run`） | 开启 |
 | `linkat()` / `symlinkat()` | 沙箱化的安装目标目录里报 `EPERM`/`EACCES` | **关闭**（需手动开启）|
 | `syscall(SYS_fchmodat2)` | 真机 `SIGSYS`，OpenHarmony 容器里是 `ENOSYS` —— 两边都失败，但失败方式不同 | 开启 |
 
@@ -136,9 +136,12 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 - **`tmpfile`**（3 项检查）：完整的写入/读回往返、3 个同时存在的临时文件之间互不污染、以及连续 50 次打开+关闭循环全部不失败（对一个零参数函数来说， 这是最接近参数矩阵的东西）。
 - **`getcwd`**（5 项检查 + 1 项 info）：核心问题是「是不是真的无操作」——两种不同的调用方式（`getcwd(buf, size)` vs `getcwd(NULL, 0)`）在 cwd 没变的情况下必须返回逐字节一致的字符串。另外还有 `size=0` → `EINVAL`、 `size=1`（真实缓冲区）→ `ERANGE`、以及 `buf=NULL, size=1` 通过 musl 的 GNU 自动分配扩展成功（这三项都是对照这台设备*实际*的 libc 行为校准的，而不是 LTP 那种原始系统调用层面的预期，因为 shim 只拦截 libc 包装函数 —— 具体原因见代码注释）。还有一个不计分的 `INFO` 检查项，用来验证 cwd 被 rmdir 之后的 fallback 行为。
 - **`linkat`/`symlinkat`**（3 项检查）：此前**完全没有**覆盖 ——这是这轮排查里发现的最大缺口。`EEXIST` 会原样透传（对照 LTP `linkat02.c`）；在 `$TMPDIR` 里真实、当场复现出来的 `EACCES` （通过重跑 `ohos-preflight` 的 `g5_linkat_eperm` 探针、针对这个测试自己的 `$TMPDIR` 确认，不是模拟出来的条件）会触发 copy fallback，且内容正确； `symlinkat`（在这个 `$TMPDIR` 里不受限制）验证的是成功/无操作路径。
+- **bun 调用场景镜像**（8 项检查，跨 close_range/getcwd/linkat/symlinkat/fchmodat2 + symlink）：上面那些是按 LTP 通用语义校准的；这一组是对照 ohos-bun 源码里的**全部真实调用点**逐一补的——① `close_range(4, ~0U, CLOEXEC)` init 期 fd 泄漏防护（`bun_initialize_process`，跳过 stdio 0-2、对 ≥4 的 fd 设 `FD_CLOEXEC` 但保持打开）；② `close_range(3, ~0U, CLOEXEC)` spawn/reload 路径（`BunProcess.cpp` + `on_before_reload_process_linux`，fd 3 **也** CLOEXEC，与 init 的 first=4 区分）；③ `getcwd` 6 层深目录 `getcwd()==readlink("/proc/self/cwd")==构造路径"`；④ `linkat` 经 `/proc/self/fd/<N>` 物化 `O_TMPFILE`（npm `linkat_tmpfile` 无 CAP 回退路径）；⑤ `linkat(SRC_DIRFD, basename, DEST_DIRFD, path, 0)` dirfd 源+dirfd 目的（Hardlinker/PackageInstall hardlink 安装热路径，区别于 AT_FDCWD 绝对路径；基线确认此形状同样 EACCES，shim 的 openat(dirfd) 解析确实被触发）；⑥ `symlinkat` 相对 target 按 `newdirfd` 解析（验证 `open→openat(newdirfd)` 修复；本设备 symlinkat 不受 EPERM 限制，故测 fix 依赖的解析机制本身）；⑦ `symlink(target, link)` 2-arg（bun `--bun` 造假 node 可执行 `lib.rs:702`；**shim 不 hook symlink 这个符号**——测试确认它在 OHOS 上可用，故无需 hook，若受限则在此暴露缺口）；⑧ `fchmodat2` 经 `syscall()` 入口 + `AT_SYMLINK_NOFOLLOW`（bun `lchmod` 唯一调用点，shim 丢弃 flag 走 `fchmodat` 回退）。
 - **透传检查**（2 项）：`getpid()` 对比 `syscall(SYS_getpid)`，以及一次管道读写往返 —— 用来证明拦截全局 `syscall()` 符号来处理 `close_range` 不会干扰其它无关的系统调用。
 
-最近一次真机运行（显式用 `env -u LD_PRELOAD` / `env LD_PRELOAD=...`，而不是依赖 shell 环境状态）：**加了 shim 之后 23/23 项计分检查全部通过**（`ALL PASS (0/23 checks failed)`）。真正的基线（无 shim）下，`4/21` 项计分检查失败（`getpwuid_r` 的 `ERANGE`、3 处 `tmpfile`——和文档记录的沙箱症状完全吻合），另外 3 项报告 `INFO` 而不贡献通过/失败（`getcwd_unlinked`——没有 shim 就没有 fallback 可测；`linkat_eacces_fallback`——确认 `EACCES` 这个怪癖确实会复现，没有东西可以拿来打分；`close_range` 无论参数如何都无条件 `SIGSYS`，所以它的 7 项检查加上 `CLOSE_RANGE_UNSHARE` 和新加的 `fchmodat2_applies_mode`，一共 9 项都报告 `INFO`，因为它们没有 shim 的保护根本没法跑完——见「已知平台行为」）；还有一项（`close_range_libc_fn`）报告 `SKIP`，因为不预加载的话这个符号根本不存在。每一项在基线下能有意义地跑起来的检查，要么通过（对应真实、可用的行为），要么精确地失败/报告文档里记录的那个症状 —— 没有意外情况。
+最近一次真机运行（显式用 `env -u LD_PRELOAD` / `env LD_PRELOAD=...`，而不是依赖 shell 环境状态）：**加了 shim 之后 32/32 项计分检查全部通过**（`ALL PASS (0/32 checks failed)`）。真正的基线（无 shim）下，`4/30` 项计分检查失败（`getpwuid_r` 的 `ERANGE`、3 处 `tmpfile`——和文档记录的沙箱症状完全吻合），另外若干项报告 `INFO` 而不贡献通过/失败（`linkat_eacces_fallback`、`linkat_bun_tmpfile`、`linkat_bun_dirfd`——确认 linkat 的 `EACCES` 怪癖在 AT_FDCWD 绝对路径、`/proc/self/fd`、dirfd 三种形状下都会复现，没有东西可以拿来打分；`close_range`/`fchmodat2` 无 shim 时无条件 `SIGSYS`，所以 close_range 的 9 项检查（含 `close_range_bun_init`、`close_range_bun_spawn`）加上 `CLOSE_RANGE_UNSHARE` 和 `fchmodat2_applies_mode`、`fchmodat2_bun_lchmod`，一共 12 项都报告 `INFO`，因为它们没有 shim 的保护根本没法跑完——见「已知平台行为」）；还有一项（`close_range_libc_fn`）报告 `SKIP`，因为不预加载的话这个符号根本不存在。每一项在基线下能有意义地跑起来的检查，要么通过（对应真实、可用的行为），要么精确地失败/报告文档里记录的那个症状 —— 没有意外情况。
+
+**关于"PASS 是否等于真验证了 shim"的诚实说明**——把 8 个 bun 场景测试按"是否真的触发了 shim 的 fallback 路径"分两类：① **真验证**（6 项，设备上 EACCES/SIGSYS 真复现 → shim 回退被触发 → 断言验证结果）：`close_range_bun_init`/`spawn`（CLOEXEC 正确设置 + fd 保持打开 + stdio 不动）、`linkat_bun_tmpfile`/`dirfd`（拷贝内容正确；dirfd 形状若 shim 误用 CWD 会拷不到 → 测试会挂）、`fchmodat2_bun_lchmod`（mode 正确应用）、`getcwd_unlinked`（deleted-cwd → `/proc/self/cwd` → stat 守卫 → `$HOME`，**计分**——这是 getcwd 修复在设备上唯一可复现的分支）。② **过了但不触发 shim 回退**（3 项，已如实标注）：`getcwd_deep_nested`（tmpfs 里 getcwd 本就成功，shim 回退没被触发，只是深路径 + `/proc/self/cwd` 一致性健全性检查；getcwd 修复的 EACCES+真实 cwd 分支需 hmdfs DAC 拒绝，被测试进程权限绕过，**设备上不可复现**，只能靠代码审查 + 此一致性检查）、`symlinkat_rel_resolution`（直接测 `openat(dirfd,相对)` 解析机制，**不调 shim 的 symlinkat hook**；symlinkat 在本设备不受 EPERM 限制，hook 的 copy 回退路径不可复现，此测试守护 fix 依赖的解析机制）、`symlink_two_arg`（shim **不 hook** `symlink` 符号，测的是真 symlink 在 OHOS 可用——确认 bun 造假 node 不需要额外兜底）。
 
 ### 双轨确认：OpenHarmony 容器
 
@@ -222,7 +225,7 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 | `pw_shell` | `/bin/sh` | `/bin/false`（写死的 —— 没办法知道真实 shell 是什么）|
 | `pw_uid` / `pw_gid` | `0` / `0` | `0` / `0`（一致 —— 来自真实系统调用，不是环境变量）|
 
-所以 fallback 在数值型身份字段和 `pw_dir` 上是准确的（只要 `$HOME`设置了，实践中它基本总是设置的），但字符串型身份字段（name/gecos/shell）会退化成合成的占位符。这本来就是已经写明的权衡，只是现在有了逐字段的确认，而不是靠假设。`tmpfile` 的写入/读回往返在真实实现和 fallback 之间完全一致（在这个测试深度下没发现功能差异）。`getcwd` 的 fallback 返回 `$HOME` 而不是真实 cwd 是设计如此 ——它只会在真实调用已经因为 `ENOENT`（cwd 被删除）失败之后才会介入，这种情况下根本没有「真实」的 cwd 可以返回。
+所以 fallback 在数值型身份字段和 `pw_dir` 上是准确的（只要 `$HOME`设置了，实践中它基本总是设置的），但字符串型身份字段（name/gecos/shell）会退化成合成的占位符。这本来就是已经写明的权衡，只是现在有了逐字段的确认，而不是靠假设。`tmpfile` 的写入/读回往返在真实实现和 fallback 之间完全一致（在这个测试深度下没发现功能差异）。`getcwd` 的 fallback 现在优先 `readlink("/proc/self/cwd")` 返回**真实 cwd**（内核 `d_path()` 不受用户态 `+x` 限制，正是 `getcwd()` 父目录遍历失败而它能成功的原因），用 `stat()` 校验路径仍存在；只有当路径确已消失（rmdir 后 `stat` 返回 `ENOENT`）才回落 `$HOME`。所以对 hmdfs `EACCES` 这类「cwd 有效但 `getcwd()` 走不通」的场景，fallback 给的是正确路径而非 `$HOME` 猜测——这正是让 bun 能撤掉 `ohos_set_pwd`/`cd-prefix` 的关键。
 
 在 5 次重复的 `--dump` 运行之间做了交叉复核，两两互相比对：真实实现和 fallback 两边的输出每次都逐字节完全一致。这些是确定性的、结构性的差异（纯靠 `getenv()` 合成能填哪些字段、不能填哪些字段），不是抖动或者跟时间相关的输出。
 

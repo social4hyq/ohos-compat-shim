@@ -715,6 +715,33 @@ FILE *tmpfile(void)
 /*     OHOS_COMPAT_SHIM_DISABLE=getcwd.                                 */
 /* ==================================================================== */
 
+/* Copy a NUL-terminated cwd candidate into the caller's buffer (or a freshly
+ * malloc'd one when buf==NULL, per getcwd(3)'s GNU auto-allocate extension),
+ * honoring the size/ERANGE contract. Returns buf/out on success, NULL+ERANGE
+ * on a too-small caller buffer, NULL+ENOMEM on malloc failure. */
+static char *cwd_copy_out(const char *src, char *buf, size_t size)
+{
+	size_t need = strlen(src) + 1;
+	if (buf) {
+		if (size < need) {
+			errno = ERANGE;
+			return NULL;
+		}
+		memcpy(buf, src, need);
+		return buf;
+	}
+	size_t alloc_size = size ? size : need;
+	if (alloc_size < need) {
+		errno = ERANGE;
+		return NULL;
+	}
+	char *out = malloc(alloc_size);
+	if (!out)
+		return NULL;
+	memcpy(out, src, need);
+	return out;
+}
+
 typedef char *(*getcwd_fn)(char *, size_t);
 
 char *getcwd(char *buf, size_t size)
@@ -726,33 +753,38 @@ char *getcwd(char *buf, size_t size)
 	char *r = real ? real(buf, size) : NULL;
 	if (r || shim_disabled("getcwd"))
 		return r;
-	if (errno != ENOENT)
-		return r; /* different real error, don't mask it */
+	/* Only engage the fallback on "couldn't resolve the cwd" errors (EACCES:
+	 * an ancestor lacks +x on hmdfs/tmpfs; ENOENT: cwd rmdir'd). Argument/
+	 * buffer errors (EINVAL size=0, ERANGE buf-too-small, EFAULT) must pass
+	 * through untouched so callers see the real errno. */
+	if (errno != EACCES && errno != ENOENT)
+		return r;
+	/* getcwd()'s userspace parent-walk (readdir("..") up to /) needs +x on
+	 * every ancestor; HarmonyOS sandbox dirs on hmdfs/tmpfs and rmdir'd
+	 * cwds trip it with EACCES/ENOENT. The kernel still knows the real cwd:
+	 * /proc/self/cwd is resolved server-side via d_path() with NO userspace
+	 * permission check, so it succeeds exactly where getcwd()'s walk fails
+	 * and yields the REAL cwd — what bash and lifecycle scripts actually
+	 * need, not a $HOME guess. (This is what lets bun drop its ohos_set_pwd
+	 * / cd-prefix workarounds once the shim is preloaded.) */
+	char proc_buf[PATH_MAX];
+	ssize_t n = readlink("/proc/self/cwd", proc_buf, sizeof(proc_buf) - 1);
+	if (n > 0) {
+		proc_buf[n] = '\0';
+		struct stat st;
+		/* Trust the kernel-reported path unless it is provably gone: stat
+		 * ENOENT means the cwd was rmdir'd (a dangling path is worse than
+		 * $HOME), so fall through. Any other stat outcome (success, or an
+		 * EACCES on an ancestor that doesn't invalidate the path) keeps it. */
+		if (stat(proc_buf, &st) == 0 || errno != ENOENT)
+			return cwd_copy_out(proc_buf, buf, size);
+	}
 
+	/* Last resort: somewhere valid so the caller doesn't hard-crash. */
 	const char *home = getenv("HOME");
 	if (!home)
 		home = "/data/storage/el2/base";
-	size_t need = strlen(home) + 1;
-
-	if (buf) {
-		if (size < need) {
-			errno = ERANGE;
-			return NULL;
-		}
-		memcpy(buf, home, need);
-		return buf;
-	}
-
-	size_t alloc_size = size ? size : need;
-	if (alloc_size < need) {
-		errno = ERANGE;
-		return NULL;
-	}
-	char *out = malloc(alloc_size);
-	if (!out)
-		return NULL;
-	memcpy(out, home, need);
-	return out;
+	return cwd_copy_out(home, buf, size);
 }
 
 /* ==================================================================== */
@@ -848,10 +880,13 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath)
 	if (errno != EPERM && errno != EACCES)
 		return rc;
 
-	/* Only handles the common "target is a real, resolvable file"
-	 * case (e.g. PackageInstall::link_bin). A dangling/relative target
-	 * that can't be opened from here still fails as before. */
-	int src = open(target, O_RDONLY);
+	/* Resolve `target` relative to the link's directory (newdirfd), NOT the
+	 * process CWD: a package symlink's target is almost always a path
+	 * relative to the link's own dir (e.g. node_modules/.bin/cli -> ../pkg),
+	 * and resolving it against CWD would either miss or copy an unrelated
+	 * same-named file. Only handles the "target resolves to a real file"
+	 * case; a dangling/not-yet-extracted target still fails as before. */
+	int src = openat(newdirfd, target, O_RDONLY);
 	if (src < 0) {
 		errno = EPERM;
 		return -1;

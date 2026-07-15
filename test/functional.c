@@ -223,6 +223,70 @@ static void test_close_range_cloexec(void)
 		close(fd);
 }
 
+/* bun's close_range(first, ~0U, CLOSE_RANGE_CLOEXEC) idiom: set FD_CLOEXEC on
+ * every open fd >= `first` while LEAVING them open (CLOEXEC, not a close),
+ * never touching stdio or fds < first. Two call sites use this —
+ * bun_initialize_process() with first=4 (keeps fd 3 for IPC) and the spawn /
+ * on_before_reload_process_linux paths with first=3 (CLOEXEC fd 3 too so it
+ * doesn't leak to the child). This helper covers both by parameterizing
+ * `first`; the single-fd cloexec and plain-close wide_sparse tests don't
+ * cover this wide + CLOEXEC + keep-open + boundary combination. */
+static void close_range_bun_cloexec_from(int first, const char *name)
+{
+	int opened[12];
+	int nopen = 0;
+	for (int i = 0; i < 12 && nopen < 12; i++) {
+		int f = open("/dev/null", O_RDONLY);
+		if (f < 0)
+			break;
+		opened[nopen++] = f; /* keep all open so fd numbers advance past `first` */
+	}
+	for (int i = 0; i < nopen; i++)
+		fcntl(opened[i], F_SETFD, 0); /* clear so the shim setting CLOEXEC is detectable */
+	int clo0 = fcntl(0, F_GETFD), clo1 = fcntl(1, F_GETFD), clo2 = fcntl(2, F_GETFD);
+
+	long ret;
+	int errno_out;
+	if (!guarded_close_range(first, (long)~0U, CLOSE_RANGE_CLOEXEC, &ret, &errno_out)) {
+		report_close_range_would_crash(name);
+		for (int i = 0; i < nopen; i++)
+			if (fd_is_open(opened[i]))
+				close(opened[i]);
+		return;
+	}
+	int ok = (ret == 0) && fcntl(0, F_GETFD) == clo0 && fcntl(1, F_GETFD) == clo1 &&
+		 fcntl(2, F_GETFD) == clo2;
+	int saw_in_range = 0;
+	for (int i = 0; i < nopen && ok; i++) {
+		if (opened[i] >= first) {
+			ok = ok && fd_is_open(opened[i]) && (fcntl(opened[i], F_GETFD) & FD_CLOEXEC);
+			saw_in_range = 1;
+		} else {
+			ok = ok && !(fcntl(opened[i], F_GETFD) & FD_CLOEXEC); /* below first: untouched */
+		}
+	}
+	ok = ok && saw_in_range; /* must have at least one fd in range to actually test */
+	char detail[120];
+	snprintf(detail, sizeof(detail), "CLOEXEC on fds>=%d (kept open), below untouched", first);
+	check(ok, name, detail);
+	for (int i = 0; i < nopen; i++)
+		if (fd_is_open(opened[i]))
+			close(opened[i]);
+}
+
+static void test_close_range_bun_init_cloexec(void)
+{
+	/* c-bindings.cpp bun_initialize_process(): close_range(4, ~0U, CLOEXEC). */
+	close_range_bun_cloexec_from(4, "close_range_bun_init");
+}
+
+static void test_close_range_bun_spawn_cloexec(void)
+{
+	/* BunProcess.cpp spawn path + c-bindings.cpp on_before_reload_process_linux:
+	 * close_range(3, ~0U, CLOEXEC) — fd 3 included (not kept for IPC here). */
+	close_range_bun_cloexec_from(3, "close_range_bun_spawn");
+}
+
 static void test_close_range_einval_first_last(void)
 {
 	/* Per upstream Linux (fs/file.c SYSCALL_DEFINE3(close_range, ...))
@@ -582,7 +646,7 @@ static void test_getcwd_success_is_noop(void)
  * GNU-extension-aware semantics for these same inputs on musl — so these
  * are calibrated against what the real libc call on this device actually
  * does, confirmed at baseline before writing the assertions. In every
- * case, the point is the same: the shim's ENOENT-only trigger condition
+ * case, the point is the same: the shim's EACCES/ENOENT trigger condition
  * must leave every *other* outcome (EINVAL, ERANGE, or a real success via
  * musl's auto-allocate extension) completely untouched. */
 static void test_getcwd_einval_size_zero(void)
@@ -618,6 +682,67 @@ static void test_getcwd_null_buf_autoalloc(void)
 	free(r);
 }
 
+static void test_getcwd_deep_nested(void)
+{
+	/* bun install/run operate in deep sandbox dir trees where getcwd() must
+	 * still resolve the full path, and under the shim's fallback must agree
+	 * with /proc/self/cwd. Build a 6-level nesting under TMPDIR, chdir to the
+	 * leaf, and require getcwd() == readlink("/proc/self/cwd") == the built
+	 * path. This is the shape bun's getcwd callers — and the shells bun
+	 * spawns (which inherit the preload) — actually hit. Passes both baseline
+	 * and shimmed (TMPDIR getcwd works); it pins deep-path correctness and
+	 * getcwd<->/proc/self/cwd agreement. */
+	char orig[4096];
+	if (!getcwd(orig, sizeof(orig))) {
+		check(0, "getcwd_deep_nested", "could not capture orig cwd");
+		return;
+	}
+	const char *tmp = getenv("TMPDIR");
+	if (!tmp)
+		tmp = "/data/storage/el2/base/tmp";
+	char tmpl[4096];
+	snprintf(tmpl, sizeof(tmpl), "%s/ohos-compat-fntest-deep-XXXXXX", tmp);
+	char *base = mkdtemp(tmpl);
+	if (!base) {
+		check(0, "getcwd_deep_nested", "mkdtemp base failed");
+		return;
+	}
+	char path[4096];
+	snprintf(path, sizeof(path), "%s", base);
+	size_t base_len = strlen(path);
+
+	int built = 1;
+	for (int i = 0; i < 6 && built; i++) {
+		strcat(path, "/d");
+		if (mkdir(path, 0700) != 0)
+			built = 0;
+	}
+	int ok = 0;
+	if (built && chdir(path) == 0) {
+		char gbuf[4096], pbuf[4096];
+		char *g = getcwd(gbuf, sizeof(gbuf));
+		ssize_t n = readlink("/proc/self/cwd", pbuf, sizeof(pbuf) - 1);
+		if (n > 0)
+			pbuf[n] = '\0';
+		ok = g && strcmp(g, path) == 0 && n > 0 && strcmp(pbuf, path) == 0 &&
+		     strcmp(g, pbuf) == 0;
+	}
+	check(ok, "getcwd_deep_nested",
+	      "getcwd == /proc/self/cwd == built path in 6-level tree");
+
+	chdir(orig);
+	/* rmdir leaf-first: chop one "/d" off at a time down to the base dir. */
+	for (size_t len = strlen(path); len > base_len;) {
+		rmdir(path);
+		char *slash = strrchr(path, '/');
+		if (!slash)
+			break;
+		*slash = '\0';
+		len = strlen(path);
+	}
+	rmdir(base); /* mkdtemp base */
+}
+
 static void test_getcwd_unlinked_fallback(void)
 {
 	/* Only meaningful WITH the shim loaded (OHOS_COMPAT_SHIM_DISABLE
@@ -646,14 +771,30 @@ static void test_getcwd_unlinked_fallback(void)
 	rmdir(dir); /* remove out from under ourselves */
 
 	char buf[4096];
+	errno = 0;
 	char *r = getcwd(buf, sizeof(buf));
-	char detail[128];
-	snprintf(detail, sizeof(detail), "%s",
-		 r ? r : (errno == ENOENT ? "NULL/ENOENT (expected without fallback)"
-					  : "NULL/other-errno"));
-	/* Not scored pass/fail against a fixed expectation — informational,
-	 * since the "right" answer depends on OHOS_COMPAT_SHIM_DISABLE. */
-	printf("INFO  %-28s %s\n", "getcwd_unlinked", detail);
+	const char *home = getenv("HOME");
+	if (!home)
+		home = "/data/storage/el2/base";
+	/* WITH the shim: getcwd()'s userspace walk fails (ENOENT — cwd rmdir'd),
+	 * the fallback tries /proc/self/cwd (returns the now-deleted path), the
+	 * stat() guard rejects it, and it returns $HOME — a valid path so the
+	 * caller doesn't crash. This is the ONLY branch of the getcwd fix that's
+	 * reproducible on this device (the EACCES/real-cwd branch needs hmdfs DAC
+	 * denial, defeated by the test process's privileges), so it's scored.
+	 * WITHOUT the shim: getcwd() returns NULL/ENOENT — no fallback exists. */
+	int ok;
+	char detail[160];
+	if (shim_is_loaded()) {
+		ok = r != NULL && strcmp(r, home) == 0;
+		snprintf(detail, sizeof(detail), "shim fallback -> %s (want $HOME=%s)%s",
+			 r ? r : "NULL", home, ok ? "" : " MISMATCH");
+	} else {
+		ok = (r == NULL); /* tmpfs: getcwd after rmdir -> NULL/ENOENT, no fallback */
+		snprintf(detail, sizeof(detail), "baseline %s errno=%d — no fallback%s",
+			 r ? r : "NULL", errno, ok ? "" : " (unexpectedly succeeded)");
+	}
+	check(ok, "getcwd_unlinked", detail);
 
 	chdir(orig);
 }
@@ -785,6 +926,143 @@ static void test_linkat_eacces_fallback(void)
 	unlink(dst);
 }
 
+static void test_linkat_bun_tmpfile_via_proc_self_fd(void)
+{
+	/* bun's npm cache write (src/install/npm.rs linkat_tmpfile) materializes
+	 * an O_TMPFILE fd. The fast path linkat(tmpfd, "", dir, name,
+	 * AT_EMPTY_PATH) needs CAP_DAC_READ_SEARCH — absent under the OHOS
+	 * sandbox, so it EPERMs and bun falls back to the /proc form:
+	 *   linkat(AT_FDCWD, "/proc/self/fd/<N>", dir, name, AT_SYMLINK_FOLLOW)
+	 * The shim's linkat hook then openat()s that /proc path (following the
+	 * symlink to the tmpfile) and byte-copies it to dest — exactly the
+	 * materialize-O_TMPFILE-via-copy path bun now relies on after the
+	 * source-level linkat downgrade was removed. This reproduces it end-to-end
+	 * against the real TMPDIR linkat EACCES. */
+	const char *tmp = getenv("TMPDIR");
+	if (!tmp)
+		tmp = "/data/storage/el2/base/tmp";
+	int tmpfd = open(tmp, O_TMPFILE | O_RDWR, 0600);
+	if (tmpfd < 0) {
+		printf("INFO  %-28s O_TMPFILE unsupported here (errno=%d %s) — skipped\n",
+		       "linkat_bun_tmpfile", errno, strerror(errno));
+		checks++;
+		return;
+	}
+	const char *payload = "tmpfile-payload-via-proc";
+	write(tmpfd, payload, strlen(payload));
+
+	char proc[64];
+	snprintf(proc, sizeof(proc), "/proc/self/fd/%d", tmpfd);
+	char dst[4096];
+	snprintf(dst, sizeof(dst), "%s/ohos-compat-fntest-tmpfile-dst", tmp);
+	unlink(dst);
+
+	errno = 0;
+	int rc = linkat(AT_FDCWD, proc, AT_FDCWD, dst, AT_SYMLINK_FOLLOW);
+	char detail[200];
+	if (shim_is_loaded()) {
+		/* Shim active with linkat opted in (main()'s setenv): the copy
+		 * fallback must materialize dst with the tmpfile's contents. */
+		FILE *f = fopen(dst, "r");
+		char buf[64] = {0};
+		size_t n = f ? fread(buf, 1, sizeof(buf) - 1, f) : 0;
+		if (f)
+			fclose(f);
+		int ok = f && n == strlen(payload) && strcmp(buf, payload) == 0;
+		snprintf(detail, sizeof(detail),
+			 "linkat(/proc/self/fd) %s, dst content %s",
+			 rc == 0 ? "succeeded (real or copy)" : "rc=-1 but copy present",
+			 ok ? "matches" : "MISMATCH/missing");
+		check(ok, "linkat_bun_tmpfile", detail);
+	} else {
+		/* Baseline (no shim): a real linkat() here reproduces the TMPDIR
+		 * EACCES quirk (see linkat_eacces_fallback) — expected, not a shim
+		 * correctness question. */
+		snprintf(detail, sizeof(detail),
+			 "baseline linkat rc=%d errno=%d (%s) — no shim to fall back",
+			 rc, errno, strerror(errno));
+		printf("INFO  %-28s %s\n", "linkat_bun_tmpfile", detail);
+		checks++;
+	}
+	close(tmpfd);
+	unlink(dst);
+}
+
+static void test_linkat_bun_dirfd_source(void)
+{
+	/* bun's hardlink install (Hardlinker.rs, PackageInstall.rs) hardlinks a
+	 * cached file into node_modules via linkat(SRC_DIRFD, basename,
+	 * DEST_DIRFD, path, 0) — dirfd source + dirfd dest, NOT AT_FDCWD absolute
+	 * paths like linkat_eacces_fallback above. The shim's linkat hook must
+	 * openat(SRC_DIRFD, basename) to find the cached file (resolved against the
+	 * dirfd, not CWD) and copy it to openat(DEST_DIRFD, path). This is the
+	 * install hot path every cached package hits; the AT_FDCWD absolute-path
+	 * test alone doesn't exercise dirfd-relative resolution on either side. */
+	const char *tmp = getenv("TMPDIR");
+	if (!tmp)
+		tmp = "/data/storage/el2/base/tmp";
+	char srcdir[4096], dstdir[4096], srcfile[4096], dstfile[4096];
+	snprintf(srcdir, sizeof(srcdir), "%s/ohos-compat-fntest-linkdir-src", tmp);
+	snprintf(dstdir, sizeof(dstdir), "%s/ohos-compat-fntest-linkdir-dst", tmp);
+	snprintf(srcfile, sizeof(srcfile), "%s/cached", srcdir);
+	snprintf(dstfile, sizeof(dstfile), "%s/installed", dstdir);
+	unlink(dstfile);
+	unlink(srcfile);
+	rmdir(srcdir);
+	rmdir(dstdir);
+	int src_dirfd = -1, dst_dirfd = -1;
+	if (mkdir(srcdir, 0700) || mkdir(dstdir, 0700)) {
+		check(0, "linkat_bun_dirfd", "mkdir src/dst failed");
+		goto cleanup;
+	}
+	int sfd = open(srcfile, O_CREAT | O_WRONLY, 0644);
+	if (sfd < 0) {
+		check(0, "linkat_bun_dirfd", "could not create cached file");
+		goto cleanup;
+	}
+	const char *payload = "dirfd-linkat-payload";
+	write(sfd, payload, strlen(payload));
+	close(sfd);
+
+	src_dirfd = open(srcdir, O_RDONLY | O_DIRECTORY);
+	dst_dirfd = open(dstdir, O_RDONLY | O_DIRECTORY);
+	if (src_dirfd < 0 || dst_dirfd < 0) {
+		check(0, "linkat_bun_dirfd", "could not open dirfds");
+		goto cleanup;
+	}
+
+	errno = 0;
+	int rc = linkat(src_dirfd, "cached", dst_dirfd, "installed", 0);
+	char detail[200];
+	if (shim_is_loaded()) {
+		FILE *f = fopen(dstfile, "r");
+		char buf[64] = {0};
+		size_t n = f ? fread(buf, 1, sizeof(buf) - 1, f) : 0;
+		if (f)
+			fclose(f);
+		int ok = f && n == strlen(payload) && strcmp(buf, payload) == 0;
+		snprintf(detail, sizeof(detail),
+			 "linkat(dirfd,dirfd) %s, dst content %s",
+			 rc == 0 ? "succeeded" : "copy fallback", ok ? "matches" : "MISMATCH/missing");
+		check(ok, "linkat_bun_dirfd", detail);
+	} else {
+		snprintf(detail, sizeof(detail),
+			 "baseline linkat(dirfd,dirfd) rc=%d errno=%d (%s) — no shim to fall back",
+			 rc, errno, strerror(errno));
+		printf("INFO  %-28s %s\n", "linkat_bun_dirfd", detail);
+		checks++;
+	}
+cleanup:
+	if (src_dirfd >= 0)
+		close(src_dirfd);
+	if (dst_dirfd >= 0)
+		close(dst_dirfd);
+	unlink(dstfile);
+	unlink(srcfile);
+	rmdir(srcdir);
+	rmdir(dstdir);
+}
+
 static void test_symlinkat_success_is_noop(void)
 {
 	/* symlinkat() was NOT found to be restricted in TMPDIR on this
@@ -838,6 +1116,130 @@ static void test_symlinkat_success_is_noop(void)
 /*  an expected INFO instead of taking the suite down with it.            */
 /* ==================================================================== */
 
+static void test_symlinkat_relative_target_resolution(void)
+{
+	/* bun's TarballStream creates symlinks whose targets are RELATIVE to the
+	 * link's own directory (e.g. node_modules/.bin/cli -> ../pkg/index.js).
+	 * The symlinkat copy-fallback fix changed open(target) [resolved against
+	 * the process CWD — wrong dir, copies an unrelated same-named file] to
+	 * openat(newdirfd, target) [resolved against the link's directory]. The
+	 * symlinkat hook's EPERM->copy path can't be triggered on this device
+	 * (symlinkat isn't EPERM-restricted in TMPDIR here), so this verifies the
+	 * resolution MECHANISM the fix relies on: a relative path that exists
+	 * under `dirfd` but NOT under CWD must open via openat(dirfd, ...) and
+	 * must MISS via open() — the exact divergence the old bug rode on. */
+	const char *tmp = getenv("TMPDIR");
+	if (!tmp)
+		tmp = "/data/storage/el2/base/tmp";
+	char root[4096], sub[4096], file_in_sub[4096];
+	snprintf(root, sizeof(root), "%s/ohos-compat-fntest-symrel", tmp);
+	snprintf(sub, sizeof(sub), "%s/sub", root);
+	snprintf(file_in_sub, sizeof(file_in_sub), "%s/pkgfile", sub);
+	unlink(file_in_sub);
+	rmdir(sub);
+	rmdir(root);
+	if (mkdir(root, 0700) || mkdir(sub, 0700)) {
+		check(0, "symlinkat_rel_resolution", "could not create dirs");
+		rmdir(sub);
+		rmdir(root);
+		return;
+	}
+	int wfd = open(file_in_sub, O_CREAT | O_WRONLY, 0644);
+	if (wfd < 0) {
+		check(0, "symlinkat_rel_resolution", "could not create file");
+		rmdir(sub);
+		rmdir(root);
+		return;
+	}
+	const char *payload = "relative-target-payload";
+	write(wfd, payload, strlen(payload));
+	close(wfd);
+
+	char orig[4096];
+	if (!getcwd(orig, sizeof(orig))) {
+		check(0, "symlinkat_rel_resolution", "could not capture cwd");
+		goto cleanup;
+	}
+	int dirfd = open(sub, O_RDONLY | O_DIRECTORY);
+	int ok = (chdir(root) == 0) && dirfd >= 0;
+	if (ok) {
+		/* fixed resolution: openat(dirfd, relative) finds the file in `sub`. */
+		errno = 0;
+		int rfd = openat(dirfd, "pkgfile", O_RDONLY);
+		char buf[64] = {0};
+		if (rfd >= 0) {
+			ssize_t n = read(rfd, buf, sizeof(buf) - 1);
+			close(rfd);
+			ok = ok && n == (ssize_t)strlen(payload) && strcmp(buf, payload) == 0;
+		} else {
+			ok = 0;
+		}
+		/* contrast: open("pkgfile") against CWD (root) must MISS — the file is
+		 * in `sub`, not root. This is the wrong-file/miss the old open(target)
+		 * shim code would have produced. */
+		errno = 0;
+		int bad = open("pkgfile", O_RDONLY);
+		ok = ok && (bad < 0);
+		if (bad >= 0)
+			close(bad);
+	}
+	check(ok, "symlinkat_rel_resolution",
+	      "openat(dirfd, relative) resolves; open() vs CWD misses (the old bug)");
+	if (dirfd >= 0)
+		close(dirfd);
+	chdir(orig);
+cleanup:
+	unlink(file_in_sub);
+	rmdir(sub);
+	rmdir(root);
+}
+
+static void test_symlink_two_arg_bun_fake_node(void)
+{
+	/* bun's `--bun` mode creates fake node executables via the 2-arg symlink()
+	 * (src/install/lib.rs:702): symlink(argv0_abs, BUN_NODE_DIR/{bun,node}).
+	 * This is the *symlink* libc symbol, NOT symlinkat — and this shim does
+	 * NOT hook it (the hook list is close_range/syscall/getpwuid_r/tmpfile/
+	 * getcwd/linkat/symlinkat; no symlink). The test pins bun's real call shape
+	 * and confirms whether it works unaided: symlinkat is unrestricted in
+	 * TMPDIR here, and symlink is symlinkat(.., AT_FDCWD, ..), so it should
+	 * too — but if it ever EPERMs, that surfaces a genuine gap (bun's fake-node
+	 * creation would need a shim symlink hook) rather than hiding it. */
+	const char *tmp = getenv("TMPDIR");
+	if (!tmp)
+		tmp = "/data/storage/el2/base/tmp";
+	char target[4096], linkpath[4096];
+	snprintf(target, sizeof(target), "%s/ohos-compat-fntest-sym2-target", tmp);
+	snprintf(linkpath, sizeof(linkpath), "%s/ohos-compat-fntest-sym2-link", tmp);
+	unlink(linkpath);
+	unlink(target);
+	int fd = open(target, O_CREAT | O_WRONLY, 0755);
+	if (fd < 0) {
+		check(0, "symlink_two_arg", "could not create target");
+		return;
+	}
+	close(fd);
+
+	errno = 0;
+	int rc = symlink(target, linkpath); /* 2-arg, absolute target + absolute link */
+	int ok = 0;
+	char detail[200];
+	if (rc == 0) {
+		struct stat st;
+		ok = (lstat(linkpath, &st) == 0) && S_ISLNK(st.st_mode);
+		snprintf(detail, sizeof(detail),
+			 "symlink(target,link) ok, lstat %s symlink (no shim hook needed)",
+			 ok ? "confirms" : "NOT a");
+	} else {
+		snprintf(detail, sizeof(detail),
+			 "symlink() FAILED rc=%d errno=%d (%s) — GAP: shim has no symlink hook",
+			 rc, errno, strerror(errno));
+	}
+	check(ok, "symlink_two_arg", detail);
+	unlink(linkpath);
+	unlink(target);
+}
+
 static void test_fchmodat2_applies_mode(void)
 {
 	char path[4096];
@@ -881,6 +1283,48 @@ static void test_fchmodat2_applies_mode(void)
 /*  Pass-through: unrelated syscalls must be unaffected                  */
 /* ==================================================================== */
 
+static void test_fchmodat2_bun_lchmod_symlink_nofollow(void)
+{
+	/* bun's lchmod (src/sys/lib.rs) issues fchmodat2 via the raw syscall()
+	 * entry — this musl has no libc wrapper — passing AT_SYMLINK_NOFOLLOW:
+	 *   syscall(SYS_fchmodat2, AT_FDCWD, path, mode, AT_SYMLINK_NOFOLLOW)
+	 * The shim's fallback drops the flag (classic fchmodat() can't honor
+	 * NOFOLLOW portably) and applies fchmodat(dirfd, path, mode, 0). On a
+	 * regular file that's the same result. This pins the exact bun call shape
+	 * — syscall() entry point + the NOFOLLOW flag bun passes — so a regression
+	 * in either the entry-point dispatch or the flag handling is caught. */
+	char path[4096];
+	const char *tmp = getenv("TMPDIR");
+	if (!tmp)
+		tmp = "/data/storage/el2/base/tmp";
+	snprintf(path, sizeof(path), "%s/ohos-compat-fntest-fchmodat2-nofollow", tmp);
+	unlink(path);
+	int fd = open(path, O_CREAT | O_WRONLY, 0644);
+	if (fd < 0) {
+		check(0, "fchmodat2_bun_lchmod", "could not create fixture");
+		return;
+	}
+	close(fd);
+
+	long ret;
+	int errno_out;
+	if (!guarded_fchmodat2(AT_FDCWD, path, 0640, AT_SYMLINK_NOFOLLOW, &ret, &errno_out)) {
+		printf("INFO  %-28s would SIGSYS without the shim's protection "
+		       "(caught here so the suite could continue) — expected at baseline\n",
+		       "fchmodat2_bun_lchmod");
+		checks++;
+		unlink(path);
+		return;
+	}
+	struct stat st;
+	mode_t applied = (stat(path, &st) == 0) ? (st.st_mode & 07777) : 0;
+	char detail[128];
+	snprintf(detail, sizeof(detail), "ret=%ld mode=%o (want 0640, flag dropped)",
+		 ret, (unsigned)applied);
+	check(ret == 0 && applied == 0640, "fchmodat2_bun_lchmod", detail);
+	unlink(path);
+}
+
 static void test_passthrough_getpid(void)
 {
 	pid_t a = getpid();
@@ -915,6 +1359,8 @@ int main(void)
 
 	test_close_range_multi_range();
 	test_close_range_cloexec();
+	test_close_range_bun_init_cloexec();
+	test_close_range_bun_spawn_cloexec();
 	test_close_range_einval_first_last();
 	test_close_range_einval_bad_flags();
 	test_close_range_wide_sparse_range();
@@ -933,13 +1379,19 @@ int main(void)
 	test_getcwd_einval_size_zero();
 	test_getcwd_erange_size_one();
 	test_getcwd_null_buf_autoalloc();
+	test_getcwd_deep_nested();
 	test_getcwd_unlinked_fallback();
 
 	test_linkat_eexist_passthrough();
 	test_linkat_eacces_fallback();
+	test_linkat_bun_tmpfile_via_proc_self_fd();
+	test_linkat_bun_dirfd_source();
 	test_symlinkat_success_is_noop();
+	test_symlinkat_relative_target_resolution();
+	test_symlink_two_arg_bun_fake_node();
 
 	test_fchmodat2_applies_mode();
+	test_fchmodat2_bun_lchmod_symlink_nofollow();
 
 	test_passthrough_getpid();
 	test_passthrough_read_write();
