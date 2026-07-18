@@ -44,10 +44,7 @@
  * Runtime toggles (comma-separated symbol names):
  *   OHOS_COMPAT_SHIM_DISABLE — turn OFF a default-on interceptor
  *                              (close_range, getpwuid_r, tmpfile, getcwd,
- *                               fchmodat2)
- *   OHOS_COMPAT_SHIM_ENABLE  — turn ON a default-off interceptor
- *                              (linkat, symlinkat — semantically lossy,
- *                               opt-in only; see README)
+ *                               fchmodat2, linkat, symlinkat)
  *
  * Deliberately NOT implemented: pthread_cancel (musl stub is a no-op;
  * emulating cancellation needs cooperative checkpoints in the target
@@ -103,7 +100,7 @@ static int env_list_has(const char *var, const char *name)
 }
 
 /*
- * shim_disabled()/shim_enabled_optin() are called from every interceptor
+ * shim_disabled() are called from every interceptor
  * entry point — including syscall(), which every non-close_range syscall in
  * the process also routes through. A naive getenv()+scan on every single
  * call would tax the hottest path in the library for no reason: the toggle
@@ -118,26 +115,16 @@ enum {
 	SD_TMPFILE     = 1 << 2,
 	SD_GETCWD      = 1 << 3,
 	SD_FCHMODAT2   = 1 << 4,
-};
-enum {
-	SE_LINKAT    = 1 << 0,
-	SE_SYMLINKAT = 1 << 1,
+	SD_LINKAT      = 1 << 5,
+	SD_SYMLINKAT   = 1 << 6,
 };
 
 static int g_disable_mask = -1;
-static int g_enable_mask = -1;
 
 static void parse_toggle_masks(void)
 {
 	if (g_disable_mask >= 0)
 		return;
-
-	int e = 0;
-	if (env_list_has("OHOS_COMPAT_SHIM_ENABLE", "linkat"))
-		e |= SE_LINKAT;
-	if (env_list_has("OHOS_COMPAT_SHIM_ENABLE", "symlinkat"))
-		e |= SE_SYMLINKAT;
-	g_enable_mask = e;
 
 	int d = 0;
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "close_range"))
@@ -150,6 +137,10 @@ static void parse_toggle_masks(void)
 		d |= SD_GETCWD;
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "fchmodat2"))
 		d |= SD_FCHMODAT2;
+	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "linkat"))
+		d |= SD_LINKAT;
+	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "symlinkat"))
+		d |= SD_SYMLINKAT;
 	g_disable_mask = d; /* set last: non-negative value doubles as "done" */
 }
 
@@ -166,16 +157,10 @@ static int shim_disabled(const char *name)
 		return !!(g_disable_mask & SD_GETCWD);
 	if (strcmp(name, "fchmodat2") == 0)
 		return !!(g_disable_mask & SD_FCHMODAT2);
-	return 0;
-}
-
-static int shim_enabled_optin(const char *name)
-{
-	parse_toggle_masks();
 	if (strcmp(name, "linkat") == 0)
-		return !!(g_enable_mask & SE_LINKAT);
+		return !!(g_disable_mask & SD_LINKAT);
 	if (strcmp(name, "symlinkat") == 0)
-		return !!(g_enable_mask & SE_SYMLINKAT);
+		return !!(g_disable_mask & SD_SYMLINKAT);
 	return 0;
 }
 
@@ -793,13 +778,13 @@ char *getcwd(char *buf, size_t size)
 /*     symlinkat, a copy of the link *target file* when it exists.      */
 /*     Semantically lossy (loses hardlink/symlink identity — a later     */
 /*     write to one path won't show up at the other, and a dangling      */
-/*     symlink target can't be copied). Default OFF: opt in per-process  */
-/*     via OHOS_COMPAT_SHIM_ENABLE=linkat,symlinkat once you've           */
-/*     confirmed the consumer doesn't rely on true link semantics.       */
-/* ==================================================================== */
-
-static int copy_fd_contents(int src_fd, int dst_fd)
-{
+/*     Semantically lossy (loses hardlink/symlink identity — a later     */
+/*     write to one path will not show up at the other, and a dangling       */
+/*     symlink target cannot be copied). Default ON since 0.2.0 (bun          */
+/*     install needs hardlinks and the sandbox blocks the real linkat         */
+/*     for all apps). Disable individually via                                */
+/*     OHOS_COMPAT_SHIM_DISABLE=linkat,symlinkat if true link semantics       */
+/*     matter for your workload.                                              */
 	char buf[65536];
 	ssize_t n;
 	while ((n = read(src_fd, buf, sizeof(buf))) > 0) {
@@ -827,7 +812,9 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd,
 		real = (linkat_fn)dlsym(RTLD_NEXT, "linkat");
 
 	int rc = real ? real(olddirfd, oldpath, newdirfd, newpath, flags) : -1;
-	if (rc == 0 || !shim_enabled_optin("linkat"))
+	if (rc == 0)
+		return 0;
+	if (shim_disabled("linkat"))
 		return rc;
 	if (errno != EPERM && errno != EACCES)
 		return rc;
@@ -875,7 +862,9 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath)
 		real = (symlinkat_fn)dlsym(RTLD_NEXT, "symlinkat");
 
 	int rc = real ? real(target, newdirfd, linkpath) : -1;
-	if (rc == 0 || !shim_enabled_optin("symlinkat"))
+	if (rc == 0)
+		return 0;
+	if (shim_disabled("symlinkat"))
 		return rc;
 	if (errno != EPERM && errno != EACCES)
 		return rc;
