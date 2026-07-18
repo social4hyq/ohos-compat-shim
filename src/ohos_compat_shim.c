@@ -777,14 +777,13 @@ char *getcwd(char *buf, size_t size)
 /*     for hardlinks; fall back to a byte copy (linkat) or, for          */
 /*     symlinkat, a copy of the link *target file* when it exists.      */
 /*     Semantically lossy (loses hardlink/symlink identity — a later     */
-/*     write to one path won't show up at the other, and a dangling      */
-/*     Semantically lossy (loses hardlink/symlink identity — a later     */
-/*     write to one path will not show up at the other, and a dangling       */
 /*     symlink target cannot be copied). Default ON since 0.2.0 (bun          */
 /*     install needs hardlinks and the sandbox blocks the real linkat         */
 /*     for all apps). Disable individually via                                */
 /*     OHOS_COMPAT_SHIM_DISABLE=linkat,symlinkat if true link semantics       */
 /*     matter for your workload.                                              */
+static int copy_fd_contents(int src_fd, int dst_fd)
+{
 	char buf[65536];
 	ssize_t n;
 	while ((n = read(src_fd, buf, sizeof(buf))) > 0) {
