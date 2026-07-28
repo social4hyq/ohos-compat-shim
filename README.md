@@ -14,7 +14,7 @@
 | `getcwd()` | hmdfs/tmpfs 父目录缺 `+x` 时 `EACCES`，或 cwd 被 rmdir 后 `ENOENT`（常见于生命周期脚本、`bun run`） | 开启 |
 | `linkat()` / `symlinkat()` | 沙箱化的安装目标目录里报 `EPERM`/`EACCES` | **关闭**（需手动开启）|
 | `syscall(SYS_fchmodat2)` | 真机 `SIGSYS`，OpenHarmony 容器里是 `ENOSYS` —— 两边都失败，但失败方式不同 | 开启 |
-| `splice()` | 源端 EOF 时返回 `-1/EPIPE`，Linux 返回 `0` —— 所有 splice 拷贝循环在文件尾误报错误 | 开启 |
+| `splice()` | 两个独立缺陷：① 源端 EOF 时返回 `-1/EPIPE`，Linux 返回 `0` —— 所有 splice 拷贝循环在文件尾误报错误；② 写进管道的数据**不唤醒**任何已阻塞的 `poll()`/`epoll_wait()`，导致轮询型消费端的管道永久死锁 | 开启 |
 
 `pthread_cancel()` 在这个平台上是 musl 的空桩实现，刻意**不**做 shim ——一个 preload 库没办法给调用方注入它所需要的协作式取消点。
 
@@ -41,7 +41,8 @@
 | `getcwd` | 探针 `g7_getcwd_unlinked` | 平台层面无法修复（这是符合 POSIX 语义的 `ENOENT` 行为）—— 这一项会一直留着 |
 | `linkat`/`symlinkat` | 探针 `g5_linkat_eperm`/`g6_symlinkat_eperm` | 目标安装目录不再对硬链接/符号链接返回 `EPERM`/`EACCES` |
 | `fchmodat2` | 探针 `c5_fchmodat2` | HarmonyOS 放行 452 号系统调用（目前是 `both_fail`：OpenHarmony 容器里也是 `ENOSYS`，所以这项收口不光需要 HarmonyOS 放行，容器那边的内核也得先实现这个系统调用）|
-| `splice` | 功能测试 `splice_eof_is_zero`（baseline 段即为探针）| 内核修正 `splice()` 的 EOF 语义，源端耗尽时返回 `0` 而不是 `EPIPE` |
+| `splice` （EOF 语义）| 功能测试 `splice_eof_is_zero`（baseline 段即为探针）| 内核修正 `splice()` 的 EOF 语义，源端耗尽时返回 `0` 而不是 `EPIPE` |
+| `splice` （poll 唤醒）| 功能测试 `splice_wakes_poll_waiter`（baseline 段即为探针）| 内核让写入管道的 splice 唤醒 poll/epoll 等待者。收口后应删掉 bounce buffer 路径，恢复零拷贝 |
 
 定期重跑 `ohos-preflight` 的双轨对比；一旦某个探针稳定地从 `needs_relax`变成 `same`，对应符号的拦截逻辑就可以在后续版本里默认关闭（或直接移除）——等消费者所支持的所有 HarmonyOS 版本都不再需要剩下的任何一个症状时，就应该停止预加载这个库。
 
@@ -67,7 +68,26 @@
 
 注意 EOF 的 pipe 上 `POLLIN` 也是置位的（此时 `read()` 会立刻返回 0），所以判 EOF 的依据是 `POLLHUP`，不是"没有 `POLLIN`"。整个分支只在 `splice()` 已经返回 `EPIPE` 时才进入，其余情况原样透传，正常路径的开销就是一次比较。
 
-这个内核的 `splice()` 还有第二个毛病：**对空管道会一直阻塞，无视 `O_NONBLOCK` 和 `SPLICE_F_NONBLOCK`**。该行为不会返回 `EPIPE`，因此碰不到上面的分支，这里没有处理 —— 记在这里是因为它会让"给 splice 加个非阻塞探测"这类想法直接失效。
+这个内核的 `splice()` 还有第三个毛病：**对空管道会一直阻塞，无视 `O_NONBLOCK` 和 `SPLICE_F_NONBLOCK`**。该行为不会返回 `EPIPE`，因此碰不到上面的分支，这里没有处理 —— 记在这里是因为它会让"给 splice 加个非阻塞探测"这类想法直接失效。
+
+## `splice()` 写入管道不唤醒 poll/epoll（为什么这里放弃了零拷贝）
+
+`splice()` 放进管道的数据**不会唤醒任何已经阻塞在该管道读端的 `poll()` 或 `epoll_wait()`**。数据确实进去了 —— 之后再 poll 一次、或者直接 `read()`，立刻就能看到 —— 所以管道的就绪**状态**是对的，坏掉的只有**唤醒**。阻塞在 `read()` 上的读者能被正常唤醒，这就是这个缺陷长期藏在同步读背后的原因。
+
+独立探针实测（等待者先阻塞，300ms 后送 4096 字节）：
+
+| 等待方式 | 由 `splice()` 送入 | 由 `write()` 送入 |
+|---|---|---|
+| `poll` | 2000ms 超时，不唤醒 | 300ms 唤醒 |
+| `epoll` LT | 2000ms 超时，不唤醒 | 301ms 唤醒 |
+| `epoll` ET | 2000ms 超时，不唤醒 | 301ms 唤醒 |
+| 阻塞 `read` | 301ms 唤醒 | 301ms 唤醒 |
+
+任何"消费端用轮询"的管道都会因此永久死锁。GNU `cat` 在 stdout 是管道时用 `splice()` 供数，于是 `cat big | bun script.js` 永远挂着：bun 阻塞在 `epoll_wait`，cat 填满 512KB 管道后也阻塞在 `splice()`。`cat big | wc -c` 没事（wc 阻塞在 `read`），`dd ... | bun script.js` 也没事（dd 用 `write`）。
+
+**修法**：目标是管道时，把字节经用户态缓冲区搬过去，让管道由 `write()` 供数 —— 它的唤醒是好的。代价是多一次内存拷贝、这条路径上不再零拷贝。实测 100MB 过两级管道从 101ms 变成 129ms（**慢 28%**）。对一个以正确性为职责的 shim 来说这个交换是划算的，但收口时应当第一时间删掉。
+
+曾经考虑过保住零拷贝的方案：**只扣下最后 1 个字节用 `write()` 送**，靠它产生唤醒。探针确认这个办法确实能唤醒 poll，但它**在真实场景里不成立**：cat 要往 512KB 的管道里搬 524288 字节，`splice()` 填满管道就短返回，那个收尾的 `write()` 根本走不到。一个"恰好在管道满时失效"的唤醒方案没有意义 —— 管道满正是读者一定在等的时刻。
 
 ## 已知平台行为（禁用 `close_range` 前请先读这段）
 

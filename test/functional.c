@@ -30,6 +30,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
 #include <setjmp.h>
@@ -1463,6 +1464,59 @@ static void test_splice_real_epipe_preserved(void)
 	check(rc < 0 && e == EPIPE, "splice_real_epipe_preserved", detail);
 }
 
+/* ---- splice(2): data put in a pipe must wake a blocked poll() ---- */
+
+struct poll_waiter {
+	int fd;
+	int rc;
+};
+
+static void *poll_waiter_thread(void *arg)
+{
+	struct poll_waiter *w = arg;
+	struct pollfd pfd = { .fd = w->fd, .events = POLLIN };
+	w->rc = poll(&pfd, 1, 1500);
+	return NULL;
+}
+
+static void test_splice_wakes_poll_waiter(void)
+{
+	int src[2], dst[2];
+	if (pipe(src) != 0 || pipe(dst) != 0) {
+		check(0, "splice_wakes_poll_waiter", "pipe() failed");
+		return;
+	}
+	if (write(src[1], "hi\n", 3) != 3) {
+		check(0, "splice_wakes_poll_waiter", "seed write failed");
+		return;
+	}
+
+	/* The waiter must be parked in poll() *before* the bytes arrive: this
+	 * checks the wakeup, not the readiness state. A poll issued afterwards
+	 * reports the pipe readable even on the broken kernel. */
+	struct poll_waiter w = { .fd = dst[0], .rc = -99 };
+	pthread_t th;
+	if (pthread_create(&th, NULL, poll_waiter_thread, &w) != 0) {
+		check(0, "splice_wakes_poll_waiter", "pthread_create failed");
+		return;
+	}
+	usleep(300000);
+
+	ssize_t moved = splice(src[0], NULL, dst[1], NULL, 1 << 19, 0);
+	pthread_join(th, NULL);
+
+	char drain[64];
+	ssize_t got = w.rc > 0 ? read(dst[0], drain, sizeof(drain)) : -1;
+	close(src[0]); close(src[1]); close(dst[0]); close(dst[1]);
+
+	char detail[192];
+	snprintf(detail, sizeof(detail),
+		 "moved=%zd poll=%d%s drained=%zd (want 3/>0/3)",
+		 moved, w.rc, w.rc == 0 ? " (timed out, never woken)" : "", got);
+	check(moved == 3 && w.rc > 0 && got == 3,
+	      "splice_wakes_poll_waiter", detail);
+}
+
 int main(void)
 {
 	/* Must happen before any linkat/symlinkat call in this process — the
@@ -1512,6 +1566,7 @@ int main(void)
 	test_passthrough_read_write();
 	test_splice_eof_is_zero();
 	test_splice_real_epipe_preserved();
+	test_splice_wakes_poll_waiter();
 
 	printf("%s (%d/%d checks failed)\n", failures == 0 ? "ALL PASS" : "SOME FAILED",
 	       failures, checks);

@@ -857,6 +857,113 @@ typedef int (*linkat_fn)(int, const char *, int, const char *, int);
  */
 typedef ssize_t (*splice_fn)(int, off_t *, int, off_t *, size_t, unsigned int);
 
+/* ------------------------------------------------------------------ */
+/*  splice(2), second defect: writing to a pipe wakes no poll()/epoll   */
+/* ------------------------------------------------------------------ */
+/*
+ * Bytes that splice() places into a pipe never wake a poll() or
+ * epoll_wait() that is already blocked on that pipe's read end. The data
+ * really is there -- a later poll, or a read(), sees it immediately -- so
+ * the pipe's readiness *state* is right and only the *wakeup* is missing.
+ * A reader blocked in read() is woken correctly, which is why the defect
+ * hides behind anything that reads synchronously.
+ *
+ * Measured with a standalone probe (no Bun involved), waiter blocked
+ * first, 4096 bytes sent 300ms later:
+ *
+ *   waiter        fed by splice()        fed by write()
+ *   poll          2000ms timeout         woken in 300ms
+ *   epoll LT      2000ms timeout         woken in 301ms
+ *   epoll ET      2000ms timeout         woken in 301ms
+ *   read          woken in 301ms         woken in 301ms
+ *
+ * It deadlocks any pipeline whose consumer polls: GNU cat feeds stdout
+ * with splice() when it is a pipe, so `cat big | bun script.js` hangs
+ * forever -- Bun sits in epoll_wait, cat fills the 512KB pipe and then
+ * blocks in splice() too. `cat big | wc -c` is fine (wc blocks in read),
+ * and `dd ... | bun script.js` is fine (dd uses write).
+ *
+ * Fix: when the destination is a pipe, move the bytes through a userspace
+ * buffer so the pipe is fed by write(), whose wakeup works. That costs one
+ * copy and gives up splice's zero-copy property on this path, which is the
+ * right trade for a shim whose job is correctness.
+ *
+ * Holding the last byte back and sending only that one with write() would
+ * have kept the zero-copy bulk transfer, and a probe confirmed it wakes the
+ * poller -- but it does not survive the real case: cat asks for 524288
+ * bytes into a 512KB pipe, splice fills the pipe and returns short, and the
+ * trailing write() is never reached. A wakeup scheme that fails exactly
+ * when the pipe is full is no use, since that is when the reader is
+ * guaranteed to be waiting.
+ */
+#ifndef SPLICE_F_NONBLOCK
+#define SPLICE_F_NONBLOCK 2
+#endif
+
+static int splice_fd_is_fifo(int fd)
+{
+	struct stat st;
+	return fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode);
+}
+
+/*
+ * One bounded chunk, source -> userspace -> destination. Returning less than
+ * `len` is allowed by splice(2) and every splice-based copy loop already
+ * handles it, so a 64KB ceiling costs nothing but bounds the stack.
+ */
+static ssize_t splice_through_buffer(int fd_in, off_t *off_in, int fd_out,
+				     size_t len, unsigned int flags)
+{
+	char buf[65536];
+	if (len > sizeof buf)
+		len = sizeof buf;
+
+	/* SPLICE_F_NONBLOCK promises not to block on the source; read() alone
+	   would, unless fd_in itself is O_NONBLOCK. POLLHUP-without-POLLIN
+	   still reports ready, so EOF keeps flowing through to the read(). */
+	if (flags & SPLICE_F_NONBLOCK) {
+		struct pollfd pfd = { .fd = fd_in, .events = POLLIN };
+		if (poll(&pfd, 1, 0) <= 0) {
+			errno = EAGAIN;
+			return -1;
+		}
+	}
+
+	ssize_t got = off_in ? pread(fd_in, buf, len, *off_in)
+			     : read(fd_in, buf, len);
+	if (got <= 0)
+		return got;	/* 0 is EOF -- the answer splice() should give */
+
+	/* These bytes are already out of the source, so a short write cannot
+	   be reported back as "not consumed" the way splice() would: it has to
+	   be retried or the data is gone. That means a SPLICE_F_NONBLOCK caller
+	   can still block here on a full destination. Losing bytes is the worse
+	   failure, and the alternative (peek at pipe space first) has no
+	   portable form. */
+	size_t done = 0;
+	while (done < (size_t)got) {
+		ssize_t w = write(fd_out, buf + done, (size_t)got - done);
+		if (w > 0) {
+			done += (size_t)w;
+			continue;
+		}
+		if (w < 0 && errno == EINTR)
+			continue;
+		if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			struct pollfd pfd = { .fd = fd_out, .events = POLLOUT };
+			if (poll(&pfd, 1, -1) < 0 && errno != EINTR)
+				break;
+			continue;
+		}
+		break;		/* EPIPE and friends: report what did land */
+	}
+	if (done == 0)
+		return -1;	/* errno still set by write() */
+	if (off_in)
+		*off_in += (off_t)done;
+	return (ssize_t)done;
+}
+
 ssize_t splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
 	       size_t len, unsigned int flags)
 {
@@ -867,6 +974,13 @@ ssize_t splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
 		errno = ENOSYS;
 		return -1;
 	}
+
+	/* off_out must be NULL when the destination is a pipe (kernel rule);
+	   testing it as well keeps this path off any call the kernel would
+	   have rejected anyway. */
+	if (len > 0 && off_out == NULL && !shim_disabled("splice") &&
+	    splice_fd_is_fifo(fd_out))
+		return splice_through_buffer(fd_in, off_in, fd_out, len, flags);
 
 	ssize_t rc = real(fd_in, off_in, fd_out, off_out, len, flags);
 	if (rc >= 0 || errno != EPIPE)
