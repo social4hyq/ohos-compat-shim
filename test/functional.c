@@ -1288,9 +1288,9 @@ static void test_fchmodat2_bun_lchmod_symlink_nofollow(void)
 	/* bun's lchmod (src/sys/lib.rs) issues fchmodat2 via the raw syscall()
 	 * entry — this musl has no libc wrapper — passing AT_SYMLINK_NOFOLLOW:
 	 *   syscall(SYS_fchmodat2, AT_FDCWD, path, mode, AT_SYMLINK_NOFOLLOW)
-	 * The shim's fallback drops the flag (classic fchmodat() can't honor
-	 * NOFOLLOW portably) and applies fchmodat(dirfd, path, mode, 0). On a
-	 * regular file that's the same result. This pins the exact bun call shape
+	 * The shim's fallback forwards the flag to classic fchmodat(), which
+	 * this musl honours. On a regular file NOFOLLOW is a no-op either way;
+	 * the symlink case is covered separately below. This pins the bun call shape
 	 * — syscall() entry point + the NOFOLLOW flag bun passes — so a regression
 	 * in either the entry-point dispatch or the flag handling is caught. */
 	char path[4096];
@@ -1319,10 +1319,66 @@ static void test_fchmodat2_bun_lchmod_symlink_nofollow(void)
 	struct stat st;
 	mode_t applied = (stat(path, &st) == 0) ? (st.st_mode & 07777) : 0;
 	char detail[128];
-	snprintf(detail, sizeof(detail), "ret=%ld mode=%o (want 0640, flag dropped)",
+	snprintf(detail, sizeof(detail), "ret=%ld mode=%o (want 0640)",
 		 ret, (unsigned)applied);
 	check(ret == 0 && applied == 0640, "fchmodat2_bun_lchmod", detail);
 	unlink(path);
+}
+
+/* AT_SYMLINK_NOFOLLOW must not be silently downgraded into "follow it".
+ * The shim once dropped the flag on its fallback path, so a chmod aimed at
+ * a symlink landed on the file the link pointed at -- a chmod escaping the
+ * directory the caller meant to touch. Linux refuses the operation instead
+ * (a symlink's own mode bits are meaningless), and this musl's fchmodat
+ * does too once the flag actually reaches it. */
+static void test_fchmodat2_symlink_not_followed(void)
+{
+	char victim[4096], link[4096];
+	const char *tmp = getenv("TMPDIR");
+	if (!tmp)
+		tmp = "/data/storage/el2/base/tmp";
+	snprintf(victim, sizeof(victim), "%s/ohos-compat-fntest-lchmod-victim", tmp);
+	snprintf(link, sizeof(link), "%s/ohos-compat-fntest-lchmod-link", tmp);
+	unlink(victim);
+	unlink(link);
+
+	int fd = open(victim, O_CREAT | O_WRONLY, 0600);
+	if (fd < 0) {
+		check(0, "fchmodat2_symlink_not_followed", "could not create fixture");
+		return;
+	}
+	close(fd);
+	if (symlink(victim, link) != 0) {
+		check(0, "fchmodat2_symlink_not_followed", "could not create symlink");
+		unlink(victim);
+		return;
+	}
+
+	long ret;
+	int errno_out;
+	if (!guarded_fchmodat2(AT_FDCWD, link, 0777, AT_SYMLINK_NOFOLLOW, &ret, &errno_out)) {
+		printf("INFO  %-28s would SIGSYS without the shim's protection "
+		       "(caught here so the suite could continue) — expected at baseline\n",
+		       "fchmodat2_symlink_not_followed");
+		checks++;
+		unlink(link);
+		unlink(victim);
+		return;
+	}
+
+	struct stat st;
+	mode_t victim_mode = (stat(victim, &st) == 0) ? (st.st_mode & 07777) : 0;
+	char detail[160];
+	snprintf(detail, sizeof(detail),
+		 "ret=%ld errno=%d, target mode=%o (want 0600 untouched)", ret, errno_out,
+		 (unsigned)victim_mode);
+	/* The call must not succeed in changing the target. Refusing outright
+	 * (ENOTSUP, as Linux does) and leaving it alone are both acceptable;
+	 * silently rewriting the target's mode is not. */
+	check(victim_mode == 0600, "fchmodat2_symlink_not_followed", detail);
+
+	unlink(link);
+	unlink(victim);
 }
 
 static void test_passthrough_getpid(void)
@@ -1450,6 +1506,7 @@ int main(void)
 
 	test_fchmodat2_applies_mode();
 	test_fchmodat2_bun_lchmod_symlink_nofollow();
+	test_fchmodat2_symlink_not_followed();
 
 	test_passthrough_getpid();
 	test_passthrough_read_write();

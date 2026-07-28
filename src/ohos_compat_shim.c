@@ -517,10 +517,9 @@ long syscall(long number, ...)
 /*       SIGSYS on real HarmonyOS hardware regardless of arguments, same */
 /*       failure mode as close_range (not a graceful ENOSYS) — verified  */
 /*       with a standalone guarded repro before writing this. Falls back */
-/*       to the classic fchmodat() (dropping the flags argument — loses  */
-/*       AT_SYMLINK_NOFOLLOW semantics on a symlink target, matching     */
-/*       ohos-preflight's validated solutions/c5_fchmodat2.c). Simpler   */
-/*       than close_range: no evidence different flag values change the  */
+/*       to the classic fchmodat(), forwarding AT_SYMLINK_NOFOLLOW —     */
+/*       this musl honours it (measured below). Simpler than             */
+/*       close_range: no evidence different flag values change the       */
 /*       SIGSYS outcome here (there's no second underlying syscall like  */
 /*       unshare() to independently trip), so one process-wide probe is  */
 /*       trusted rather than re-guarding every call.                     */
@@ -561,11 +560,26 @@ static int fc2_dispatch(int dirfd, const char *path, mode_t mode, int flags)
 		}
 	}
 
-	/* Fallback: classic fchmodat(), no flags — the one meaningful loss is
-	 * AT_SYMLINK_NOFOLLOW (mode would apply to the symlink's target
-	 * instead of being rejected/applied to the link itself). Matches
-	 * ohos-preflight's validated solutions/c5_fchmodat2.c exactly. */
-	return fchmodat(dirfd, path, mode, 0);
+	/* Fallback: classic fchmodat(), forwarding AT_SYMLINK_NOFOLLOW.
+	 *
+	 * This used to drop the flag, on the assumption that classic fchmodat()
+	 * could not honour it. Measured on this device, it can:
+	 *
+	 *   regular file + NOFOLLOW -> rc=0, mode applied
+	 *   directory    + NOFOLLOW -> rc=0, mode applied
+	 *   symlink      + NOFOLLOW -> rc=-1 ENOTSUP, target untouched
+	 *
+	 * which is exactly Linux's contract (a symlink's own mode bits are
+	 * meaningless, so chmod on one is refused). Dropping the flag was
+	 * therefore not just lossy but unsafe: it turned "do not follow this
+	 * symlink" into "follow it", so a chmod aimed at a link landed on
+	 * whatever the link pointed at. bun's installer relies on the refusal
+	 * to avoid chmod-ing a file outside the package via a symlinked bin
+	 * target (test/cli/install/symlink-path-traversal.test.ts).
+	 *
+	 * Other fchmodat2-only flags (AT_EMPTY_PATH) stay dropped: classic
+	 * fchmodat() would reject them outright and no caller here uses them. */
+	return fchmodat(dirfd, path, mode, flags & AT_SYMLINK_NOFOLLOW);
 }
 
 /* ==================================================================== */
