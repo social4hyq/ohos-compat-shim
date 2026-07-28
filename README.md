@@ -14,6 +14,7 @@
 | `getcwd()` | hmdfs/tmpfs 父目录缺 `+x` 时 `EACCES`，或 cwd 被 rmdir 后 `ENOENT`（常见于生命周期脚本、`bun run`） | 开启 |
 | `linkat()` / `symlinkat()` | 沙箱化的安装目标目录里报 `EPERM`/`EACCES` | **关闭**（需手动开启）|
 | `syscall(SYS_fchmodat2)` | 真机 `SIGSYS`，OpenHarmony 容器里是 `ENOSYS` —— 两边都失败，但失败方式不同 | 开启 |
+| `splice()` | 源端 EOF 时返回 `-1/EPIPE`，Linux 返回 `0` —— 所有 splice 拷贝循环在文件尾误报错误 | 开启 |
 
 `pthread_cancel()` 在这个平台上是 musl 的空桩实现，刻意**不**做 shim ——一个 preload 库没办法给调用方注入它所需要的协作式取消点。
 
@@ -40,6 +41,7 @@
 | `getcwd` | 探针 `g7_getcwd_unlinked` | 平台层面无法修复（这是符合 POSIX 语义的 `ENOENT` 行为）—— 这一项会一直留着 |
 | `linkat`/`symlinkat` | 探针 `g5_linkat_eperm`/`g6_symlinkat_eperm` | 目标安装目录不再对硬链接/符号链接返回 `EPERM`/`EACCES` |
 | `fchmodat2` | 探针 `c5_fchmodat2` | HarmonyOS 放行 452 号系统调用（目前是 `both_fail`：OpenHarmony 容器里也是 `ENOSYS`，所以这项收口不光需要 HarmonyOS 放行，容器那边的内核也得先实现这个系统调用）|
+| `splice` | 功能测试 `splice_eof_is_zero`（baseline 段即为探针）| 内核修正 `splice()` 的 EOF 语义，源端耗尽时返回 `0` 而不是 `EPIPE` |
 
 定期重跑 `ohos-preflight` 的双轨对比；一旦某个探针稳定地从 `needs_relax`变成 `same`，对应符号的拦截逻辑就可以在后续版本里默认关闭（或直接移除）——等消费者所支持的所有 HarmonyOS 版本都不再需要剩下的任何一个症状时，就应该停止预加载这个库。
 
@@ -48,6 +50,24 @@
 这套方案只对通过**动态链接的 libc 符号**解析的调用生效。通过内联汇编发起系统调用的代码——例如 Bun 的 rustix `linux_raw` 后端用于 `openat2`/`epoll_pwait2` 的那部分——根本不会碰这些符号，`LD_PRELOAD` 插桩自然也就够不着它。这些还是得走真正的源码级移植。完整矩阵见可行性文档。
 
 静态链接的二进制同样没法做 shim —— `LD_PRELOAD` 只对动态链接的目标生效。接入前先用 `readelf -d <binary>` 确认一下（找 `NEEDED libc.so`）。
+
+## `splice()` 的 EOF 判据（为什么不能无脑把 EPIPE 当 EOF）
+
+这个内核在**源端 pipe 到达 EOF** 时让 `splice()` 返回 `-1/EPIPE`，而 Linux 返回 `0`；同一个 pipe 上 `read()` 却正确返回 `0`，所以坏的只有 splice 这条路径。后果是每一个 splice 拷贝循环都会把正常的文件尾当成致命错误 —— GNU coreutils 的 `cat` 只要 stdin 和 stdout 同为管道就走这条路，于是打印 `cat: -: Broken pipe` 并以 1 退出。
+
+**真正的 EPIPE（目标端读端已关闭）必须照常报出来**，否则会静默截断拷贝。两者用 `poll()` 分得很干净，而且 `poll()` 是无损的 —— 不像 `read()`，它不会消耗掉我们正要搬运的那个字节：
+
+| 情形 | `poll(fd_in)` | `poll(fd_out)` |
+|---|---|---|
+| 源端 EOF（内核 bug）| `POLLIN\|POLLHUP` | `POLLOUT` |
+| 目标端损坏（真 EPIPE）| `POLLIN` | `POLLOUT\|POLLERR` |
+| 两者同时发生 | `POLLIN\|POLLHUP` | `POLLOUT\|POLLERR` |
+
+判据就是目标端的 `POLLERR`。**先查目标端**，这样"两者同时"的歧义情形会落到"真错误"一侧 —— 这是保守的方向：把一个恰好也处于 EOF 的坏管道报成错误没有任何损失，而吞掉一个真 EPIPE 会让拷贝悄悄少写数据。
+
+注意 EOF 的 pipe 上 `POLLIN` 也是置位的（此时 `read()` 会立刻返回 0），所以判 EOF 的依据是 `POLLHUP`，不是"没有 `POLLIN`"。整个分支只在 `splice()` 已经返回 `EPIPE` 时才进入，其余情况原样透传，正常路径的开销就是一次比较。
+
+这个内核的 `splice()` 还有第二个毛病：**对空管道会一直阻塞，无视 `O_NONBLOCK` 和 `SPLICE_F_NONBLOCK`**。该行为不会返回 `EPIPE`，因此碰不到上面的分支，这里没有处理 —— 记在这里是因为它会让"给 splice 加个非阻塞探测"这类想法直接失效。
 
 ## 已知平台行为（禁用 `close_range` 前请先读这段）
 

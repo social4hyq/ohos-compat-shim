@@ -56,6 +56,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <limits.h>
 #include <pwd.h>
 #include <sched.h>
@@ -117,6 +118,7 @@ enum {
 	SD_FCHMODAT2   = 1 << 4,
 	SD_LINKAT      = 1 << 5,
 	SD_SYMLINKAT   = 1 << 6,
+	SD_SPLICE      = 1 << 7,
 };
 
 static int g_disable_mask = -1;
@@ -141,6 +143,8 @@ static void parse_toggle_masks(void)
 		d |= SD_LINKAT;
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "symlinkat"))
 		d |= SD_SYMLINKAT;
+	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "splice"))
+		d |= SD_SPLICE;
 	g_disable_mask = d; /* set last: non-negative value doubles as "done" */
 }
 
@@ -161,6 +165,8 @@ static int shim_disabled(const char *name)
 		return !!(g_disable_mask & SD_LINKAT);
 	if (strcmp(name, "symlinkat") == 0)
 		return !!(g_disable_mask & SD_SYMLINKAT);
+	if (strcmp(name, "splice") == 0)
+		return !!(g_disable_mask & SD_SPLICE);
 	return 0;
 }
 
@@ -802,6 +808,75 @@ static int copy_fd_contents(int src_fd, int dst_fd)
 }
 
 typedef int (*linkat_fn)(int, const char *, int, const char *, int);
+
+/* ------------------------------------------------------------------ */
+/*  splice(2): EOF on the source is reported as EPIPE instead of 0      */
+/* ------------------------------------------------------------------ */
+/*
+ * This kernel returns -1/EPIPE from splice() when the *source* pipe is at
+ * end-of-file, where Linux returns 0. read() on that same pipe correctly
+ * returns 0, so only the splice path is affected. Every splice-based copy
+ * loop therefore mistakes a normal EOF for a fatal error: GNU coreutils'
+ * cat takes that path whenever stdin and stdout are both pipes and prints
+ * "cat: -: Broken pipe" then exits 1. Measured with a standalone probe,
+ * no Bun involved.
+ *
+ * A genuine EPIPE (the destination's read end is gone) must still be
+ * reported. poll() separates the two cleanly and is non-destructive --
+ * unlike read(), it cannot consume the byte we are asked to move:
+ *
+ *   source at EOF        poll(fd_in)=POLLIN|POLLHUP  poll(fd_out)=POLLOUT
+ *   destination broken   poll(fd_in)=POLLIN          poll(fd_out)=POLLOUT|POLLERR
+ *   both at once         poll(fd_out)=POLLOUT|POLLERR
+ *
+ * So POLLERR on the destination decides it. Checking the destination FIRST
+ * makes the ambiguous "both" case resolve to the real error, which is the
+ * conservative direction: reporting a broken pipe that also happens to be
+ * at EOF loses nothing, whereas swallowing a real EPIPE would silently
+ * truncate a copy.
+ *
+ * Only reached when splice() has already failed with EPIPE; every other
+ * outcome is passed through untouched, so the cost on the normal path is
+ * one comparison. Note POLLIN is set on an EOF pipe too (a read would
+ * return 0 immediately), which is why POLLHUP -- not the absence of
+ * POLLIN -- is the EOF signal.
+ */
+typedef ssize_t (*splice_fn)(int, off_t *, int, off_t *, size_t, unsigned int);
+
+ssize_t splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
+	       size_t len, unsigned int flags)
+{
+	static splice_fn real = NULL;
+	if (!real)
+		real = (splice_fn)dlsym(RTLD_NEXT, "splice");
+	if (!real) {
+		errno = ENOSYS;
+		return -1;
+	}
+
+	ssize_t rc = real(fd_in, off_in, fd_out, off_out, len, flags);
+	if (rc >= 0 || errno != EPIPE)
+		return rc;
+	if (shim_disabled("splice"))
+		return rc;
+
+	int saved = errno;
+
+	/* Destination genuinely broken? Then EPIPE is the correct answer. */
+	struct pollfd out_pfd = { .fd = fd_out, .events = POLLOUT };
+	if (poll(&out_pfd, 1, 0) > 0 && (out_pfd.revents & (POLLERR | POLLNVAL))) {
+		errno = saved;
+		return rc;
+	}
+
+	/* Source hung up with nothing left to move: that is a plain EOF. */
+	struct pollfd in_pfd = { .fd = fd_in, .events = POLLIN };
+	if (poll(&in_pfd, 1, 0) > 0 && (in_pfd.revents & POLLHUP))
+		return 0;
+
+	errno = saved;
+	return rc;
+}
 
 int linkat(int olddirfd, const char *oldpath, int newdirfd,
 	  const char *newpath, int flags)

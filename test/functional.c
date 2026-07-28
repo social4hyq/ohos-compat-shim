@@ -1349,6 +1349,64 @@ static void test_passthrough_read_write(void)
 	      "passthrough_read_write", "pipe write/read unaffected");
 }
 
+/* ---- splice(2): this kernel reports source-EOF as EPIPE, not 0 ---- */
+
+static void test_splice_eof_is_zero(void)
+{
+	int src[2], dst[2];
+	if (pipe(src) != 0 || pipe(dst) != 0) {
+		check(0, "splice_eof_is_zero", "pipe() failed");
+		return;
+	}
+	if (write(src[1], "hi\n", 3) != 3) {
+		check(0, "splice_eof_is_zero", "seed write failed");
+		return;
+	}
+	close(src[1]);                       /* no further data can arrive */
+
+	char drain[64];
+	ssize_t first = splice(src[0], NULL, dst[1], NULL, 1 << 19, 0);
+	ssize_t got = read(dst[0], drain, sizeof(drain));
+	ssize_t eof = splice(src[0], NULL, dst[1], NULL, 1 << 19, 0);
+	int e = errno;
+	close(src[0]); close(dst[0]); close(dst[1]);
+
+	char detail[160];
+	snprintf(detail, sizeof(detail),
+		 "moved=%zd drained=%zd eof_call=%zd%s%s (want 3/3/0)",
+		 first, got, eof, eof < 0 ? " errno=" : "",
+		 eof < 0 ? strerror(e) : "");
+	check(first == 3 && got == 3 && eof == 0, "splice_eof_is_zero", detail);
+}
+
+static void test_splice_real_epipe_preserved(void)
+{
+	int src[2], dst[2];
+	if (pipe(src) != 0 || pipe(dst) != 0) {
+		check(0, "splice_real_epipe_preserved", "pipe() failed");
+		return;
+	}
+	if (write(src[1], "hi\n", 3) != 3) {
+		check(0, "splice_real_epipe_preserved", "seed write failed");
+		return;
+	}
+	close(dst[0]);                       /* destination genuinely broken */
+
+	void (*prev)(int) = signal(SIGPIPE, SIG_IGN);
+	ssize_t rc = splice(src[0], NULL, dst[1], NULL, 1 << 19, 0);
+	int e = errno;
+	signal(SIGPIPE, prev);
+	close(src[0]); close(src[1]); close(dst[1]);
+
+	/* Must NOT be rewritten to 0 -- swallowing this would silently
+	 * truncate a copy. Data was available, so a 0 here means the shim
+	 * mistook a broken destination for end-of-input. */
+	char detail[160];
+	snprintf(detail, sizeof(detail), "rc=%zd %s (want -1/EPIPE, never 0)",
+		 rc, rc < 0 ? strerror(e) : "no error");
+	check(rc < 0 && e == EPIPE, "splice_real_epipe_preserved", detail);
+}
+
 int main(void)
 {
 	/* Must happen before any linkat/symlinkat call in this process — the
@@ -1395,6 +1453,8 @@ int main(void)
 
 	test_passthrough_getpid();
 	test_passthrough_read_write();
+	test_splice_eof_is_zero();
+	test_splice_real_epipe_preserved();
 
 	printf("%s (%d/%d checks failed)\n", failures == 0 ? "ALL PASS" : "SOME FAILED",
 	       failures, checks);
