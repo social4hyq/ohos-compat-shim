@@ -821,6 +821,76 @@ static int copy_fd_contents(int src_fd, int dst_fd)
 	return (n < 0) ? -1 : 0;
 }
 
+/* Copy src_fd to newdirfd/newpath atomically: write a hidden sibling temp
+ * file, then renameat() into place. The previous direct O_CREAT|O_EXCL +
+ * copy made the destination visible at 0 bytes the moment it was created,
+ * so a concurrent quick_exit (bun install aborting on a resolution error
+ * while a worker thread is still flushing its npm manifest cache) left
+ * permanently corrupt 0-byte cache entries ("manifest is invalid" on the
+ * next load — bun-install-registry prereleases-* tests). With tmp+rename
+ * the destination appears complete or not at all; a quick_exit mid-copy
+ * only litters a hidden temp file.
+ *
+ * EEXIST semantics: real linkat fails if newpath exists. renameat would
+ * silently replace it, so pre-check with fstatat; the tiny TOCTOU window
+ * between check and rename is inherent to an emulation and harmless for
+ * the cache-writer workloads this shim serves (they unlink+retry anyway). */
+static int copy_fd_to_path_atomic(int src_fd, int newdirfd, const char *newpath,
+				  mode_t mode)
+{
+	/* The temp file MUST live in newpath's own directory: renameat is
+	 * same-filesystem only, and an absolute newpath with a bare temp name
+	 * would put the temp in the process CWD (possibly another fs → EXDEV). */
+	char tmp[PATH_MAX];
+	const char *slash = strrchr(newpath, '/');
+	size_t dirlen = slash ? (size_t)(slash - newpath) + 1 : 0;
+	if (dirlen >= sizeof(tmp))
+		return -1;
+	int len = snprintf(tmp, sizeof(tmp), "%.*s.ohos-linkat-tmp.%d",
+			   (int)dirlen, newpath, (int)getpid());
+	if (len <= 0 || len >= (int)sizeof(tmp))
+		return -1;
+
+	int dst = -1;
+	for (int i = 0; i < 100; i++) {
+		char *p = tmp + len;
+		if (i > 0)
+			snprintf(p, sizeof(tmp) - len, ".%d", i);
+		dst = openat(newdirfd, tmp,
+			     O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, mode);
+		if (dst >= 0)
+			break;
+		if (errno != EEXIST)
+			return -1;
+	}
+	if (dst < 0)
+		return -1;
+
+	int copy_rc = copy_fd_contents(src_fd, dst);
+	int e = errno;
+	close(dst);
+	if (copy_rc != 0) {
+		unlinkat(newdirfd, tmp, 0);
+		errno = e;
+		return -1;
+	}
+
+	struct stat st;
+	if (fstatat(newdirfd, newpath, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+		unlinkat(newdirfd, tmp, 0);
+		errno = EEXIST;
+		return -1;
+	}
+
+	if (renameat(newdirfd, tmp, newdirfd, newpath) != 0) {
+		e = errno;
+		unlinkat(newdirfd, tmp, 0);
+		errno = e;
+		return -1;
+	}
+	return 0;
+}
+
 typedef int (*linkat_fn)(int, const char *, int, const char *, int);
 
 /* ------------------------------------------------------------------ */
@@ -1034,24 +1104,14 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd,
 		return -1;
 	}
 
-	int dst = openat(newdirfd, newpath, O_WRONLY | O_CREAT | O_EXCL,
-			 st.st_mode & 0777);
-	if (dst < 0) {
+	if (copy_fd_to_path_atomic(src, newdirfd, newpath,
+				   st.st_mode & 0777) != 0) {
 		int e = errno;
 		close(src);
 		errno = e;
 		return -1;
 	}
-
-	int copy_rc = copy_fd_contents(src, dst);
-	int e = errno;
 	close(src);
-	close(dst);
-	if (copy_rc != 0) {
-		unlinkat(newdirfd, newpath, 0);
-		errno = e;
-		return -1;
-	}
 	return 0;
 }
 
@@ -1091,23 +1151,13 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath)
 		return -1;
 	}
 
-	int dst = openat(newdirfd, linkpath, O_WRONLY | O_CREAT | O_EXCL,
-			 st.st_mode & 0777);
-	if (dst < 0) {
+	if (copy_fd_to_path_atomic(src, newdirfd, linkpath,
+				   st.st_mode & 0777) != 0) {
 		int e = errno;
 		close(src);
 		errno = e;
 		return -1;
 	}
-
-	int copy_rc = copy_fd_contents(src, dst);
-	int e = errno;
 	close(src);
-	close(dst);
-	if (copy_rc != 0) {
-		unlinkat(newdirfd, linkpath, 0);
-		errno = e;
-		return -1;
-	}
 	return 0;
 }

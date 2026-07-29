@@ -40,6 +40,8 @@
 | `tmpfile` | 探针 `g1_tmpfile` | 应用沙箱内 `P_tmpdir` 变为可写 |
 | `getcwd` | 探针 `g7_getcwd_unlinked` | 平台层面无法修复（这是符合 POSIX 语义的 `ENOENT` 行为）—— 这一项会一直留着 |
 | `linkat`/`symlinkat` | 探针 `g5_linkat_eperm`/`g6_symlinkat_eperm` | 目标安装目录不再对硬链接/符号链接返回 `EPERM`/`EACCES` |
+
+> **copy fallback 的原子性**：字节拷贝经同目录隐藏临时文件 + `renameat` 落位，目标路径要么完整出现、要么不出现。此前直接 `O_CREAT|O_EXCL` + 拷贝的实现会让目标在 0 字节时即可见——bun install 因解析失败 `quick_exit`、而 worker 线程还在刷 npm manifest 缓存时，会留下永久性 0 字节 `.npm` 缓存（下次加载报 "manifest is invalid"，bun-install-registry 的 prereleases-* 用例就是踩在这里）。临时文件放在 `newpath` 同目录是硬性要求：`renameat` 不能跨文件系统，绝对路径的 `newpath` 配裸临时文件名会把临时文件落到进程 CWD（可能异 fs → `EXDEV`）。
 | `fchmodat2` | 探针 `c5_fchmodat2` | HarmonyOS 放行 452 号系统调用（目前是 `both_fail`：OpenHarmony 容器里也是 `ENOSYS`，所以这项收口不光需要 HarmonyOS 放行，容器那边的内核也得先实现这个系统调用）|
 | `splice` （EOF 语义）| 功能测试 `splice_eof_is_zero`（baseline 段即为探针）| 内核修正 `splice()` 的 EOF 语义，源端耗尽时返回 `0` 而不是 `EPIPE` |
 | `splice` （poll 唤醒）| 功能测试 `splice_wakes_poll_waiter`（baseline 段即为探针）| 内核让写入管道的 splice 唤醒 poll/epoll 等待者。收口后应删掉 bounce buffer 路径，恢复零拷贝 |
