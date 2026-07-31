@@ -585,10 +585,35 @@ static int fc2_dispatch(int dirfd, const char *path, mode_t mode, int flags)
 /* ==================================================================== */
 /*  2. getpwuid_r() — HarmonyOS HAP uids (2002xxxx) aren't in /etc/passwd */
 /*     Real impl returns ENOENT/0-with-NULL-result; synthesize a minimal */
-/*     passwd record from env vars, matching Node's os.userInfo() needs. */
+/*     passwd record matching Node's os.userInfo() needs. When the query */
+/*     is for the caller's own uid, prefer the real OS-account name from */
+/*     libos_account_ndk.so (OH_OsAccount_GetName, API 12+), then env    */
+/*     vars, then a uid-derived placeholder.                             */
 /* ==================================================================== */
 
+#ifndef LOGIN_NAME_MAX
+#define LOGIN_NAME_MAX 256
+#endif
+
 typedef int (*getpwuid_r_fn)(uid_t, struct passwd *, char *, size_t, struct passwd **);
+
+/* Lazily resolve OH_OsAccount_GetName; cache the handle and symbol for the
+ * process lifetime (getpwuid_r() is called repeatedly, e.g. by Node's
+ * os.userInfo()). Returns NULL when the library or symbol is unavailable,
+ * so callers transparently fall back to env-var synthesis. */
+typedef int (*ohos_get_name_fn)(char *, size_t);
+
+static ohos_get_name_fn ohos_get_name_resolve(void)
+{
+	static void *handle = NULL;
+	static ohos_get_name_fn fn = NULL;
+	if (!handle) {
+		handle = dlopen("libos_account_ndk.so", RTLD_NOW | RTLD_LOCAL);
+		if (handle)
+			fn = (ohos_get_name_fn)dlsym(handle, "OH_OsAccount_GetName");
+	}
+	return fn;
+}
 
 int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
 	      struct passwd **result)
@@ -612,12 +637,23 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
 		return ENOENT;
 	}
 
-	/* Fallback: synthesize from environment, mirroring
-	 * ohos-preflight/solutions/i9_getpwuid_r.c. A set-but-empty var
-	 * (e.g. `export LOGNAME=`) is treated the same as unset. */
-	const char *username = getenv("LOGNAME");
-	if (username && !*username)
-		username = NULL;
+	/* Fallback: synthesize from the OS-account name (only valid for the
+	 * caller's own uid — the account API has no uid parameter), then
+	 * environment, mirroring ohos-preflight/solutions/i9_getpwuid_r.c.
+	 * A set-but-empty var (e.g. `export LOGNAME=`) is treated the same
+	 * as unset. */
+	const char *username = NULL;
+	char account_name[LOGIN_NAME_MAX];
+	if (uid == getuid()) {
+		ohos_get_name_fn get_name = ohos_get_name_resolve();
+		if (get_name && get_name(account_name, sizeof(account_name)) == 0)
+			username = account_name;
+	}
+	if (!username) {
+		username = getenv("LOGNAME");
+		if (username && !*username)
+			username = NULL;
+	}
 	if (!username) {
 		username = getenv("USER");
 		if (username && !*username)

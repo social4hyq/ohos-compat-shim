@@ -25,6 +25,8 @@
 - `close_range`：`cr_probe_syscall()` 每个进程只跑一次；如果真实系统调用成功，该进程就会缓存 `WORKS` 状态，之后再也不会碰用户态 fallback。
 - `getpwuid_r` / `tmpfile` / `getcwd` / `linkat` / `symlinkat`：**每次**调用都会先调用真实函数；shim 自己的逻辑只在真实调用失败、且失败特征与上表记录的 HarmonyOS 沙箱症状完全吻合时才会介入。
 
+`getpwuid_r` 的 fallback 用户名来源：优先调用 `OH_OsAccount_GetName()`（`libos_account_ndk.so`，运行时 dlopen、句柄缓存，编译期零 SDK 依赖）取当前系统账号名——但只在查询的 uid 等于进程自身 uid 时（账号 API 没有 uid 参数）；失败或非自身 uid 时回落 `$LOGNAME`/`$USER`，最后退化为 `u<uid>` 占位符。其余字段（`pw_dir`/`pw_shell`/`pw_uid`/`pw_gid`）逻辑不变，账号 API 无法提供。
+
 实际效果：一旦 HarmonyOS 哪天把 `close_range` 加入白名单（ohos-preflight 报告里 441 号被标为 P0，诉求正是这个），或者修复了另外四个症状里的任何一个，**所有新启动的进程都会自动享受到这个改进**——不需要重新编译 shim，不需要重新部署，这个仓库里也不需要改一行代码。
 
 但这**不代表**平台跟上之后开销就会归零。只要消费者仍然 `LD_PRELOAD` 这个库，每次调用依旧要付出进入拦截函数、以及做一次 `dlsym` 缓存过的真实调用尝试的代价（在[性能](#性能)一节中实测约为 10 ns/次的透传税，对已经成功的路径来说几乎可以忽略）。真正做到*完全*零开销的唯一办法，是消费者不再为该符号预加载这个库 ——这是**消费者自己的打包决策**，shim 本身做不到，因为它在编译期根本无法预知运行时某台设备的沙箱究竟允许什么。
@@ -229,7 +231,7 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 | `tmpfile` | 3 011 710 ns/次 | ~33 500 ns/次 | **慢约 90 倍** |
 | `getcwd` | 1922.8 ns/次 | ~272 ns/次 | **慢约 7 倍** |
 
-这个差距不是 shim 本身的开销 —— 而是「真实系统调用/libc 调用直接就能用」和「每次调用都需要一个用户态的变通方案」（`close_range` 靠 `/proc/self/fd` 枚举、`tmpfile` 靠 `mkstemp()`、`getpwuid_r` 靠拼接环境变量）之间真实存在的成本差异。这也是上面收口跟踪表为什么重要的最直接证据：HarmonyOS 补上的每一个缺口，对用了 shim 的消费者来说，都是一次实打实的、两位数倍数级别的性能提升，而不仅仅是修正确性。
+这个差距不是 shim 本身的开销 —— 而是「真实系统调用/libc 调用直接就能用」和「每次调用都需要一个用户态的变通方案」（`close_range` 靠 `/proc/self/fd` 枚举、`tmpfile` 靠 `mkstemp()`、`getpwuid_r` 靠合成用户记录）之间真实存在的成本差异。这也是上面收口跟踪表为什么重要的最直接证据：HarmonyOS 补上的每一个缺口，对用了 shim 的消费者来说，都是一次实打实的、两位数倍数级别的性能提升，而不仅仅是修正确性。
 
 ### 容器内部：加不加 shim
 
@@ -260,14 +262,14 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 
 | 字段 | `getpwuid_r` 真实实现 | `getpwuid_r` fallback |
 |---|---|---|
-| `pw_name` | `root` | `u0`（基于 uid 的占位符 —— 没有环境变量可以拿来当真实用户名）|
+| `pw_name` | `root` | `u0`（容器里无账号服务/环境变量时的退化值；真机上 `uid==getuid()` 时优先返回 `OH_OsAccount_GetName` 的账号名，本机实测 `hyq`）|
 | `pw_passwd` | `x` | ``（空 —— 没有对应物）|
-| `pw_gecos` | `root` | `u0`（和 `pw_name` 保持一致）|
+| `pw_gecos` | `root` | `u0`（和 `pw_name` 保持一致，真机同上）|
 | `pw_dir` | `/root` | `/root`（一致 —— 两边都读的是 `$HOME`）|
 | `pw_shell` | `/bin/sh` | `/bin/false`（写死的 —— 没办法知道真实 shell 是什么）|
 | `pw_uid` / `pw_gid` | `0` / `0` | `0` / `0`（一致 —— 来自真实系统调用，不是环境变量）|
 
-所以 fallback 在数值型身份字段和 `pw_dir` 上是准确的（只要 `$HOME`设置了，实践中它基本总是设置的），但字符串型身份字段（name/gecos/shell）会退化成合成的占位符。这本来就是已经写明的权衡，只是现在有了逐字段的确认，而不是靠假设。`tmpfile` 的写入/读回往返在真实实现和 fallback 之间完全一致（在这个测试深度下没发现功能差异）。`getcwd` 的 fallback 现在优先 `readlink("/proc/self/cwd")` 返回**真实 cwd**（内核 `d_path()` 不受用户态 `+x` 限制，正是 `getcwd()` 父目录遍历失败而它能成功的原因），用 `stat()` 校验路径仍存在；只有当路径确已消失（rmdir 后 `stat` 返回 `ENOENT`）才回落 `$HOME`。所以对 hmdfs `EACCES` 这类「cwd 有效但 `getcwd()` 走不通」的场景，fallback 给的是正确路径而非 `$HOME` 猜测——这正是让 bun 能撤掉 `ohos_set_pwd`/`cd-prefix` 的关键。
+所以 fallback 在数值型身份字段和 `pw_dir` 上是准确的（只要 `$HOME`设置了，实践中它基本总是设置的）。字符串型身份字段：真机上查询自身 uid 时 name/gecos 取的是真实账号名（`OH_OsAccount_GetName`，本机实测 `hyq`），只有账号服务不可用或查询别的 uid 时才退化为 env/`u<uid>` 占位符；`pw_shell` 依旧写死为 `/bin/false`（账号 API 无法提供）。这本来就是已经写明的权衡，只是现在有了逐字段的确认，而不是靠假设。`tmpfile` 的写入/读回往返在真实实现和 fallback 之间完全一致（在这个测试深度下没发现功能差异）。`getcwd` 的 fallback 现在优先 `readlink("/proc/self/cwd")` 返回**真实 cwd**（内核 `d_path()` 不受用户态 `+x` 限制，正是 `getcwd()` 父目录遍历失败而它能成功的原因），用 `stat()` 校验路径仍存在；只有当路径确已消失（rmdir 后 `stat` 返回 `ENOENT`）才回落 `$HOME`。所以对 hmdfs `EACCES` 这类「cwd 有效但 `getcwd()` 走不通」的场景，fallback 给的是正确路径而非 `$HOME` 猜测——这正是让 bun 能撤掉 `ohos_set_pwd`/`cd-prefix` 的关键。
 
 在 5 次重复的 `--dump` 运行之间做了交叉复核，两两互相比对：真实实现和 fallback 两边的输出每次都逐字节完全一致。这些是确定性的、结构性的差异（纯靠 `getenv()` 合成能填哪些字段、不能填哪些字段），不是抖动或者跟时间相关的输出。
 
@@ -279,7 +281,7 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 | `getcwd` | 253.6 ns/次 | 14.1 ns/次 | **fallback 快约 17.9 倍** |
 | `tmpfile` | 33 893.3 ns/次 | 29 980.1 ns/次 | 约 1.13 倍（每次跑方向都会反转 —— 基本打平）|
 
-这和 `close_range` 正好是**相反**的方向 —— `close_range` 的 fallback（`/proc/self/fd` 枚举）比真实系统调用要慢 40-90 倍（见[容器对比](#容器对比fallback-到底要花多少代价)）。规律是：一个 fallback 到底比真实调用快还是慢，完全取决于真实调用做了多少 fallback 不需要重做的工作——`getpwuid_r` 的真实路径要做一次 NSS/`/etc/passwd` 查找，`getcwd` 的真实路径要做一次真实的内核路径解析系统调用，这两者 fallback 都完全跳过（纯 `getenv()` + 字符串操作，不涉及任何系统调用）；相比之下，`close_range` 的 fallback 得*主动去枚举并关闭*文件描述符，来近似内核本来会直接做的事情；`tmpfile` 的 fallback 依旧要做真实的文件系统 I/O（`mkstemp()`），所以它和真实调用处在同一个成本量级，而不是彻底跳过了工作。这里不存在一条「fallback 就是更慢」或者「fallback 就是更快」的通用规律——得按每个符号具体去核实。
+这和 `close_range` 正好是**相反**的方向 —— `close_range` 的 fallback（`/proc/self/fd` 枚举）比真实系统调用要慢 40-90 倍（见[容器对比](#容器对比fallback-到底要花多少代价)）。规律是：一个 fallback 到底比真实调用快还是慢，完全取决于真实调用做了多少 fallback 不需要重做的工作——`getpwuid_r` 的真实路径要做一次 NSS/`/etc/passwd` 查找，`getcwd` 的真实路径要做一次真实的内核路径解析系统调用，这两者 fallback 都基本跳过（`getpwuid_r` 在查询自身 uid 时多一次缓存后的账号服务 IPC，失败则纯 `getenv()`）；相比之下，`close_range` 的 fallback 得*主动去枚举并关闭*文件描述符，来近似内核本来会直接做的事情；`tmpfile` 的 fallback 依旧要做真实的文件系统 I/O（`mkstemp()`），所以它和真实调用处在同一个成本量级，而不是彻底跳过了工作。这里不存在一条「fallback 就是更慢」或者「fallback 就是更快」的通用规律——得按每个符号具体去核实。
 
 **同一个工具，在真实 HarmonyOS 设备上运行**（`make real-vs-fallback`，单次运行 —— 下面真机上的数字，方向上和 shim 自己在[性能](#性能)一节里 averaged 出的真机基准数据是一致的，这正是用来确认这些不是偶然波动的关键）：
 

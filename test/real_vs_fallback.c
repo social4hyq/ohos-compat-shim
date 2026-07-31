@@ -23,6 +23,7 @@
  * file's simpler direct-call model.
  */
 #define _GNU_SOURCE
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -47,15 +48,42 @@ static void report(const char *name, long iters, double ms)
 }
 
 /* ==================================================================== */
-/* getpwuid_r: real vs fallback (env-var synthesis, verbatim from shim)  */
+/* getpwuid_r: real vs fallback (verbatim from shim)                    */
 /* ==================================================================== */
+
+#ifndef LOGIN_NAME_MAX
+#define LOGIN_NAME_MAX 256
+#endif
+
+typedef int (*ohos_get_name_fn)(char *, size_t);
+
+static ohos_get_name_fn ohos_get_name_resolve(void)
+{
+	static void *handle = NULL;
+	static ohos_get_name_fn fn = NULL;
+	if (!handle) {
+		handle = dlopen("libos_account_ndk.so", RTLD_NOW | RTLD_LOCAL);
+		if (handle)
+			fn = (ohos_get_name_fn)dlsym(handle, "OH_OsAccount_GetName");
+	}
+	return fn;
+}
 
 static void fallback_getpwuid_r(uid_t uid, struct passwd *pwd, char *buf,
 				size_t buflen, struct passwd **result)
 {
-	const char *username = getenv("LOGNAME");
-	if (username && !*username)
-		username = NULL;
+	const char *username = NULL;
+	char account_name[LOGIN_NAME_MAX];
+	if (uid == getuid()) {
+		ohos_get_name_fn get_name = ohos_get_name_resolve();
+		if (get_name && get_name(account_name, sizeof(account_name)) == 0)
+			username = account_name;
+	}
+	if (!username) {
+		username = getenv("LOGNAME");
+		if (username && !*username)
+			username = NULL;
+	}
 	if (!username) {
 		username = getenv("USER");
 		if (username && !*username)
