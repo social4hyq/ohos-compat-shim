@@ -39,7 +39,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/epoll.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef __NR_close_range
@@ -1517,6 +1519,117 @@ static void test_splice_wakes_poll_waiter(void)
 	      "splice_wakes_poll_waiter", detail);
 }
 
+/* ---- epoll_wait(2): the pipe-repair clamp must not leak premature 0 ----
+ *
+ * Regression tests for the libuv crash (node's uv__io_poll:
+ * "assert(timeout != -1)" when nfds == 0, seen as pnpm SIGABRT). The
+ * epoll_pipe interceptor clamps long waits to a 250ms internal poll so it
+ * can FIONREAD registered pipes; returning that empty 250ms poll to the
+ * CALLER violates the epoll_wait API contract — a -1 wait must block until
+ * an event or signal, and a T-ms wait may return 0 only after ~T ms. The
+ * clamp must be hidden by re-waiting internally. Both checks pass on a
+ * correct kernel (baseline) and MUST pass with the shim. */
+
+static long long test_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void test_epoll_wait_finite_timeout_honored(void)
+{
+	int fds[2];
+	if (pipe(fds) != 0) {
+		check(0, "epoll_wait_timeout_honored", "pipe() failed");
+		return;
+	}
+	int epfd = epoll_create1(0);
+	struct epoll_event ev = { .events = EPOLLIN, .data.fd = fds[0] };
+	if (epfd < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, fds[0], &ev) != 0) {
+		check(0, "epoll_wait_timeout_honored", "epoll setup failed");
+		return;
+	}
+
+	/* Empty pipe registered: a 700ms wait must not return 0 before the
+	 * caller's own timeout expires. The broken shim returned its first
+	 * empty 250ms repair poll, i.e. rc=0 after ~250ms. */
+	long long t0 = test_now_ms();
+	struct epoll_event out;
+	int rc = epoll_wait(epfd, &out, 1, 700);
+	long long elapsed = test_now_ms() - t0;
+	close(fds[0]); close(fds[1]); close(epfd);
+
+	char detail[128];
+	snprintf(detail, sizeof(detail),
+		 "rc=%d elapsed=%lldms (want rc=0, elapsed>=600)", rc, elapsed);
+	check(rc == 0 && elapsed >= 600, "epoll_wait_timeout_honored", detail);
+}
+
+struct epoll_waiter {
+	int epfd;
+	volatile int rc;
+};
+
+static void *epoll_pwaiter_thread(void *arg)
+{
+	struct epoll_waiter *w = arg;
+	struct epoll_event out;
+	w->rc = epoll_pwait(w->epfd, &out, 1, -1, NULL);
+	return NULL;
+}
+
+static void test_epoll_pwait_infinite_no_zero_return(void)
+{
+	int fds[2];
+	if (pipe(fds) != 0) {
+		check(0, "epoll_pwait_infinite_no_zero", "pipe() failed");
+		return;
+	}
+	int epfd = epoll_create1(0);
+	struct epoll_event ev = { .events = EPOLLIN, .data.fd = fds[0] };
+	if (epfd < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, fds[0], &ev) != 0) {
+		check(0, "epoll_pwait_infinite_no_zero", "epoll setup failed");
+		return;
+	}
+
+	/* libuv's exact crash shape: an infinite (-1) wait must NEVER return
+	 * 0. Let the waiter park for 600ms — well past the 250ms repair
+	 * poll — and confirm it is still blocked; then publish a byte it
+	 * must observe. On the T50-broken kernel the baseline (no shim) run
+	 * can sporadically fail the wakeup half — that is the bug the shim
+	 * repairs, not a suite defect. */
+	struct epoll_waiter w = { .epfd = epfd, .rc = -99 };
+	pthread_t th;
+	if (pthread_create(&th, NULL, epoll_pwaiter_thread, &w) != 0) {
+		check(0, "epoll_pwait_infinite_no_zero", "pthread_create failed");
+		return;
+	}
+	pthread_detach(th);
+	usleep(600000);
+	int premature_zero = (w.rc == 0);
+	if (write(fds[1], "x", 1) != 1)
+		check(0, "epoll_pwait_infinite_no_zero", "wake write failed");
+
+	/* Bounded join: 2s for the wakeup, so a kernel-struck baseline run
+	 * reports FAIL instead of hanging the whole suite. */
+	int waited_ms = 0;
+	while (w.rc == -99 && waited_ms < 2000) {
+		usleep(20000);
+		waited_ms += 20;
+	}
+	int final_rc = w.rc;
+	close(fds[0]); close(fds[1]); close(epfd);
+
+	char detail[160];
+	snprintf(detail, sizeof(detail),
+		 "premature_zero=%d final_rc=%d (want 0/1)%s",
+		 premature_zero, final_rc,
+		 final_rc == -99 ? " never woken (kernel T50?)" : "");
+	check(!premature_zero && final_rc == 1,
+	      "epoll_pwait_infinite_no_zero", detail);
+}
+
 int main(void)
 {
 	/* Must happen before any linkat/symlinkat call in this process — the
@@ -1567,6 +1680,9 @@ int main(void)
 	test_splice_eof_is_zero();
 	test_splice_real_epipe_preserved();
 	test_splice_wakes_poll_waiter();
+
+	test_epoll_wait_finite_timeout_honored();
+	test_epoll_pwait_infinite_no_zero_return();
 
 	printf("%s (%d/%d checks failed)\n", failures == 0 ? "ALL PASS" : "SOME FAILED",
 	       failures, checks);
