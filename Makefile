@@ -53,12 +53,17 @@ $(BENCH): test/bench.c
 $(RVF): test/real_vs_fallback.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Sign via a temp file + atomic rename, never in place (-inFile == -outFile):
+# in-place signing sporadically fails on-device with FILE_NOT_FOUND right
+# after "write code sign data success" (observed on test/smoke,
+# test/real_vs_fallback, test/functional — then the half-written file makes
+# every later in-place attempt fail too). Temp + mv has never failed.
 sign: all
-	binary-sign-tool sign -selfSign 1 -inFile $(LIB) -outFile $(LIB) && chmod +x $(LIB)
-	binary-sign-tool sign -selfSign 1 -inFile $(SMOKE) -outFile $(SMOKE) && chmod +x $(SMOKE)
-	binary-sign-tool sign -selfSign 1 -inFile $(FUNCTIONAL) -outFile $(FUNCTIONAL) && chmod +x $(FUNCTIONAL)
-	binary-sign-tool sign -selfSign 1 -inFile $(BENCH) -outFile $(BENCH) && chmod +x $(BENCH)
-	binary-sign-tool sign -selfSign 1 -inFile $(RVF) -outFile $(RVF) && chmod +x $(RVF)
+	@for f in $(LIB) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF); do \
+		echo "sign $$f"; \
+		binary-sign-tool sign -selfSign 1 -inFile $$f -outFile $$f.signed && \
+		chmod +x $$f.signed && mv -f $$f.signed $$f || exit 1; \
+	done
 
 real-vs-fallback: sign
 	@echo "=== functional: real vs fallback ==="
