@@ -1,0 +1,39 @@
+#!/bin/sh
+# ohos-shim -- run any command with libohos_compat.so preloaded.
+#
+# Generalizes examples/opencode-wrapper.sh (which you copy next to one
+# specific binary and hardcode the target into) into a single reusable
+# command: point it at whatever you'd normally run.
+#
+#   ohos-shim node script.js
+#   ohos-shim atomcode
+#   alias atomcode='ohos-shim atomcode'
+#
+# Resolution order for the .so: next to this script (../lib/, the brew
+# opt/ohos-compat-shim/{bin,lib} layout — works identically whether this is
+# opt/ohos-compat-shim/bin/ohos-shim or a relocated copy that kept the same
+# bin+lib sibling structure), then $HOMEBREW_PREFIX/opt/ohos-compat-shim/lib,
+# then $HOME/.harmonybrew (the default prefix, for a shell that never
+# exported HOMEBREW_PREFIX).
+
+set -eu
+
+if [ "$#" -eq 0 ]; then
+	echo "usage: ohos-shim <command> [args...]" >&2
+	exit 64
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+shim="$script_dir/../lib/libohos_compat.so"
+
+if [ ! -f "$shim" ]; then
+	shim="${HOMEBREW_PREFIX:-$HOME/.harmonybrew}/opt/ohos-compat-shim/lib/libohos_compat.so"
+fi
+
+if [ ! -f "$shim" ]; then
+	echo "ohos-shim: libohos_compat.so not found (looked next to this script and under \$HOMEBREW_PREFIX/opt/ohos-compat-shim/lib; is the ohos-compat-shim formula installed?)" >&2
+	exit 1
+fi
+
+export LD_PRELOAD="$shim${LD_PRELOAD:+:$LD_PRELOAD}"
+exec "$@"
