@@ -9,21 +9,58 @@
 #   ohos-shim atomcode
 #   alias atomcode='ohos-shim atomcode'
 #
-# Resolution order for the .so: next to this script (../lib/, the brew
-# opt/ohos-compat-shim/{bin,lib} layout — works identically whether this is
-# opt/ohos-compat-shim/bin/ohos-shim or a relocated copy that kept the same
-# bin+lib sibling structure), then $HOMEBREW_PREFIX/opt/ohos-compat-shim/lib,
-# then $HOME/.harmonybrew (the default prefix, for a shell that never
-# exported HOMEBREW_PREFIX).
+# Resolution order for the .so / libexec payload: next to this script
+# (../lib or ../libexec — the brew opt/ohos-compat-shim/{bin,lib,libexec}
+# layout — works identically whether this is opt/ohos-compat-shim/bin/
+# ohos-shim or a relocated copy that kept the same sibling structure), then
+# $HOMEBREW_PREFIX/opt/ohos-compat-shim/{lib,libexec}, then $HOME/.harmonybrew
+# (the default prefix, for a shell that never exported HOMEBREW_PREFIX).
+#
+#   ohos-shim check [--json|--rounds N|--with-shim]
+#     -> runs `ohos-compat-check` (src/ohos_compat_check.c), which probes
+#        whether the symptoms this shim works around are still reproducible
+#        on THIS device/OS build, ending with a ready-to-export
+#        OHOS_COMPAT_SHIM_DISABLE=... line. Always starts from a clean
+#        baseline (unsets LD_PRELOAD itself) regardless of what's ambient.
+#
+#   ohos-shim -- <command> [args...]
+#     -> escape hatch: preload+exec a real program that happens to be named
+#        "check" (or any other subcommand name added here later), instead of
+#        it being interpreted as one of ohos-shim's own subcommands.
 
 set -eu
 
 if [ "$#" -eq 0 ]; then
 	echo "usage: ohos-shim <command> [args...]" >&2
+	echo "       ohos-shim check [--json|--rounds N|--with-shim]" >&2
+	echo "       ohos-shim -- <command> [args...]   (run something literally named 'check', etc.)" >&2
 	exit 64
 fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ "$1" = "--" ]; then
+	shift
+	if [ "$#" -eq 0 ]; then
+		echo "usage: ohos-shim -- <command> [args...]" >&2
+		exit 64
+	fi
+elif [ "$1" = "check" ]; then
+	shift
+	check_bin="$script_dir/../libexec/ohos-compat-check"
+	if [ ! -f "$check_bin" ]; then
+		check_bin="${HOMEBREW_PREFIX:-$HOME/.harmonybrew}/opt/ohos-compat-shim/libexec/ohos-compat-check"
+	fi
+	if [ ! -f "$check_bin" ]; then
+		echo "ohos-shim: ohos-compat-check not found (looked next to this script and under \$HOMEBREW_PREFIX/opt/ohos-compat-shim/libexec; is the ohos-compat-shim formula installed?)" >&2
+		exit 1
+	fi
+	# ohos-compat-check unsets LD_PRELOAD itself on startup, but strip it
+	# here too for defense in depth -- same rationale as the Makefile's
+	# `check` target.
+	exec env -u LD_PRELOAD "$check_bin" "$@"
+fi
+
 shim="$script_dir/../lib/libohos_compat.so"
 
 if [ ! -f "$shim" ]; then

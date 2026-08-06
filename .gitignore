@@ -4,7 +4,9 @@ test/smoke
 test/functional
 test/bench
 test/real_vs_fallback
+ohos-compat-check
 lib/
+libexec/
 
 # Editor/tool caches
 .arts/

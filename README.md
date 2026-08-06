@@ -12,7 +12,7 @@
 | `getpwuid_r()` | `rc=0, *result=NULL` —— Node 的 `os.userInfo()` 抛异常 | 开启 |
 | `tmpfile()` | 返回 `NULL`，`errno=EPERM` —— 沙箱内 `P_tmpdir` 不可写 | 开启 |
 | `getcwd()` | hmdfs/tmpfs 父目录缺 `+x` 时 `EACCES`，或 cwd 被 rmdir 后 `ENOENT`（常见于生命周期脚本、`bun run`） | 开启 |
-| `linkat()` / `symlinkat()` | 沙箱化的安装目标目录里报 `EPERM`/`EACCES` | **关闭**（需手动开启）|
+| `linkat()` / `symlinkat()` | 沙箱化的安装目标目录里报 `EPERM`/`EACCES` | 开启 |
 | `syscall(SYS_fchmodat2)` | 真机 `SIGSYS`，OpenHarmony 容器里是 `ENOSYS` —— 两边都失败，但失败方式不同 | 开启 |
 | `splice()` | 两个独立缺陷：① 源端 EOF 时返回 `-1/EPIPE`，Linux 返回 `0` —— 所有 splice 拷贝循环在文件尾误报错误；② 写进管道的数据**不唤醒**任何已阻塞的 `poll()`/`epoll_wait()`，导致轮询型消费端的管道永久死锁 | 开启 |
 
@@ -151,22 +151,61 @@ spawn("/path/to/real-binary", process.argv.slice(2), {
 ### 运行时开关
 
 ```sh
-# 关闭某个默认开启的拦截点（逗号分隔）
+# 关闭某个默认开启的拦截点（逗号分隔）——全部 9 个拦截点默认都是开启的，
+# 没有对应的 OHOS_COMPAT_SHIM_ENABLE：只有这一个开关
 export OHOS_COMPAT_SHIM_DISABLE=getcwd,tmpfile
-
-# 打开某个默认关闭的拦截点（语义有损，需按场景手动开启）
-export OHOS_COMPAT_SHIM_ENABLE=linkat,symlinkat
 ```
+
+关哪些合适，别靠猜——见下一节 `ohos-shim check`，它会在当前设备上逐项实测
+每个拦截点是否还会复现所修的症状，直接给出一行可复制的
+`OHOS_COMPAT_SHIM_DISABLE=...`。
+
+## `ohos-shim check` —— 平台能力回归自检
+
+这套 shim 是针对 HarmonyOS 6.1 真机沙箱写的；后续系统版本会逐步放开这些限制，
+但没有文档能告诉你**具体哪台设备上放开了哪几项**——只能实测。
+`ohos-shim check`（`src/ohos_compat_check.c`，`make check` 本地构建）就是干这个的：
+
+```sh
+ohos-shim check                          # 默认表格输出
+ohos-shim check --json                   # 机器可读
+ohos-shim check --rounds 50              # 加大 splice/epoll_pipe 间歇性缺陷的探测轮数
+ohos-shim check --with-shim              # 追加第二遍：预加载 shim 后重跑，验证 shim 修好了
+```
+
+逐拦截点给出三态结论：
+
+- **仍需要**——基线复现了 shim 所修的症状，别关。
+- **可关闭**——基线行为已经正常，可以安全地塞进 `OHOS_COMPAT_SHIM_DISABLE`。
+- **不确定**——`splice`/`epoll_pipe` 这两个是间歇性缺陷（复现率随内存压力上升），
+  `--rounds` 轮全部没复现也只判「不确定」而不是「可关闭」——**未复现不等于已修复**，
+  想确认就加大 `--rounds` 或在真实负载下重跑。
+
+两个例外，即使平台放开也不建议照单全收：
+
+- `getcwd` 的 cwd-被删兜底是主动防御，不是平台缺陷本身，判「可关闭」也建议留着。
+- `linkat`/`symlinkat` 的拷贝 fallback 是有损语义（丢硬链接/符号链接身份），一旦判
+  「可关闭」就应该尽快真的关掉，不要因为「反正能用」就留着。
+
+另外报一组信息性的周边平台能力（`openat2`/`epoll_pwait2`/`clone3` 等裸 syscall、
+`ptrace`、`prctl(PR_SET_PTRACER)`、musl 的 dlopen/`.dynsym` 限制……），只供参考，
+不产出关闭建议——这些不是这个 shim（或任何 `LD_PRELOAD` shim）能修的东西，完整
+90+ 项平台能力矩阵还是要靠 `ohos-preflight`。
+
+依赖 `libexec/ohos-compat-check` + `lib/libohos_compat_checkdep.so`（brew 安装自带）；
+也可以只把 `src/ohos_compat_check.c` 和 `src/checkdep.c` 这两份源码 scp 到没装
+harmonybrew 的机器上，用 OHOS NDK clang 单独编译（见 `Makefile` 的 `check` target）。
 
 ## 构建
 
 本机 / 真机迭代（需要通过 harmonybrew 安装的 OHOS NDK）：
 
 ```sh
-make             # 构建 libohos_compat.so + test/smoke + test/functional + test/bench
+make             # 构建 libohos_compat.so + test/smoke + test/functional + test/bench + check
 make smoke       # 基础 3 项检查，先跑基线再跑加 shim
 make functional  # 全面的一致性检查，先跑基线再跑加 shim
 make bench       # 单次调用开销数据，先跑基线再跑加 shim
+make check       # 跑 ohos-compat-check（`ohos-shim check` 的 payload），强制干净 LD_PRELOAD 基线
 ```
 
 npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest` runner 上交叉编译产出，用的是同一套 OHOS NDK clang 调用方式，用 [ohos-bst-light](https://github.com/hqzing/ohos-bst-light) 的 `self-sign.py` 自签名，并且要先通过真机 smoke test 才会进入 GitHub Release / npm 发布环节。不依赖任何 Homebrew formula，也不需要自建构建 runner。
