@@ -615,7 +615,9 @@ static int fc2_dispatch(int dirfd, const char *path, mode_t mode, int flags)
 /*     passwd record matching Node's os.userInfo() needs. When the query */
 /*     is for the caller's own uid, prefer the real OS-account name from */
 /*     libos_account_ndk.so (OH_OsAccount_GetName, API 12+), then env    */
-/*     vars, then a uid-derived placeholder.                             */
+/*     vars, then a uid-derived placeholder. Queries for any other uid   */
+/*     pass the real ENOENT through — the synthesized record is only     */
+/*     valid for the current account.                                    */
 /* ==================================================================== */
 
 #ifndef LOGIN_NAME_MAX
@@ -660,6 +662,15 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
 	}
 
 	if (shim_disabled("getpwuid_r")) {
+		*result = NULL;
+		return ENOENT;
+	}
+
+	/* Only synthesize for the caller's own uid — the fallback record IS the
+	 * current OS account, so handing it out for an arbitrary uid would mask
+	 * the ENOENT that callers rely on (Node's process.initgroups() numeric
+	 * pre-resolve expects ERR_UNKNOWN_CREDENTIAL for unknown uids). */
+	if (uid != getuid() && uid != geteuid()) {
 		*result = NULL;
 		return ENOENT;
 	}
