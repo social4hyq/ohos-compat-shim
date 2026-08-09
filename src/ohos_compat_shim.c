@@ -792,6 +792,13 @@ int getaddrinfo(const char *node, const char *service,
 
 	int rc = real(node, service, hints, res);
 
+	if (getenv("OHOS_GAI_DEBUG"))
+		fprintf(stderr,
+			"[gai-shim] node=%s flags=0x%x family=%d socktype=%d rc=%d\n",
+			node ? node : "(null)", hints ? hints->ai_flags : -1,
+			hints ? hints->ai_family : -1, hints ? hints->ai_socktype : -1,
+			rc);
+
 	if (shim_disabled("getaddrinfo") || rc != 0 || !hints || !node ||
 	    !(hints->ai_flags & AI_ADDRCONFIG))
 		return rc;
@@ -811,14 +818,27 @@ int getaddrinfo(const char *node, const char *service,
 			break;
 		}
 	}
-	if (n == 0 || !all_v6_loopback)
+	if (n == 0 || !all_v6_loopback) {
+		if (getenv("OHOS_GAI_DEBUG"))
+			fprintf(stderr, "[gai-shim] merge skipped: n=%d all_v6_lb=%d\n",
+				n, all_v6_loopback);
 		return rc;
+	}
 
 	struct addrinfo hints2 = *hints;
 	hints2.ai_flags &= ~AI_ADDRCONFIG;
+	/* Force AF_INET for the retry: an AF_UNSPEC no-ADDRCONFIG query on this
+	 * resolver can still come back v6-only (it is stateful), but an explicit
+	 * AF_INET query for a loopback name is answered from /etc/hosts. */
+	hints2.ai_family = AF_INET;
 	struct addrinfo *res2 = NULL;
-	if (real(node, service, &hints2, &res2) != 0)
+	if (real(node, service, &hints2, &res2) != 0) {
+		if (getenv("OHOS_GAI_DEBUG"))
+			fprintf(stderr, "[gai-shim] retry failed\n");
 		return rc; /* retry failed: keep the original (broken) answer */
+	}
+	if (getenv("OHOS_GAI_DEBUG"))
+		fprintf(stderr, "[gai-shim] retry ok, merging\n");
 
 	/* Move AF_INET nodes from res2 onto the tail of *res (preserving the
 	 * loopback-first order), then free what remains of res2. */
