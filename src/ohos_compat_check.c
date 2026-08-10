@@ -48,6 +48,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/openat2.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
@@ -61,6 +63,7 @@
 #include <sys/ptrace.h>
 #include <sys/prctl.h>
 #include <sys/sendfile.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -890,6 +893,67 @@ static void probe_epoll_pipe(void)
 	}
 }
 
+/* -- getaddrinfo ---------------------------------------------------------
+ *
+ * Calls the plain `getaddrinfo` symbol directly (same convention as
+ * probe_tmpfile()/probe_getcwd() above) rather than dlsym(RTLD_NEXT, ...):
+ * the baseline pass (no LD_PRELOAD) resolves this to real libc, and
+ * `ohos-shim check --with-shim`'s second pass resolves it to the shim's own
+ * interposed getaddrinfo() -- exactly the two conditions this check needs
+ * to distinguish.
+ */
+
+static void probe_getaddrinfo(void)
+{
+	report_row_t *r = add_row("getaddrinfo", "A",
+		"AI_ADDRCONFIG 查询 localhost 是否错误只返回 IPv6 loopback");
+	r->has_disable_flag = 1;
+
+	struct addrinfo hints = { 0 };
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_ADDRCONFIG;
+
+	struct addrinfo *res = NULL;
+	int rc = getaddrinfo("localhost", NULL, &hints, &res);
+	if (rc != 0) {
+		/* Can't evaluate the AI_ADDRCONFIG symptom without a
+		 * resolvable "localhost" -- not a verdict on the bug itself. */
+		r->verdict = V_INCONCLUSIVE;
+		snprintf(r->note, sizeof(r->note),
+			"getaddrinfo(\"localhost\", AI_ADDRCONFIG) 失败: %s -- 无法判定",
+			gai_strerror(rc));
+		return;
+	}
+
+	int n = 0, has_v4 = 0, all_v6_loopback = 1;
+	for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+		n++;
+		if (ai->ai_family == AF_INET) {
+			has_v4 = 1;
+			all_v6_loopback = 0;
+			continue;
+		}
+		if (ai->ai_family != AF_INET6 ||
+		    ai->ai_addrlen < sizeof(struct sockaddr_in6) ||
+		    !IN6_IS_ADDR_LOOPBACK(
+			    &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr))
+			all_v6_loopback = 0;
+	}
+	freeaddrinfo(res);
+
+	if (n > 0 && all_v6_loopback && !has_v4) {
+		r->verdict = V_NEEDED;
+		snprintf(r->note, sizeof(r->note),
+			"复现: AI_ADDRCONFIG 只返回 %d 条 IPv6 loopback，无 IPv4 -- "
+			"Happy-Eyeballs 调用方拿不到 IPv4 兜底地址", n);
+	} else {
+		r->verdict = V_DROPPABLE;
+		snprintf(r->note, sizeof(r->note),
+			"未复现: %d 条结果，has_v4=%d -- AI_ADDRCONFIG 行为正常", n, has_v4);
+	}
+}
+
 static void run_a_group_probes(void)
 {
 	probe_close_range();
@@ -901,6 +965,7 @@ static void run_a_group_probes(void)
 	probe_symlinkat();
 	probe_splice();
 	probe_epoll_pipe();
+	probe_getaddrinfo();
 }
 
 /* ==================================================================== */

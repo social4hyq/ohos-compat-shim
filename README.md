@@ -15,6 +15,7 @@
 | `linkat()` / `symlinkat()` | 沙箱化的安装目标目录里报 `EPERM`/`EACCES` | 开启 |
 | `syscall(SYS_fchmodat2)` | 真机 `SIGSYS`，OpenHarmony 容器里是 `ENOSYS` —— 两边都失败，但失败方式不同 | 开启 |
 | `splice()` | 两个独立缺陷：① 源端 EOF 时返回 `-1/EPIPE`，Linux 返回 `0` —— 所有 splice 拷贝循环在文件尾误报错误；② 写进管道的数据**不唤醒**任何已阻塞的 `poll()`/`epoll_wait()`，导致轮询型消费端的管道永久死锁 | 开启 |
+| `getaddrinfo()` | `AI_ADDRCONFIG` 误判本机无全局 IPv4，查询 `localhost` 时只返回 `::1`（IPv6 loopback）—— Happy Eyeballs（`autoSelectFamily`）类调用方在 `::1` 拒绝连接时没有 IPv4 地址可退回 | 开启 |
 
 `pthread_cancel()` 在这个平台上是 musl 的空桩实现，刻意**不**做 shim ——一个 preload 库没办法给调用方注入它所需要的协作式取消点。
 
@@ -47,6 +48,7 @@
 | `fchmodat2` | 探针 `c5_fchmodat2` | HarmonyOS 放行 452 号系统调用（目前是 `both_fail`：OpenHarmony 容器里也是 `ENOSYS`，所以这项收口不光需要 HarmonyOS 放行，容器那边的内核也得先实现这个系统调用）|
 | `splice` （EOF 语义）| 功能测试 `splice_eof_is_zero`（baseline 段即为探针）| 内核修正 `splice()` 的 EOF 语义，源端耗尽时返回 `0` 而不是 `EPIPE` |
 | `splice` （poll 唤醒）| 功能测试 `splice_wakes_poll_waiter`（baseline 段即为探针）| 内核让写入管道的 splice 唤醒 poll/epoll 等待者。收口后应删掉 bounce buffer 路径，恢复零拷贝 |
+| `getaddrinfo` | `ohos-shim check` 自带探针 `getaddrinfo`（`ohos_compat_check.c`，无对应 `ohos-preflight` 探针——这是纯 IPv4/IPv6 结果集判定，不是失败/成功二态，不适合套 preflight 的 pass/fail 约定）| `AI_ADDRCONFIG` 查询 `localhost` 不再只返回 IPv6 loopback |
 
 定期重跑 `ohos-preflight` 的双轨对比；一旦某个探针稳定地从 `needs_relax`变成 `same`，对应符号的拦截逻辑就可以在后续版本里默认关闭（或直接移除）——等消费者所支持的所有 HarmonyOS 版本都不再需要剩下的任何一个症状时，就应该停止预加载这个库。
 
