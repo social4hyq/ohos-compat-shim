@@ -82,6 +82,16 @@
 #error "ohos_compat_shim.c: only supports aarch64 (HarmonyOS/OHOS target)"
 #endif
 
+/* /tmp is read-only in the OHOS sandbox; default TMPDIR so the program's own
+ * mkstemp/getenv temp calls land on a writable, auto-cleaned path. Preserves
+ * any user- or wrapper-set TMPDIR. */
+__attribute__((constructor))
+static void ohos_shim_init_tmpdir(void)
+{
+	if (!getenv("TMPDIR"))
+		setenv("TMPDIR", "/data/storage/el2/base/cache", 1);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Runtime toggle parsing                                            */
 /* ------------------------------------------------------------------ */
