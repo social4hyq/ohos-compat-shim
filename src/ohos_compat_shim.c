@@ -44,7 +44,7 @@
  * Runtime toggles (comma-separated symbol names):
  *   OHOS_COMPAT_SHIM_DISABLE — turn OFF a default-on interceptor
  *                              (close_range, getpwuid_r, tmpfile, getcwd,
- *                               fchmodat2, linkat, symlinkat, splice,
+ *                               fchmodat2, link, linkat, symlinkat, splice,
  *                               epoll_pipe, getaddrinfo)
  *
  * Deliberately NOT implemented: pthread_cancel (musl stub is a no-op;
@@ -138,6 +138,7 @@ enum {
 	SD_SPLICE      = 1 << 7,
 	SD_EPOLL_PIPE  = 1 << 8,
 	SD_GETADDRINFO = 1 << 9,
+	SD_LINK        = 1 << 10,
 };
 
 static int g_disable_mask = -1;
@@ -168,6 +169,8 @@ static void parse_toggle_masks(void)
 		d |= SD_EPOLL_PIPE;
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "getaddrinfo"))
 		d |= SD_GETADDRINFO;
+	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "link"))
+		d |= SD_LINK;
 	g_disable_mask = d; /* set last: non-negative value doubles as "done" */
 }
 
@@ -194,6 +197,8 @@ static int shim_disabled(const char *name)
 		return !!(g_disable_mask & SD_EPOLL_PIPE);
 	if (strcmp(name, "getaddrinfo") == 0)
 		return !!(g_disable_mask & SD_GETADDRINFO);
+	if (strcmp(name, "link") == 0)
+		return !!(g_disable_mask & SD_LINK);
 	return 0;
 }
 
@@ -1737,6 +1742,52 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath)
 	}
 
 	if (copy_fd_to_path_atomic(src, newdirfd, linkpath,
+				   st.st_mode & 0777) != 0) {
+		int e = errno;
+		close(src);
+		errno = e;
+		return -1;
+	}
+	close(src);
+	return 0;
+}
+
+typedef int (*link_fn)(const char *, const char *);
+
+/* link() — same sandbox EPERM/EACCES story as linkat, but musl's link()
+ * goes through an inline syscall(SYS_linkat) that bypasses the linkat
+ * *dynamic symbol*, so the linkat hook above never sees fs.link / libuv
+ * callers — they reach musl's link() symbol instead, which this hook
+ * intercepts. Fall back to the same atomic byte-copy as linkat. Semantically
+ * lossy (loses hardlink identity), like linkat. Disable via
+ * OHOS_COMPAT_SHIM_DISABLE=link. */
+int link(const char *oldpath, const char *newpath)
+{
+	static link_fn real = NULL;
+	if (!real)
+		real = (link_fn)dlsym(RTLD_NEXT, "link");
+
+	int rc = real ? real(oldpath, newpath) : -1;
+	if (rc == 0)
+		return 0;
+	if (shim_disabled("link"))
+		return rc;
+	if (errno != EPERM && errno != EACCES)
+		return rc;
+
+	int src = openat(AT_FDCWD, oldpath, O_RDONLY);
+	if (src < 0)
+		return -1;
+
+	struct stat st;
+	if (fstat(src, &st) != 0) {
+		int e = errno;
+		close(src);
+		errno = e;
+		return -1;
+	}
+
+	if (copy_fd_to_path_atomic(src, AT_FDCWD, newpath,
 				   st.st_mode & 0777) != 0) {
 		int e = errno;
 		close(src);

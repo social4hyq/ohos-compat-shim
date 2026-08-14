@@ -929,6 +929,65 @@ static void test_linkat_eacces_fallback(void)
 	unlink(dst);
 }
 
+static void test_link_eacces_fallback(void)
+{
+	/* Same sandbox EACCES as linkat, but reached via the plain link() libc
+	 * symbol — the path Node's fs.link / libuv take. musl's link() goes
+	 * through an inline syscall(SYS_linkat) that bypasses the linkat
+	 * *dynamic symbol*, so the linkat hook never sees these callers; the
+	 * dedicated link() hook must catch them. Same copy fallback, same
+	 * lossy (separate-inode) tradeoff. */
+	char src[4096], dst[4096];
+	const char *tmp = getenv("TMPDIR");
+	if (!tmp)
+		tmp = "/data/storage/el2/base/tmp";
+	snprintf(src, sizeof(src), "%s/ohos-compat-fntest-link-eacces-src", tmp);
+	snprintf(dst, sizeof(dst), "%s/ohos-compat-fntest-link-eacces-dst", tmp);
+	unlink(src);
+	unlink(dst);
+
+	int sfd = open(src, O_CREAT | O_WRONLY, 0644);
+	if (sfd < 0) {
+		check(0, "link_eacces_fallback", "could not create src fixture");
+		return;
+	}
+	const char *payload = "link-fallback-payload";
+	write(sfd, payload, strlen(payload));
+	close(sfd);
+
+	errno = 0;
+	int rc = link(src, dst);
+
+	char detail[160];
+	if (rc == 0) {
+		FILE *f = fopen(dst, "r");
+		char buf[64] = {0};
+		size_t n = f ? fread(buf, 1, sizeof(buf) - 1, f) : 0;
+		if (f)
+			fclose(f);
+		int ok = f && n == strlen(payload) && strcmp(buf, payload) == 0;
+		snprintf(detail, sizeof(detail),
+			 "link succeeded (real or fallback), content %s",
+			 ok ? "matches" : "MISMATCH");
+		check(ok, "link_eacces_fallback", detail);
+	} else if (shim_is_loaded()) {
+		snprintf(detail, sizeof(detail),
+			 "link still failed rc=%d errno=%d (%s) even with the shim's "
+			 "link() EACCES->copy fallback",
+			 rc, errno, strerror(errno));
+		check(0, "link_eacces_fallback", detail);
+	} else {
+		snprintf(detail, sizeof(detail),
+			 "link failed rc=%d errno=%d (%s) — confirms the TMPDIR "
+			 "EACCES quirk reproduces at baseline via the link() symbol",
+			 rc, errno, strerror(errno));
+		printf("INFO  %-28s %s\n", "link_eacces_fallback", detail);
+	}
+
+	unlink(src);
+	unlink(dst);
+}
+
 static void test_linkat_bun_tmpfile_via_proc_self_fd(void)
 {
 	/* bun's npm cache write (src/install/npm.rs linkat_tmpfile) materializes
@@ -1665,6 +1724,7 @@ int main(void)
 
 	test_linkat_eexist_passthrough();
 	test_linkat_eacces_fallback();
+	test_link_eacces_fallback();
 	test_linkat_bun_tmpfile_via_proc_self_fd();
 	test_linkat_bun_dirfd_source();
 	test_symlinkat_success_is_noop();

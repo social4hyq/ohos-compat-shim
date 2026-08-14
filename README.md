@@ -13,6 +13,7 @@
 | `tmpfile()` | 返回 `NULL`，`errno=EPERM` —— 沙箱内 `P_tmpdir` 不可写 | 开启 |
 | `getcwd()` | hmdfs/tmpfs 父目录缺 `+x` 时 `EACCES`，或 cwd 被 rmdir 后 `ENOENT`（常见于生命周期脚本、`bun run`） | 开启 |
 | `linkat()` / `symlinkat()` | 沙箱化的安装目标目录里报 `EPERM`/`EACCES` | 开启 |
+| `link()` | 同上（hard link 被禁）；musl 的 `link()` 走内联 `syscall(SYS_linkat)` 绕过 `linkat` 动态符号，故 `linkat` 拦截够不着 Node `fs.link`/libuv 这类经 `link()` 符号调用的调用者——本拦截点补这条路径（同样的 copy fallback） | 开启 |
 | `syscall(SYS_fchmodat2)` | 真机 `SIGSYS`，OpenHarmony 容器里是 `ENOSYS` —— 两边都失败，但失败方式不同 | 开启 |
 | `splice()` | 两个独立缺陷：① 源端 EOF 时返回 `-1/EPIPE`，Linux 返回 `0` —— 所有 splice 拷贝循环在文件尾误报错误；② 写进管道的数据**不唤醒**任何已阻塞的 `poll()`/`epoll_wait()`，导致轮询型消费端的管道永久死锁 | 开启 |
 | `getaddrinfo()` | `AI_ADDRCONFIG` 误判本机无全局 IPv4，查询 `localhost` 时只返回 `::1`（IPv6 loopback）—— Happy Eyeballs（`autoSelectFamily`）类调用方在 `::1` 拒绝连接时没有 IPv4 地址可退回 | 开启 |
@@ -24,7 +25,7 @@
 每个拦截点都会先通过 `dlsym(RTLD_NEXT, ...)` 解析出真实实现并尝试调用它，而不是先走 fallback 逻辑 —— 这不是一次性的系统版本判断，而是每个新进程都会重新做的实时探测（对 `close_range` 之外的符号来说，甚至是每一次调用都重新判断）。具体来说：
 
 - `close_range`：`cr_probe_syscall()` 每个进程只跑一次；如果真实系统调用成功，该进程就会缓存 `WORKS` 状态，之后再也不会碰用户态 fallback。
-- `getpwuid_r` / `tmpfile` / `getcwd` / `linkat` / `symlinkat`：**每次**调用都会先调用真实函数；shim 自己的逻辑只在真实调用失败、且失败特征与上表记录的 HarmonyOS 沙箱症状完全吻合时才会介入。
+- `getpwuid_r` / `tmpfile` / `getcwd` / `linkat` / `symlinkat` / `link`：**每次**调用都会先调用真实函数；shim 自己的逻辑只在真实调用失败、且失败特征与上表记录的 HarmonyOS 沙箱症状完全吻合时才会介入。
 
 `getpwuid_r` 的 fallback 用户名来源：优先调用 `OH_OsAccount_GetName()`（`libos_account_ndk.so`，运行时 dlopen、句柄缓存，编译期零 SDK 依赖）取当前系统账号名——但只在查询的 uid 等于进程自身 uid 时（账号 API 没有 uid 参数）；失败或非自身 uid 时回落 `$LOGNAME`/`$USER`，最后退化为 `u<uid>` 占位符。其余字段（`pw_dir`/`pw_shell`/`pw_uid`/`pw_gid`）逻辑不变，账号 API 无法提供。
 
@@ -43,6 +44,7 @@
 | `tmpfile` | 探针 `g1_tmpfile` | 应用沙箱内 `P_tmpdir` 变为可写 |
 | `getcwd` | 探针 `g7_getcwd_unlinked` | 平台层面无法修复（这是符合 POSIX 语义的 `ENOENT` 行为）—— 这一项会一直留着 |
 | `linkat`/`symlinkat` | 探针 `g5_linkat_eperm`/`g6_symlinkat_eperm` | 目标安装目录不再对硬链接/符号链接返回 `EPERM`/`EACCES` |
+| `link` | 同 `linkat`（同源 hard-link 限制，同一 `g5_linkat_eperm` 探针即判定） | 同 `linkat` |
 
 > **copy fallback 的原子性**：字节拷贝经同目录隐藏临时文件 + `renameat` 落位，目标路径要么完整出现、要么不出现。此前直接 `O_CREAT|O_EXCL` + 拷贝的实现会让目标在 0 字节时即可见——bun install 因解析失败 `quick_exit`、而 worker 线程还在刷 npm manifest 缓存时，会留下永久性 0 字节 `.npm` 缓存（下次加载报 "manifest is invalid"，bun-install-registry 的 prereleases-* 用例就是踩在这里）。临时文件放在 `newpath` 同目录是硬性要求：`renameat` 不能跨文件系统，绝对路径的 `newpath` 配裸临时文件名会把临时文件落到进程 CWD（可能异 fs → `EXDEV`）。
 | `fchmodat2` | 探针 `c5_fchmodat2` | HarmonyOS 放行 452 号系统调用（目前是 `both_fail`：OpenHarmony 容器里也是 `ENOSYS`，所以这项收口不光需要 HarmonyOS 放行，容器那边的内核也得先实现这个系统调用）|
