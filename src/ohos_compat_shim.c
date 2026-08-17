@@ -54,6 +54,7 @@
 
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <elf.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -61,6 +62,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <limits.h>
+#include <link.h>
 #include <pthread.h>
 #include <pwd.h>
 #include <sched.h>
@@ -91,6 +93,7 @@ static void ohos_shim_init_tmpdir(void)
 	if (!getenv("TMPDIR"))
 		setenv("TMPDIR", "/data/storage/el2/base/cache", 1);
 }
+
 
 /* ------------------------------------------------------------------ */
 /*  Runtime toggle parsing                                            */
@@ -139,6 +142,7 @@ enum {
 	SD_EPOLL_PIPE  = 1 << 8,
 	SD_GETADDRINFO = 1 << 9,
 	SD_LINK        = 1 << 10,
+	SD_STD_STREAMS = 1 << 11,
 };
 
 static int g_disable_mask = -1;
@@ -171,6 +175,8 @@ static void parse_toggle_masks(void)
 		d |= SD_GETADDRINFO;
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "link"))
 		d |= SD_LINK;
+	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "std_streams"))
+		d |= SD_STD_STREAMS;
 	g_disable_mask = d; /* set last: non-negative value doubles as "done" */
 }
 
@@ -199,7 +205,135 @@ static int shim_disabled(const char *name)
 		return !!(g_disable_mask & SD_GETADDRINFO);
 	if (strcmp(name, "link") == 0)
 		return !!(g_disable_mask & SD_LINK);
+	if (strcmp(name, "std_streams") == 0)
+		return !!(g_disable_mask & SD_STD_STREAMS);
 	return 0;
+}
+
+
+/* ------------------------------------------------------------------ */
+/*  std_streams: backfill stdout/stderr/stdin COPY-reloc slots         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Dynamically-linked musl executables that reference stdout/stderr/stdin
+ * get R_AARCH64_COPY relocations whose dynsym entries also *define* the
+ * symbol at the copy target (a .bss slot) in the executable. glibc's ld.so
+ * resolves the copy against the libc definition, but HarmonyOS's musl
+ * ld.so resolves it against the executable's own definition — an 8-byte
+ * self-copy that leaves the slot at its .bss initial value NULL. The first
+ * stdio call (e.g. bun's setvbuf(stdout, NULL, _IOLBF, 0)) then dies in
+ * the hardened libc assert "setvbuf: parameter is null". Verified against
+ * the official claude-code 2.1.229-2.1.233 linux-arm64-musl binaries.
+ *
+ * Fix: at load time, scan the main executable's .rela.dyn for COPY relocs
+ * against those three names and write libc's real FILE* into each NULL
+ * slot. Pure no-op for executables without such relocations.
+ */
+
+#define OHOS_R_AARCH64_COPY 1024
+
+struct std_fixup {
+	const char *name;
+	Elf64_Addr slot;
+};
+
+/* dl_iterate_phdr visits the main program first; on musl its dlpi_name is
+ * the exe path rather than glibc's "", so track the first reported phdr
+ * pointer instead of comparing names. */
+static int phdr_is_main_exe(const struct dl_phdr_info *info)
+{
+	static const Elf64_Phdr *first;
+	if (!first) {
+		first = info->dlpi_phdr;
+		return 1;
+	}
+	return info->dlpi_phdr == first;
+}
+
+static int std_streams_collect(struct dl_phdr_info *info, size_t sz, void *data)
+{
+	struct std_fixup *f = data;
+
+	(void)sz;
+	if (!phdr_is_main_exe(info))
+		return 1;
+
+	for (int j = 0; j < info->dlpi_phnum; j++) {
+		const Elf64_Phdr *ph = &info->dlpi_phdr[j];
+		if (ph->p_type != PT_DYNAMIC)
+			continue;
+
+		Elf64_Addr base = info->dlpi_addr;
+		Elf64_Dyn *d = (Elf64_Dyn *)(base + ph->p_vaddr);
+		Elf64_Sym *symtab = NULL;
+		const char *strtab = NULL;
+		const Elf64_Rela *rela = NULL;
+		Elf64_Xword relasz = 0;
+
+		for (; d->d_tag != DT_NULL; d++) {
+			switch (d->d_tag) {
+			case DT_SYMTAB: symtab = (Elf64_Sym *)(base + d->d_un.d_ptr); break;
+			case DT_STRTAB: strtab = (const char *)(base + d->d_un.d_ptr); break;
+			case DT_RELA:   rela = (const Elf64_Rela *)(base + d->d_un.d_ptr); break;
+			case DT_RELASZ: relasz = d->d_un.d_val; break;
+			}
+		}
+		if (!symtab || !strtab || !rela || !relasz)
+			return 1;
+
+		for (Elf64_Xword o = 0; o + sizeof(Elf64_Rela) <= relasz;
+		     o += sizeof(Elf64_Rela)) {
+			const Elf64_Rela *r = (const Elf64_Rela *)((const char *)rela + o);
+			if (ELF64_R_TYPE(r->r_info) != OHOS_R_AARCH64_COPY)
+				continue;
+			const Elf64_Sym *s = &symtab[ELF64_R_SYM(r->r_info)];
+			const char *name = strtab + s->st_name;
+			for (int k = 0; k < 3; k++)
+				if (strcmp(f[k].name, name) == 0)
+					f[k].slot = base + r->r_offset;
+		}
+		return 1;
+	}
+	return 1;
+}
+
+/* Returns libc's FILE* for the named stream, or NULL. The executable
+ * exports its own (still-NULL) definition, so a plain dlsym() would find
+ * that one — RTLD_NEXT from this preloaded library resolves inside libc
+ * instead. musl defines the variable as `FILE *const stdout = ...`, so
+ * dlsym returns the address of the variable and we dereference it. */
+static void *std_streams_libc_file(const char *name)
+{
+	void *var = dlsym(RTLD_NEXT, name);
+	if (var && *(void **)var)
+		return *(void **)var;
+	return NULL;
+}
+
+__attribute__((constructor))
+static void ohos_shim_init_std_streams(void)
+{
+	if (shim_disabled("std_streams"))
+		return;
+
+	struct std_fixup f[3] = {
+		{ "stdout", 0 },
+		{ "stderr", 0 },
+		{ "stdin",  0 },
+	};
+	dl_iterate_phdr(std_streams_collect, f);
+
+	for (int k = 0; k < 3; k++) {
+		if (!f[k].slot)
+			continue;
+		void **slot = (void **)f[k].slot;
+		if (*slot) /* already resolved — nothing to do */
+			continue;
+		void *file = std_streams_libc_file(f[k].name);
+		if (file)
+			*slot = file;
+	}
 }
 
 /* ------------------------------------------------------------------ */

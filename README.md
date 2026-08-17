@@ -16,6 +16,7 @@
 | `link()` | 同上（hard link 被禁）；musl 的 `link()` 走内联 `syscall(SYS_linkat)` 绕过 `linkat` 动态符号，故 `linkat` 拦截够不着 Node `fs.link`/libuv 这类经 `link()` 符号调用的调用者——本拦截点补这条路径（同样的 copy fallback） | 开启 |
 | `syscall(SYS_fchmodat2)` | 真机 `SIGSYS`，OpenHarmony 容器里是 `ENOSYS` —— 两边都失败，但失败方式不同 | 开启 |
 | `splice()` | 两个独立缺陷：① 源端 EOF 时返回 `-1/EPIPE`，Linux 返回 `0` —— 所有 splice 拷贝循环在文件尾误报错误；② 写进管道的数据**不唤醒**任何已阻塞的 `poll()`/`epoll_wait()`，导致轮询型消费端的管道永久死锁 | 开启 |
+| `stdout`/`stderr`/`stdin` COPY-reloc 槽位 | 预编译 musl 可执行文件引用标准流时，链接器生成 `R_AARCH64_COPY` 重定位并在 dynsym 里**自定义**该符号；HarmonyOS 的 musl ld.so 按"可执行文件自身定义"解析这份拷贝——8 字节自拷贝，槽位停留在 .bss 初始值 `NULL`。第一次 stdio 调用（如 bun 启动的 `setvbuf(stdout, NULL, _IOLBF, 0)`）即触发加固 libc 断言 `setvbuf: parameter is null` abort（官方 claude-code linux-arm64-musl 二进制 2.1.229+ 的实际死因）。加载期扫描主程序 `.rela.dyn` 回填 libc 真实 `FILE*` | 开启 |
 | `getaddrinfo()` | `AI_ADDRCONFIG` 误判本机无全局 IPv4，查询 `localhost` 时只返回 `::1`（IPv6 loopback）—— Happy Eyeballs（`autoSelectFamily`）类调用方在 `::1` 拒绝连接时没有 IPv4 地址可退回 | 开启 |
 
 `pthread_cancel()` 在这个平台上是 musl 的空桩实现，刻意**不**做 shim ——一个 preload 库没办法给调用方注入它所需要的协作式取消点。
