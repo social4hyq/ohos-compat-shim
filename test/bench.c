@@ -38,6 +38,9 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <poll.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -190,6 +193,169 @@ static void bench_getcwd(void)
 	report("getcwd", iters, now_ms() - t0);
 }
 
+/*
+ * bench_poll_patch_* / bench_epoll_wait_no_pipe / bench_epoll_ctl_churn —
+ * added for the 2026-08-18 shim performance/stability validation pass
+ * (epoll_pipe interceptor had zero benchmark coverage before this).
+ *
+ * poll_patch_idle_fds / poll_patch_pipe_fds isolate ep_shim_patch_pollfds()
+ * (ohos_compat_shim.c): whenever the epoll_pipe interceptor is enabled at
+ * all -- gated only by the global shim_disabled("epoll_pipe") check, NOT by
+ * whether any pipe was ever actually registered -- every poll()/ppoll()
+ * return runs an uncached fstat() (splice_fd_is_fifo()) on every fd that
+ * asked for POLLIN and came back with revents==0. That is an O(N) tax on
+ * the caller's *entire idle fd set*, paid on every call, process-wide, for
+ * every LD_PRELOAD consumer. N is swept via argv so the O(N) shape shows up
+ * directly in the ns/call trend rather than needing algebra on one number.
+ *
+ * epoll_wait_no_pipe isolates the global-mutex-plus-O(64)-scan cost
+ * (g_ep_pipes_lock, ep_reg_any_locked) an epoll_wait/epoll_pwait call pays
+ * even when the epfd has zero registered pipes.
+ *
+ * epoll_ctl_churn isolates the same lock+scan cost under repeated
+ * ADD/MOD/DEL on an fd that *does* register (a real pipe), which is the
+ * shape a churning connection pool would produce.
+ */
+
+static void bench_poll_patch_idle_fds(int n)
+{
+	char name[32];
+	snprintf(name, sizeof(name), "poll_patch_idle_n%d", n);
+
+	int *fds = calloc((size_t)n, sizeof(int));
+	struct pollfd *pfds = calloc((size_t)n, sizeof(struct pollfd));
+	if (!fds || !pfds) {
+		printf("%-22s calloc failed\n", name);
+		free(fds);
+		free(pfds);
+		return;
+	}
+	for (int i = 0; i < n; i++) {
+		fds[i] = eventfd(0, EFD_NONBLOCK);
+		pfds[i].fd = fds[i];
+		pfds[i].events = POLLIN;
+	}
+
+	long iters = 5000;
+	double t0 = now_ms();
+	for (long i = 0; i < iters; i++) {
+		for (int j = 0; j < n; j++)
+			pfds[j].revents = 0;
+		poll(pfds, (nfds_t)n, 0);
+	}
+	report(name, iters, now_ms() - t0);
+
+	for (int i = 0; i < n; i++)
+		if (fds[i] >= 0)
+			close(fds[i]);
+	free(fds);
+	free(pfds);
+}
+
+static void bench_poll_patch_pipe_fds(int n)
+{
+	char name[32];
+	snprintf(name, sizeof(name), "poll_patch_pipe_n%d", n);
+
+	int (*fds)[2] = calloc((size_t)n, sizeof(int[2]));
+	struct pollfd *pfds = calloc((size_t)n, sizeof(struct pollfd));
+	if (!fds || !pfds) {
+		printf("%-22s calloc failed\n", name);
+		free(fds);
+		free(pfds);
+		return;
+	}
+	for (int i = 0; i < n; i++) {
+		if (pipe(fds[i]) != 0) {
+			printf("%-22s pipe() failed\n", name);
+			for (int k = 0; k < i; k++) {
+				close(fds[k][0]);
+				close(fds[k][1]);
+			}
+			free(fds);
+			free(pfds);
+			return;
+		}
+		fcntl(fds[i][0], F_SETFL, O_NONBLOCK);
+		pfds[i].fd = fds[i][0];
+		pfds[i].events = POLLIN;
+	}
+
+	long iters = 5000;
+	double t0 = now_ms();
+	for (long i = 0; i < iters; i++) {
+		for (int j = 0; j < n; j++)
+			pfds[j].revents = 0;
+		poll(pfds, (nfds_t)n, 0);
+	}
+	report(name, iters, now_ms() - t0);
+
+	for (int i = 0; i < n; i++) {
+		close(fds[i][0]);
+		close(fds[i][1]);
+	}
+	free(fds);
+	free(pfds);
+}
+
+static void bench_epoll_wait_no_pipe(void)
+{
+	int efd = eventfd(0, EFD_NONBLOCK);
+	int epfd = epoll_create1(0);
+	if (efd < 0 || epfd < 0) {
+		printf("%-22s setup failed\n", "epoll_wait_no_pipe");
+		return;
+	}
+	struct epoll_event ev = {0};
+	ev.events = EPOLLIN;
+	ev.data.fd = efd;
+	epoll_ctl(epfd, EPOLL_CTL_ADD, efd, &ev);
+
+	long iters = 20000;
+	struct epoll_event out[4];
+	double t0 = now_ms();
+	for (long i = 0; i < iters; i++)
+		epoll_wait(epfd, out, 4, 0);
+	report("epoll_wait_no_pipe", iters, now_ms() - t0);
+
+	close(epfd);
+	close(efd);
+}
+
+static void bench_epoll_ctl_churn(void)
+{
+	int pfd[2];
+	if (pipe(pfd) != 0) {
+		printf("%-22s pipe() failed\n", "epoll_ctl_churn");
+		return;
+	}
+	fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+	int epfd = epoll_create1(0);
+	if (epfd < 0) {
+		printf("%-22s epoll_create1 failed\n", "epoll_ctl_churn");
+		close(pfd[0]);
+		close(pfd[1]);
+		return;
+	}
+
+	long iters = 5000;
+	struct epoll_event ev = {0};
+	ev.data.fd = pfd[0];
+	double t0 = now_ms();
+	for (long i = 0; i < iters; i++) {
+		ev.events = EPOLLIN;
+		epoll_ctl(epfd, EPOLL_CTL_ADD, pfd[0], &ev);
+		ev.events = EPOLLIN | EPOLLPRI;
+		epoll_ctl(epfd, EPOLL_CTL_MOD, pfd[0], &ev);
+		epoll_ctl(epfd, EPOLL_CTL_DEL, pfd[0], NULL);
+	}
+	report("epoll_ctl_churn", iters, now_ms() - t0);
+
+	close(epfd);
+	close(pfd[0]);
+	close(pfd[1]);
+}
+
 int main(void)
 {
 	bench_syscall_passthrough();
@@ -198,5 +364,15 @@ int main(void)
 	bench_getpwuid_r();
 	bench_tmpfile();
 	bench_getcwd();
+	bench_poll_patch_idle_fds(1);
+	bench_poll_patch_idle_fds(8);
+	bench_poll_patch_idle_fds(32);
+	bench_poll_patch_idle_fds(128);
+	bench_poll_patch_pipe_fds(1);
+	bench_poll_patch_pipe_fds(8);
+	bench_poll_patch_pipe_fds(32);
+	bench_poll_patch_pipe_fds(128);
+	bench_epoll_wait_no_pipe();
+	bench_epoll_ctl_churn();
 	return 0;
 }

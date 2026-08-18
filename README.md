@@ -156,8 +156,9 @@ spawn("/path/to/real-binary", process.argv.slice(2), {
 ### 运行时开关
 
 ```sh
-# 关闭某个默认开启的拦截点（逗号分隔）——全部 9 个拦截点默认都是开启的，
-# 没有对应的 OHOS_COMPAT_SHIM_ENABLE：只有这一个开关
+# 关闭某个默认开启的拦截点（逗号分隔）——16 个拦截点里除 std_streams
+# （无对应开关，加载期无条件生效）外全部默认开启，没有对应的
+# OHOS_COMPAT_SHIM_ENABLE：只有这一个开关
 export OHOS_COMPAT_SHIM_DISABLE=getcwd,tmpfile
 ```
 

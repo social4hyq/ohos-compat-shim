@@ -1691,11 +1691,10 @@ static void test_epoll_pwait_infinite_no_zero_return(void)
 
 int main(void)
 {
-	/* Must happen before any linkat/symlinkat call in this process — the
-	 * shim's toggle mask is parsed once and cached (see
-	 * parse_toggle_masks() in ohos_compat_shim.c). No-op when this
-	 * binary runs without LD_PRELOAD. */
-	setenv("OHOS_COMPAT_SHIM_ENABLE", "linkat,symlinkat", 1);
+	/* linkat/symlinkat have been default-on since commit 3cb9f08 (which
+	 * removed OHOS_COMPAT_SHIM_ENABLE entirely — the env var this used to
+	 * set here is no longer read anywhere in ohos_compat_shim.c). No setup
+	 * needed before calling them. */
 
 	test_close_range_multi_range();
 	test_close_range_cloexec();
