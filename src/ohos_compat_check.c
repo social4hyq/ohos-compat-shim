@@ -20,7 +20,12 @@
  *
  * Two independent probe groups:
  *
- *   A — the shim's own 9 interceptors. Each gets a NEEDED/DROPPABLE/
+ *   A — the shim's own 12 interceptors (of 16 total; std_streams/close/
+ *       poll/ppoll/epoll_ctl/epoll_wait/epoll_pwait aren't separately
+ *       probed here -- epoll_ctl/wait/pwait/poll/ppoll/close are exercised
+ *       together via probe_epoll_pipe(), std_streams gets its own
+ *       INCONCLUSIVE-only row since this binary can't trigger it). Each
+ *       gets a NEEDED/DROPPABLE/
  *       INCONCLUSIVE verdict and feeds the DISABLE recommendation line.
  *   B — surrounding platform capabilities this workspace has documented
  *       workarounds for (raw syscalls Bun's rustix backend can't be
@@ -278,7 +283,7 @@ static const char *candidate_dir(int idx, char *scratch, size_t scratchsz)
 }
 
 /* ==================================================================== */
-/*  A-group: the shim's 9 interceptors                                  */
+/*  A-group: the shim's 12 interceptors                                 */
 /* ==================================================================== */
 
 /* -- close_range --------------------------------------------------- */
@@ -629,6 +634,59 @@ static void probe_linkat(void)
 		any_needed ? detail : "所有可写候选目录下真实 linkat() 均成功");
 }
 
+/*
+ * link() -- deliberately tests the plain link() libc symbol, not linkat().
+ * On this platform musl's link() issues a raw SYS_linkat syscall directly
+ * rather than calling through the linkat() symbol, so it needs (and the
+ * shim provides) its own separate interposer -- a probe against linkat()
+ * alone would not exercise it. Backfilled 2026-08-18: this row was missing
+ * even though the shim has hooked link() since v0.3.0 (audit-coverage.py
+ * caught the gap).
+ */
+static void probe_link(void)
+{
+	report_row_t *r = add_row("link", "A", "musl link() 走裸 SYS_linkat，不经过 linkat() 符号，需要独立拦截");
+	r->has_disable_flag = 1;
+	int any_needed = 0, tested = 0;
+	char detail[400] = "";
+	size_t off = 0;
+
+	for (int i = 0; i < NUM_CANDIDATE_DIRS; i++) {
+		char scratch[PATH_MAX];
+		const char *dir = candidate_dir(i, scratch, sizeof(scratch));
+		if (!dir || access(dir, W_OK) != 0)
+			continue;
+		char src[PATH_MAX], dst[PATH_MAX];
+		snprintf(src, sizeof(src), "%s/ohos-check-plainlink-src-%d", dir, (int)getpid());
+		snprintf(dst, sizeof(dst), "%s/ohos-check-plainlink-dst-%d", dir, (int)getpid());
+		int fd = open(src, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+		if (fd < 0)
+			continue;
+		close(fd);
+		unlink(dst);
+		errno = 0;
+		int rc = link(src, dst);
+		tested = 1;
+		if (rc != 0 && (errno == EPERM || errno == EACCES)) {
+			any_needed = 1;
+			off += (size_t)snprintf(detail + off, sizeof(detail) - off,
+				"[%s: errno=%d] ", dir, errno);
+		}
+		unlink(dst);
+		unlink(src);
+	}
+
+	if (!tested) {
+		r->verdict = V_INCONCLUSIVE;
+		snprintf(r->note, sizeof(r->note), "没有可写的候选目录，未能测试");
+		return;
+	}
+	r->verdict = any_needed ? V_NEEDED : V_DROPPABLE;
+	snprintf(r->note, sizeof(r->note),
+		"%s（有损语义 fallback：一旦可关闭就应尽快关闭，别图省事留着）",
+		any_needed ? detail : "所有可写候选目录下真实 link() 均成功");
+}
+
 static void probe_symlinkat(void)
 {
 	report_row_t *r = add_row("symlinkat", "A", "hmdfs/沙箱安装目标目录的符号链接");
@@ -954,6 +1012,35 @@ static void probe_getaddrinfo(void)
 	}
 }
 
+/*
+ * std_streams -- honest V_INCONCLUSIVE, deliberately not a real verdict.
+ * Backfilled 2026-08-18 (audit-coverage.py caught this row missing since
+ * the interceptor landed in v0.4.0). The defect only manifests in a binary
+ * that carries an R_AARCH64_COPY relocation against stdout/stderr/stdin --
+ * this self-probing check binary has no such relocation (it's not linking
+ * a copy-relocated libc FILE* the way an official prebuilt claude-code
+ * binary does), so it structurally cannot reproduce the trigger condition.
+ * Also: this interceptor has no OHOS_COMPAT_SHIM_DISABLE toggle at all (a
+ * constructor that unconditionally patches relocations it finds), so
+ * has_disable_flag is 0 -- there's nothing to recommend disabling anyway.
+ * A real verdict requires the manual A/B documented in the shim's README's
+ * `std_streams` section: run an official (non-recompiled) claude-code
+ * binary with and without this shim preloaded and compare startup
+ * behavior. Reporting a verdict this probe can't actually test would be
+ * worse than admitting the gap.
+ */
+static void probe_std_streams(void)
+{
+	report_row_t *r = add_row("std_streams", "A",
+		"官方预编译二进制的 stdout/stderr R_AARCH64_COPY 重定位解析错误 (setvbuf 断言 abort)");
+	r->has_disable_flag = 0;
+	r->verdict = V_INCONCLUSIVE;
+	snprintf(r->note, sizeof(r->note),
+		"探针二进制自身没有触发条件所需的 R_AARCH64_COPY 重定位，"
+		"无法在这里判定 -- 需要对官方预编译 claude-code 二进制手工 A/B "
+		"(README std_streams 一节)");
+}
+
 static void run_a_group_probes(void)
 {
 	probe_close_range();
@@ -962,10 +1049,12 @@ static void run_a_group_probes(void)
 	probe_tmpfile();
 	probe_getcwd();
 	probe_linkat();
+	probe_link();
 	probe_symlinkat();
 	probe_splice();
 	probe_epoll_pipe();
 	probe_getaddrinfo();
+	probe_std_streams();
 }
 
 /* ==================================================================== */
