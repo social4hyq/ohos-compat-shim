@@ -955,10 +955,8 @@ int getaddrinfo(const char *node, const char *service,
 	/* Only the broken case: every returned address is IPv6 loopback
 	 * (and there is at least one). Anything else passes through. */
 	int n = 0, all_v6_loopback = 1;
-	struct addrinfo *tail = NULL;
 	for (struct addrinfo *ai = *res; ai; ai = ai->ai_next) {
 		n++;
-		tail = ai;
 		if (ai->ai_family != AF_INET6 ||
 		    ai->ai_addrlen < sizeof(struct sockaddr_in6) ||
 		    !IN6_IS_ADDR_LOOPBACK(
@@ -987,23 +985,38 @@ int getaddrinfo(const char *node, const char *service,
 		return rc; /* retry failed: keep the original (broken) answer */
 	}
 	if (getenv("OHOS_GAI_DEBUG"))
-		fprintf(stderr, "[gai-shim] retry ok, merging\n");
+		fprintf(stderr, "[gai-shim] retry ok, substituting\n");
 
-	/* Move AF_INET nodes from res2 onto the tail of *res (preserving the
-	 * loopback-first order), then free what remains of res2. */
-	for (struct addrinfo **pp = &res2; *pp;) {
-		struct addrinfo *ai = *pp;
-		if (ai->ai_family == AF_INET) {
-			*pp = ai->ai_next;   /* unlink from res2 */
-			ai->ai_next = NULL;
-			tail->ai_next = ai;  /* append to *res */
-			tail = ai;
-		} else {
-			pp = &ai->ai_next;
-		}
-	}
-	if (res2)
-		freeaddrinfo(res2);
+	/* Do NOT splice res2's nodes onto *res's tail: this shim does not
+	 * interpose freeaddrinfo(), so whatever list *res ends up pointing to
+	 * is freed by the real, unmodified musl freeaddrinfo() later. musl
+	 * allocates one contiguous `struct aibuf` array per getaddrinfo()
+	 * call and derives that block's base address (and the amount to
+	 * decrement its refcount by) from the LAST node in the list it is
+	 * asked to free -- see musl's freeaddrinfo.c:
+	 *   for (cnt=1; p->ai_next; cnt++, p=p->ai_next);
+	 *   struct aibuf *b = (void *)((char *)p - offsetof(struct aibuf, ai));
+	 *   b -= b->slot;
+	 *   if (!(b->ref -= cnt)) free(b);
+	 * A list spanning *res's original block and res2's block breaks that
+	 * invariant both ways: freeaddrinfo(*res) would derive `b` from
+	 * res2's block (since it's now the tail) and decrement its ref by
+	 * the *combined* node count (underflowing it -- res2's block would
+	 * never reach ref==0 and never get freed), while *res's own block is
+	 * never freed at all (nothing ever computes its base to free it) --
+	 * a guaranteed leak of *res's original allocation plus permanently
+	 * corrupted refcount metadata on res2's, on every AI_ADDRCONFIG
+	 * IPv6-loopback-only lookup this repairs. Caught by the 2026-08-18
+	 * shim validation pass; verified against musl's actual freeaddrinfo
+	 * source, not just its header-declared contract.
+	 *
+	 * The original *res is IPv6-loopback-only, i.e. useless to the
+	 * caller by construction (that's the whole reason this retry ran) --
+	 * so simply discarding it and returning res2 (a single, genuine,
+	 * unmodified musl allocation) in its place is both safe *and*
+	 * functionally equivalent to what the merge was trying to achieve. */
+	freeaddrinfo(*res);
+	*res = res2;
 	return rc;
 }
 
