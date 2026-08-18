@@ -1942,6 +1942,189 @@ static void test_epoll_pwait_infinite_no_zero_return(void)
 	      "epoll_pwait_infinite_no_zero", detail);
 }
 
+static void test_epoll_wait_backoff_deadline_honored(void)
+{
+	int fds[2];
+	if (pipe(fds) != 0) {
+		check(0, "epoll_wait_backoff_deadline", "pipe() failed");
+		return;
+	}
+	int epfd = epoll_create1(0);
+	struct epoll_event ev = { .events = EPOLLIN, .data.fd = fds[0] };
+	if (epfd < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, fds[0], &ev) != 0) {
+		check(0, "epoll_wait_backoff_deadline", "epoll setup failed");
+		close(fds[0]); close(fds[1]);
+		if (epfd >= 0) close(epfd);
+		return;
+	}
+
+	/* Phase 2a regression: 2200ms spans the EP_BACKOFF_STREAK(8) *
+	 * EP_PIPE_POLL_MS(250ms) = 2000ms doubling boundary, so the slice
+	 * loop's deadline clamp must correctly shrink its LAST slice to
+	 * (deadline - now) even once the backoff interval has grown past
+	 * what's actually left -- exactly the interaction a bug in the
+	 * refactored "if (left < next_interval) slice = left" logic would
+	 * break. Empty pipe (never written to): must return rc=0 at
+	 * ~2200ms, neither early (premature 0, epoll_wait_timeout_honored's
+	 * own regression above) nor late (a broken clamp overshooting the
+	 * caller's deadline by a full grown interval). */
+	long long t0 = test_now_ms();
+	struct epoll_event out;
+	int rc = epoll_wait(epfd, &out, 1, 2200);
+	long long elapsed = test_now_ms() - t0;
+	close(fds[0]); close(fds[1]); close(epfd);
+
+	char detail[160];
+	snprintf(detail, sizeof(detail),
+		 "rc=%d elapsed=%lldms (want rc=0, 2100<=elapsed<=2500)", rc, elapsed);
+	check(rc == 0 && elapsed >= 2100 && elapsed <= 2500,
+	      "epoll_wait_backoff_deadline", detail);
+}
+
+struct backoff_waiter {
+	int epfd;
+	volatile int rc;
+	volatile long long done_ms;
+};
+
+static void *backoff_waiter_thread(void *arg)
+{
+	struct backoff_waiter *w = arg;
+	struct epoll_event out;
+	w->rc = epoll_wait(w->epfd, &out, 1, -1);
+	w->done_ms = test_now_ms();
+	return NULL;
+}
+
+static void test_epoll_pipe_backoff_resets_on_event(void)
+{
+	int fds[2];
+	if (pipe(fds) != 0) {
+		check(0, "epoll_pipe_backoff_reset", "pipe() failed");
+		return;
+	}
+	int epfd = epoll_create1(0);
+	struct epoll_event ev = { .events = EPOLLIN, .data.fd = fds[0] };
+	if (epfd < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, fds[0], &ev) != 0) {
+		check(0, "epoll_pipe_backoff_reset", "epoll setup failed");
+		close(fds[0]); close(fds[1]);
+		if (epfd >= 0) close(epfd);
+		return;
+	}
+
+	/* Phase 2a regression, the "resets to fast on synthesis" half of
+	 * the backoff policy (deadline-honoring half covered separately
+	 * above). Round 1: let the empty-slice streak build past the
+	 * doubling threshold (2000ms) before ever writing, so the interval
+	 * has grown to 500ms by the time an event finally arrives. Round 2:
+	 * immediately re-wait on the SAME epfd (backoff state is per-epfd,
+	 * persists across calls) and send a second event almost right away
+	 * -- well before another 8-slice streak could rebuild. If reset-on-
+	 * synthesis is broken (e.g. only decaying back down slowly, or not
+	 * resetting at all), round 2's detection latency stays at the grown
+	 * value instead of snapping back to ~250ms. */
+	struct backoff_waiter w1 = { .epfd = epfd, .rc = -99 };
+	pthread_t th1;
+	if (pthread_create(&th1, NULL, backoff_waiter_thread, &w1) != 0) {
+		check(0, "epoll_pipe_backoff_reset", "pthread_create failed (round 1)");
+		close(fds[0]); close(fds[1]); close(epfd);
+		return;
+	}
+	pthread_detach(th1);
+	usleep(2300 * 1000);
+	if (write(fds[1], "a", 1) != 1)
+		check(0, "epoll_pipe_backoff_reset", "write failed (round 1)");
+	int waited = 0;
+	while (w1.rc == -99 && waited < 3000) { usleep(20000); waited += 20; }
+	char drain[4];
+	if (read(fds[0], drain, sizeof(drain)) < 0) { /* best-effort drain */ }
+
+	struct backoff_waiter w2 = { .epfd = epfd, .rc = -99 };
+	pthread_t th2;
+	if (pthread_create(&th2, NULL, backoff_waiter_thread, &w2) != 0) {
+		check(0, "epoll_pipe_backoff_reset", "pthread_create failed (round 2)");
+		close(fds[0]); close(fds[1]); close(epfd);
+		return;
+	}
+	pthread_detach(th2);
+	usleep(50 * 1000); /* let epoll_wait actually enter its first slice */
+	long long t_write2 = test_now_ms();
+	if (write(fds[1], "b", 1) != 1)
+		check(0, "epoll_pipe_backoff_reset", "write failed (round 2)");
+	waited = 0;
+	while (w2.rc == -99 && waited < 3000) { usleep(20000); waited += 20; }
+	long long detect2_latency = w2.rc == 1 ? w2.done_ms - t_write2 : -1;
+
+	close(fds[0]); close(fds[1]); close(epfd);
+
+	char detail[220];
+	snprintf(detail, sizeof(detail),
+		 "round1_rc=%d round2_rc=%d round2_detect=%lldms (want both rc=1, "
+		 "round2 detect <600ms -- comfortably above 250ms+jitter, below a "
+		 "still-grown >=500ms interval)",
+		 w1.rc, w2.rc, detect2_latency);
+	check(w1.rc == 1 && w2.rc == 1 && detect2_latency >= 0 && detect2_latency < 600,
+	      "epoll_pipe_backoff_reset", detail);
+}
+
+struct poll_infinite_waiter {
+	struct pollfd pfd;
+	volatile int rc;
+};
+
+static void *poll_infinite_waiter_thread(void *arg)
+{
+	struct poll_infinite_waiter *w = arg;
+	w->rc = poll(&w->pfd, 1, -1);
+	return NULL;
+}
+
+static void test_poll_infinite_wait_with_fifo_still_works(void)
+{
+	/* Phase 2b regression: poll(fds, n, -1) now slices internally
+	 * (ep_shim_wait-style loop) whenever a candidate FIFO fd is present
+	 * -- verified via poll_set_has_candidate_fifo -- even though the
+	 * underlying kernel defect that motivated slicing doesn't reproduce
+	 * organically on this device (same limitation as
+	 * splice_wakes_poll_waiter/epoll_pipe elsewhere in this file). This
+	 * can only verify the new slicing loop doesn't BREAK the ordinary
+	 * case: a real write must still be observed promptly and correctly,
+	 * exactly as an unsliced poll(-1) always was. Bounded join (2s) so
+	 * a broken loop reports FAIL instead of hanging the suite. */
+	int fds[2];
+	if (pipe(fds) != 0) {
+		check(0, "poll_infinite_fifo_still_works", "pipe() failed");
+		return;
+	}
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+
+	struct poll_infinite_waiter w = { .pfd = { .fd = fds[0], .events = POLLIN }, .rc = -99 };
+	pthread_t th;
+	if (pthread_create(&th, NULL, poll_infinite_waiter_thread, &w) != 0) {
+		check(0, "poll_infinite_fifo_still_works", "pthread_create failed");
+		close(fds[0]); close(fds[1]);
+		return;
+	}
+	pthread_detach(th);
+	usleep(300 * 1000); /* let it enter poll(-1) and, if slicing, at least one slice */
+	int premature = (w.rc != -99);
+	if (write(fds[1], "x", 1) != 1)
+		check(0, "poll_infinite_fifo_still_works", "write failed");
+
+	int waited = 0;
+	while (w.rc == -99 && waited < 2000) { usleep(20000); waited += 20; }
+	int final_rc = w.rc;
+	int final_revents = w.pfd.revents;
+	close(fds[0]); close(fds[1]);
+
+	char detail[160];
+	snprintf(detail, sizeof(detail),
+		 "premature_return=%d final_rc=%d revents=0x%x (want !premature, rc=1, POLLIN set)",
+		 premature, final_rc, final_revents);
+	check(!premature && final_rc == 1 && (final_revents & POLLIN),
+	      "poll_infinite_fifo_still_works", detail);
+}
+
 int main(void)
 {
 	/* linkat/symlinkat have been default-on since commit 3cb9f08 (which
@@ -1998,6 +2181,9 @@ int main(void)
 
 	test_epoll_wait_finite_timeout_honored();
 	test_epoll_pwait_infinite_no_zero_return();
+	test_epoll_wait_backoff_deadline_honored();
+	test_epoll_pipe_backoff_resets_on_event();
+	test_poll_infinite_wait_with_fifo_still_works();
 
 	printf("%s (%d/%d checks failed)\n", failures == 0 ? "ALL PASS" : "SOME FAILED",
 	       failures, checks);
