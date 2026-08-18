@@ -69,6 +69,7 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -646,6 +647,12 @@ static int fc2_dispatch(int dirfd, const char *path, mode_t mode, int flags);
 static int ep_shim_ctl_done(int rc, int epfd, int op, int fd,
 			    struct epoll_event *ev);
 
+/* Forward-declared: shim_forget_fd() lives next to close() below — see its
+ * own comment there. Needed here because bun's Rust event loop issues
+ * close()/dup2()/dup3() as raw syscalls sometimes rather than the libc
+ * symbols, same reasoning as ep_shim_ctl_done() above. */
+static void shim_forget_fd(int fd);
+
 /* syscall() override — dispatches the small set of raw-syscall-numbers
  * this file intercepts (currently close_range and fchmodat2 — see each
  * one's own section); every other number passes straight through to the
@@ -686,6 +693,23 @@ long syscall(long number, ...)
 		return ep_shim_ctl_done(
 			(int)cr_real_syscall(__NR_epoll_ctl, a0, a1, a2, a3, 0, 0),
 			(int)a0, (int)a1, (int)a2, (struct epoll_event *)a3);
+	}
+
+	/* Same reasoning as epoll_ctl above: bun's Rust event loop closes and
+	 * dup3()s fds via raw syscalls, not the close()/dup3() libc symbols
+	 * below, so those overrides alone would miss it -- leaving stale
+	 * epoll_pipe registry / fifo-cache entries for a recycled fd number.
+	 * (No __NR_dup2 case: aarch64 has no dup2 syscall number at all --
+	 * libc's dup2() is itself implemented as dup3(old, new, 0), which the
+	 * dup3 case below already covers regardless of which symbol the
+	 * caller used to get there.) */
+	if (number == __NR_close) {
+		shim_forget_fd((int)a0);
+		return cr_real_syscall(__NR_close, a0, 0, 0, 0, 0, 0);
+	}
+	if (number == __NR_dup3) {
+		shim_forget_fd((int)a1);
+		return cr_real_syscall(__NR_dup3, a0, a1, a2, 0, 0, 0);
 	}
 
 	return cr_real_syscall(number, a0, a1, a2, a3, a4, a5);
@@ -955,10 +979,8 @@ int getaddrinfo(const char *node, const char *service,
 	/* Only the broken case: every returned address is IPv6 loopback
 	 * (and there is at least one). Anything else passes through. */
 	int n = 0, all_v6_loopback = 1;
-	struct addrinfo *tail = NULL;
 	for (struct addrinfo *ai = *res; ai; ai = ai->ai_next) {
 		n++;
-		tail = ai;
 		if (ai->ai_family != AF_INET6 ||
 		    ai->ai_addrlen < sizeof(struct sockaddr_in6) ||
 		    !IN6_IS_ADDR_LOOPBACK(
@@ -987,23 +1009,38 @@ int getaddrinfo(const char *node, const char *service,
 		return rc; /* retry failed: keep the original (broken) answer */
 	}
 	if (getenv("OHOS_GAI_DEBUG"))
-		fprintf(stderr, "[gai-shim] retry ok, merging\n");
+		fprintf(stderr, "[gai-shim] retry ok, substituting\n");
 
-	/* Move AF_INET nodes from res2 onto the tail of *res (preserving the
-	 * loopback-first order), then free what remains of res2. */
-	for (struct addrinfo **pp = &res2; *pp;) {
-		struct addrinfo *ai = *pp;
-		if (ai->ai_family == AF_INET) {
-			*pp = ai->ai_next;   /* unlink from res2 */
-			ai->ai_next = NULL;
-			tail->ai_next = ai;  /* append to *res */
-			tail = ai;
-		} else {
-			pp = &ai->ai_next;
-		}
-	}
-	if (res2)
-		freeaddrinfo(res2);
+	/* Do NOT splice res2's nodes onto *res's tail: this shim does not
+	 * interpose freeaddrinfo(), so whatever list *res ends up pointing to
+	 * is freed by the real, unmodified musl freeaddrinfo() later. musl
+	 * allocates one contiguous `struct aibuf` array per getaddrinfo()
+	 * call and derives that block's base address (and the amount to
+	 * decrement its refcount by) from the LAST node in the list it is
+	 * asked to free -- see musl's freeaddrinfo.c:
+	 *   for (cnt=1; p->ai_next; cnt++, p=p->ai_next);
+	 *   struct aibuf *b = (void *)((char *)p - offsetof(struct aibuf, ai));
+	 *   b -= b->slot;
+	 *   if (!(b->ref -= cnt)) free(b);
+	 * A list spanning *res's original block and res2's block breaks that
+	 * invariant both ways: freeaddrinfo(*res) would derive `b` from
+	 * res2's block (since it's now the tail) and decrement its ref by
+	 * the *combined* node count (underflowing it -- res2's block would
+	 * never reach ref==0 and never get freed), while *res's own block is
+	 * never freed at all (nothing ever computes its base to free it) --
+	 * a guaranteed leak of *res's original allocation plus permanently
+	 * corrupted refcount metadata on res2's, on every AI_ADDRCONFIG
+	 * IPv6-loopback-only lookup this repairs. Caught by the 2026-08-18
+	 * shim validation pass; verified against musl's actual freeaddrinfo
+	 * source, not just its header-declared contract.
+	 *
+	 * The original *res is IPv6-loopback-only, i.e. useless to the
+	 * caller by construction (that's the whole reason this retry ran) --
+	 * so simply discarding it and returning res2 (a single, genuine,
+	 * unmodified musl allocation) in its place is both safe *and*
+	 * functionally equivalent to what the merge was trying to achieve. */
+	freeaddrinfo(*res);
+	*res = res2;
 	return rc;
 }
 
@@ -1325,6 +1362,54 @@ static int splice_fd_is_fifo(int fd)
 }
 
 /*
+ * splice_fd_is_fifo() is called on every idle fd on every poll()/ppoll()
+ * return while epoll_pipe is enabled (ep_shim_patch_pollfds() below) -- an
+ * uncached fstat() there is the dominant measured cost of that interceptor
+ * (2026-08-18 validation pass: test/bench.c measured +115.7us/call at 128
+ * idle fds). Cache the result per fd, direct-mapped by fd number so a hit
+ * is a single atomic load, no lock: a slot holding a *different* fd (or an
+ * empty slot) is simply treated as a cache miss and falls through to the
+ * real fstat() -- a wrong/stale hit is structurally impossible, only a
+ * missed opportunity to skip the syscall. That means correctness rests
+ * entirely on invalidating a slot whenever its fd number can start meaning
+ * a different file, which is why every place that can do that --
+ * close(fd), dup2/dup3(_, newfd), and the raw-syscall paths bun's Rust
+ * event loop uses instead of those libc symbols -- calls
+ * shim_forget_fd() below before the fd changes meaning. (This closes the
+ * same class of staleness the pre-existing g_ep_pipes registry only
+ * partially guarded against via close() alone; see shim_forget_fd().)
+ *
+ * Slot encoding: 0 = empty. A live entry is ((fd+1) << 1) | is_fifo, so
+ * fd 0 (often stdin) is representable and distinct from "empty".
+ */
+#define FIFO_CACHE_SIZE 256
+static _Atomic uint32_t g_fifo_cache[FIFO_CACHE_SIZE];
+
+static int splice_fd_is_fifo_cached(int fd)
+{
+	if (fd < 0)
+		return 0;
+	unsigned idx = (unsigned)fd % FIFO_CACHE_SIZE;
+	uint32_t slot = atomic_load_explicit(&g_fifo_cache[idx], memory_order_relaxed);
+	if (slot != 0 && (int)(slot >> 1) - 1 == fd)
+		return (int)(slot & 1);
+	int is_fifo = splice_fd_is_fifo(fd);
+	uint32_t encoded = (((uint32_t)fd + 1) << 1) | (is_fifo ? 1u : 0u);
+	atomic_store_explicit(&g_fifo_cache[idx], encoded, memory_order_relaxed);
+	return is_fifo;
+}
+
+static void fifo_cache_forget_fd(int fd)
+{
+	if (fd < 0)
+		return;
+	unsigned idx = (unsigned)fd % FIFO_CACHE_SIZE;
+	uint32_t slot = atomic_load_explicit(&g_fifo_cache[idx], memory_order_relaxed);
+	if (slot != 0 && (int)(slot >> 1) - 1 == fd)
+		atomic_store_explicit(&g_fifo_cache[idx], 0, memory_order_relaxed);
+}
+
+/*
  * One bounded chunk, source -> userspace -> destination. Returning less than
  * `len` is allowed by splice(2) and every splice-based copy loop already
  * handles it, so a 64KB ceiling costs nothing but bounds the stack.
@@ -1397,7 +1482,7 @@ ssize_t splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
 	   testing it as well keeps this path off any call the kernel would
 	   have rejected anyway. */
 	if (len > 0 && off_out == NULL && !shim_disabled("splice") &&
-	    splice_fd_is_fifo(fd_out))
+	    splice_fd_is_fifo_cached(fd_out))
 		return splice_through_buffer(fd_in, off_in, fd_out, len, flags);
 
 	ssize_t rc = real(fd_in, off_in, fd_out, off_out, len, flags);
@@ -1571,7 +1656,7 @@ static int ep_shim_ctl_done(int rc, int epfd, int op, int fd,
 	pthread_mutex_lock(&g_ep_pipes_lock);
 	if (op == EPOLL_CTL_DEL) {
 		ep_reg_del_locked(epfd, fd);
-	} else if (ev && (ev->events & EPOLLIN) && splice_fd_is_fifo(fd)) {
+	} else if (ev && (ev->events & EPOLLIN) && splice_fd_is_fifo_cached(fd)) {
 		ep_reg_update_locked(epfd, fd, ev);
 	} else {
 		/* No EPOLLIN requested, or not a pipe: make sure a
@@ -1738,7 +1823,7 @@ static int ep_shim_patch_pollfds(struct pollfd *fds, nfds_t nfds, int rc)
 		if (fds[i].fd < 0 || !(fds[i].events & POLLIN) ||
 		    fds[i].revents != 0)
 			continue;
-		if (!splice_fd_is_fifo(fds[i].fd))
+		if (!splice_fd_is_fifo_cached(fds[i].fd))
 			continue;
 		if (ioctl(fds[i].fd, FIONREAD, &avail) == 0 && avail > 0) {
 			fds[i].revents = POLLIN;
@@ -1778,6 +1863,37 @@ int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
 				     real(fds, nfds, timeout, sigmask));
 }
 
+/*
+ * Shared cleanup for every place an fd number can start meaning a
+ * different file: the real close() below, dup2()/dup3() onto an
+ * already-open newfd (which implicitly closes whatever newfd used to be),
+ * and the raw-syscall paths bun's Rust event loop uses instead of those
+ * libc symbols (see the syscall() override's __NR_close/__NR_dup3 cases).
+ * Forgets both the epoll_pipe registry entry (if that interceptor is
+ * active) and the fifo cache (unconditionally -- splice()'s own is-fifo
+ * check uses the cache too, independent of epoll_pipe). Call this *before*
+ * the fd's old meaning is gone, matching the timing the epoll registry
+ * cleanup already used: afterwards the number can be handed out again for
+ * a different file at any moment, so forgetting late leaves a window where
+ * a concurrent lookup can be caught with a stale answer.
+ *
+ * This is what closes the fd-reuse staleness risk the epoll_pipe registry
+ * only partially guarded against before (close() alone missed dup2/dup3
+ * and raw-syscall closes -- flagged in the 2026-08-18 shim validation
+ * pass) and what makes the fifo cache above safe to introduce at all.
+ */
+static void shim_forget_fd(int fd)
+{
+	if (fd < 0)
+		return;
+	if (ep_pipe_active()) {
+		pthread_mutex_lock(&g_ep_pipes_lock);
+		ep_reg_forget_fd_locked(fd);
+		pthread_mutex_unlock(&g_ep_pipes_lock);
+	}
+	fifo_cache_forget_fd(fd);
+}
+
 typedef int (*close_fn)(int);
 
 int close(int fd)
@@ -1789,15 +1905,48 @@ int close(int fd)
 		errno = ENOSYS;
 		return -1;
 	}
-	/* Forget before the real close: afterwards the number can be
-	 * handed out again at any moment. Covers the fd both as a
-	 * registered pipe and as an epfd with pipes under repair. */
-	if (fd >= 0 && ep_pipe_active()) {
-		pthread_mutex_lock(&g_ep_pipes_lock);
-		ep_reg_forget_fd_locked(fd);
-		pthread_mutex_unlock(&g_ep_pipes_lock);
-	}
+	shim_forget_fd(fd);
 	return real(fd);
+}
+
+/*
+ * dup2()/dup3() onto an already-open newfd implicitly close it -- the same
+ * "this fd number is about to mean a different file" event close() handles
+ * above. Forgetting unconditionally (even when the call will turn out to
+ * be a no-op, e.g. dup2(fd, fd), or fails) is deliberate: an unnecessary
+ * forget just costs one extra cache-miss fstat() on the next lookup,
+ * whereas forgetting only after a confirmed-successful call would leave a
+ * window, between the real syscall completing and this running, where a
+ * concurrent lookup on newfd could see the cache's old (now wrong) answer.
+ */
+typedef int (*dup2_fn)(int, int);
+
+int dup2(int oldfd, int newfd)
+{
+	static dup2_fn real = NULL;
+	if (!real)
+		real = (dup2_fn)dlsym(RTLD_NEXT, "dup2");
+	if (!real) {
+		errno = ENOSYS;
+		return -1;
+	}
+	shim_forget_fd(newfd);
+	return real(oldfd, newfd);
+}
+
+typedef int (*dup3_fn)(int, int, int);
+
+int dup3(int oldfd, int newfd, int flags)
+{
+	static dup3_fn real = NULL;
+	if (!real)
+		real = (dup3_fn)dlsym(RTLD_NEXT, "dup3");
+	if (!real) {
+		errno = ENOSYS;
+		return -1;
+	}
+	shim_forget_fd(newfd);
+	return real(oldfd, newfd, flags);
 }
 
 int linkat(int olddirfd, const char *oldpath, int newdirfd,
