@@ -53,7 +53,6 @@
  */
 
 #define _GNU_SOURCE
-#include <dirent.h>
 #include <elf.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -70,6 +69,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -394,11 +394,62 @@ static int cr_probe_state = CR_PROBE_UNKNOWN;
  * pthread-based CLOSE_RANGE_UNSHARE test) — a shared jmp_buf across
  * threads would let one thread's siglongjmp corrupt another's stack. */
 static __thread sigjmp_buf cr_sigsys_jmp;
+/* Thread-local "this thread is currently inside a guarded window" flag.
+ * Without it, a *genuine* SIGSYS delivered to a thread that isn't inside
+ * shim_guarded_syscall() — the handler is process-wide, installed the
+ * instant any thread enters its first guarded call — would siglongjmp into
+ * that thread's cr_sigsys_jmp before it has ever been initialized: undefined
+ * behavior, worse than the crash the real signal was reporting. */
+static __thread int cr_sigsys_armed;
 
 static void cr_sigsys_handler(int sig)
 {
-	(void)sig;
+	if (!cr_sigsys_armed) {
+		/* Not one of ours: restore the default disposition and
+		 * re-raise, so the process dies the same way it would with
+		 * no shim loaded at all — signal()/raise() are both on the
+		 * async-signal-safe list (signal-safety(7)), safe to call
+		 * from here. */
+		signal(SIGSYS, SIG_DFL);
+		raise(sig);
+		return;
+	}
 	siglongjmp(cr_sigsys_jmp, 1);
+}
+
+/* sigaction(SIGSYS, ...) install/restore used to happen unconditionally on
+ * every shim_guarded_syscall() call, saving/restoring whatever disposition
+ * happened to be current *on that call* — with multiple threads racing
+ * through guarded windows concurrently (the whole reason cr_sigsys_jmp is
+ * thread-local), the first thread to exit could restore a disposition that
+ * was never the true pre-shim original, and could tear the handler out from
+ * under a second thread still inside its own guarded window. Refcounted
+ * install fixes both: the handler goes in once (first 0->1 transition,
+ * caching the real original) and comes out once (last ->0 transition,
+ * restoring that same original), no matter how threads interleave. */
+static pthread_mutex_t cr_sigsys_lock = PTHREAD_MUTEX_INITIALIZER;
+static int cr_sigsys_refcount = 0;
+static struct sigaction cr_sigsys_old_sa;
+
+static void cr_sigsys_ref(void)
+{
+	pthread_mutex_lock(&cr_sigsys_lock);
+	if (cr_sigsys_refcount++ == 0) {
+		struct sigaction sa;
+		sigemptyset(&sa.sa_mask);
+		sa.sa_flags = 0;
+		sa.sa_handler = cr_sigsys_handler;
+		sigaction(SIGSYS, &sa, &cr_sigsys_old_sa);
+	}
+	pthread_mutex_unlock(&cr_sigsys_lock);
+}
+
+static void cr_sigsys_unref(void)
+{
+	pthread_mutex_lock(&cr_sigsys_lock);
+	if (--cr_sigsys_refcount == 0)
+		sigaction(SIGSYS, &cr_sigsys_old_sa, NULL);
+	pthread_mutex_unlock(&cr_sigsys_lock);
 }
 
 typedef long (*real_syscall_fn)(long, ...);
@@ -437,11 +488,8 @@ static long cr_real_syscall(long n, long a0, long a1, long a2, long a3,
 static int shim_guarded_syscall(long nr, long a0, long a1, long a2, long a3,
 				long a4, long a5, long *out_ret)
 {
-	struct sigaction old_sa, sa;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = 0;
-	sa.sa_handler = cr_sigsys_handler;
-	sigaction(SIGSYS, &sa, &old_sa);
+	cr_sigsys_ref();
+	cr_sigsys_armed = 1;
 
 	int ok;
 	if (sigsetjmp(cr_sigsys_jmp, 1) == 0) {
@@ -451,7 +499,8 @@ static int shim_guarded_syscall(long nr, long a0, long a1, long a2, long a3,
 		ok = 0;
 	}
 
-	sigaction(SIGSYS, &old_sa, NULL);
+	cr_sigsys_armed = 0;
+	cr_sigsys_unref();
 	return ok;
 }
 
@@ -500,24 +549,14 @@ static int cr_do_fallback(unsigned int first, unsigned int last, unsigned int fl
 		 * threads/whatever this table is shared with would lose
 		 * those fds too), which is worse than an honest failure. So
 		 * catch the SIGSYS and report ENOSYS/EPERM rather than either
-		 * crashing or silently doing the wrong thing. */
-		struct sigaction old_sa, sa;
-		sigemptyset(&sa.sa_mask);
-		sa.sa_flags = 0;
-		sa.sa_handler = cr_sigsys_handler;
-		sigaction(SIGSYS, &sa, &old_sa);
-
-		int ret, crashed = 0;
-		if (sigsetjmp(cr_sigsys_jmp, 1) == 0) {
-			ret = unshare(CLONE_FILES);
-		} else {
-			crashed = 1;
-			ret = -1;
-		}
-
-		sigaction(SIGSYS, &old_sa, NULL);
-
-		if (crashed) {
+		 * crashing or silently doing the wrong thing. Routed through
+		 * shim_guarded_syscall() (via __NR_unshare) rather than a
+		 * second hand-rolled sigaction/sigsetjmp pair, now that the
+		 * helper is refcounted/thread-armed-flag safe — two copies of
+		 * this pattern is exactly what let them race against each
+		 * other and against close_range's own guarded calls. */
+		long ret;
+		if (!shim_guarded_syscall(__NR_unshare, (long)CLONE_FILES, 0, 0, 0, 0, 0, &ret)) {
 			errno = ENOSYS;
 			return -1;
 		}
@@ -525,35 +564,77 @@ static int cr_do_fallback(unsigned int first, unsigned int last, unsigned int fl
 			return -1;
 	}
 
-	DIR *d = opendir("/proc/self/fd");
-	int dirfd_ = d ? dirfd(d) : -1;
-	if (!d) {
+	/* Deliberately NOT opendir()/readdir()/closedir(): this path runs from
+	 * close_range()/the syscall() override, which Bun (the primary
+	 * consumer) calls right after fork() to clean up the child's fd table
+	 * before exec — exactly the window where only async-signal-safe calls
+	 * are guaranteed correct. opendir()/readdir() malloc internally, and
+	 * the loop used to call this shim's own close(), which now takes
+	 * g_ep_pipes_lock via shim_forget_fd(): if that lock (or malloc's own
+	 * arena lock) was held by a *different* thread at fork time, the
+	 * single surviving child thread deadlocks on its first iteration.
+	 * Raw syscalls only, close() bypassed via cr_real_syscall(__NR_close,
+	 * ...) so no lock this shim owns is ever touched from here — the
+	 * registry itself is separately reset via cr_atfork_child() below. */
+	int dfd = (int)cr_real_syscall(__NR_openat, (long)AT_FDCWD,
+				       (long)"/proc/self/fd",
+				       (long)(O_RDONLY | O_DIRECTORY), 0, 0, 0);
+	if (dfd < 0) {
 		/* Extreme fallback if /proc isn't mounted/visible: linear scan,
 		 * same as ohos-preflight's own documented fallback-of-the-
 		 * fallback. Slow, but correct. */
 		if (flags & CLOSE_RANGE_CLOEXEC) {
 			for (unsigned int i = first; i <= last; i++)
-				fcntl((int)i, F_SETFD, FD_CLOEXEC);
+				cr_real_syscall(__NR_fcntl, (long)i, F_SETFD,
+						(long)FD_CLOEXEC, 0, 0, 0);
 		} else {
 			for (unsigned int i = first; i <= last; i++)
-				close((int)i);
+				cr_real_syscall(__NR_close, (long)i, 0, 0, 0, 0, 0);
 		}
 		return 0;
 	}
 
-	struct dirent *e;
-	while ((e = readdir(d))) {
-		if (e->d_name[0] < '0' || e->d_name[0] > '9')
-			continue;
-		unsigned int fd = (unsigned int)atoi(e->d_name);
-		if (fd < first || fd > last || (int)fd == dirfd_)
-			continue;
-		if (flags & CLOSE_RANGE_CLOEXEC)
-			fcntl((int)fd, F_SETFD, FD_CLOEXEC);
-		else
-			close((int)fd);
+	/* Kernel getdents64(2) ABI struct — deliberately not <dirent.h>'s
+	 * `struct dirent`, which is libc's (different-shaped, allocated-by-
+	 * readdir) view. Flexible array member holds the NUL-terminated name. */
+	struct cr_kernel_dirent64 {
+		uint64_t d_ino;
+		int64_t  d_off;
+		unsigned short d_reclen;
+		unsigned char  d_type;
+		char     d_name[];
+	};
+	char buf[4096];
+	for (;;) {
+		long n = cr_real_syscall(__NR_getdents64, (long)dfd, (long)buf,
+					 (long)sizeof(buf), 0, 0, 0);
+		if (n <= 0)
+			break;
+		long off = 0;
+		while (off < n) {
+			struct cr_kernel_dirent64 *de =
+				(struct cr_kernel_dirent64 *)(buf + off);
+			if (de->d_name[0] >= '0' && de->d_name[0] <= '9') {
+				/* Manual parse, not atoi(): not on the
+				 * async-signal-safe list, this one is. */
+				unsigned int fd = 0;
+				const char *p = de->d_name;
+				while (*p >= '0' && *p <= '9')
+					fd = fd * 10 + (unsigned int)(*p++ - '0');
+				if (fd >= first && fd <= last && (int)fd != dfd) {
+					if (flags & CLOSE_RANGE_CLOEXEC)
+						cr_real_syscall(__NR_fcntl, (long)fd,
+								F_SETFD, (long)FD_CLOEXEC,
+								0, 0, 0);
+					else
+						cr_real_syscall(__NR_close, (long)fd,
+								0, 0, 0, 0, 0);
+				}
+			}
+			off += de->d_reclen;
+		}
 	}
-	closedir(d);
+	cr_real_syscall(__NR_close, (long)dfd, 0, 0, 0, 0, 0);
 	return 0;
 }
 
@@ -1582,6 +1663,42 @@ typedef struct {
 static ep_pipe_reg_t g_ep_pipes[EP_REG_MAX];
 static pthread_mutex_t g_ep_pipes_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* fork() only carries the calling thread into the child; if some *other*
+ * thread held g_ep_pipes_lock at the instant of fork(), it stays locked
+ * forever in the child (its owner doesn't exist there to unlock it) --
+ * every close()/epoll_ctl()/epoll_wait() the child ever makes would then
+ * deadlock on its very first call, since they all touch this lock via
+ * shim_forget_fd()/ep_shim_ctl_done()/ep_shim_wait(). pthread_atfork's
+ * child callback runs in the child immediately post-fork, before any other
+ * shim entry point can run there, so reinitializing unconditionally here is
+ * safe even though the mutex was never destroyed -- POSIX doesn't strictly
+ * sanction re-init of a non-destroyed mutex, but this is the standard,
+ * widely-used pattern for exactly this problem (glibc's own malloc arena
+ * locks do the same via their fork handlers). Registrations don't survive
+ * fork meaningfully anyway (the child's epfds/pipe fds are the same numbers
+ * but a fresh execve is coming right behind close_range's cleanup in the
+ * common case), so clearing the table alongside the lock is correct, not
+ * just convenient. */
+static void cr_atfork_child(void)
+{
+	pthread_mutex_init(&g_ep_pipes_lock, NULL);
+	memset(g_ep_pipes, 0, sizeof(g_ep_pipes));
+	/* cr_sigsys_lock (shim_guarded_syscall's refcounted SIGSYS handler
+	 * install/restore, above) has the identical fork hazard -- reset the
+	 * same way. cr_sigsys_refcount resetting to 0 is safe: the forking
+	 * thread is never itself inside a guarded window across a fork() call
+	 * (nothing in this file forks from inside shim_guarded_syscall), and
+	 * no other thread survives the fork to have been counted. */
+	pthread_mutex_init(&cr_sigsys_lock, NULL);
+	cr_sigsys_refcount = 0;
+}
+
+__attribute__((constructor))
+static void cr_atfork_register(void)
+{
+	pthread_atfork(NULL, NULL, cr_atfork_child);
+}
+
 static int ep_pipe_active(void)
 {
 	return !shim_disabled("epoll_pipe");
@@ -2004,14 +2121,49 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath)
 	if (errno != EPERM && errno != EACCES)
 		return rc;
 
-	/* Resolve `target` relative to the link's directory (newdirfd), NOT the
-	 * process CWD: a package symlink's target is almost always a path
-	 * relative to the link's own dir (e.g. node_modules/.bin/cli -> ../pkg),
-	 * and resolving it against CWD would either miss or copy an unrelated
-	 * same-named file. Only handles the "target resolves to a real file"
-	 * case; a dangling/not-yet-extracted target still fails as before. */
-	int src = openat(newdirfd, target, O_RDONLY);
+	/* Resolve `target` relative to the LINK's own directory, not the
+	 * process CWD (a package symlink's target is almost always relative
+	 * to the link's own dir, e.g. node_modules/.bin/cli -> ../pkg) and
+	 * NOT unconditionally `newdirfd` either: `linkpath` can itself carry
+	 * a directory component (e.g. "sub/link" with newdirfd naming
+	 * sub's parent), in which case the link's real parent directory is
+	 * newdirfd+dirname(linkpath), and POSIX symlink(2) defines a
+	 * relative target against THAT directory, not newdirfd. Resolving
+	 * against newdirfd directly only happened to be correct when
+	 * linkpath was a bare basename (the two ARE the same directory in
+	 * that case) and silently resolved wrong once linkpath had a
+	 * directory component -- this only handles the "target resolves to
+	 * a real file" case either way; a dangling/not-yet-extracted target
+	 * still fails as before. */
+	int dir_fd = newdirfd;
+	int opened_dir_fd = -1;
+	const char *slash = strrchr(linkpath, '/');
+	if (slash) {
+		size_t dlen = (size_t)(slash - linkpath);
+		char dirbuf[PATH_MAX];
+		if (dlen == 0) {
+			/* linkpath is e.g. "/link": its directory is root. */
+			dirbuf[0] = '/';
+			dirbuf[1] = '\0';
+		} else if (dlen < sizeof(dirbuf)) {
+			memcpy(dirbuf, linkpath, dlen);
+			dirbuf[dlen] = '\0';
+		} else {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+		opened_dir_fd = openat(newdirfd, dirbuf, O_RDONLY | O_DIRECTORY);
+		if (opened_dir_fd < 0) {
+			errno = EPERM;
+			return -1;
+		}
+		dir_fd = opened_dir_fd;
+	}
+
+	int src = openat(dir_fd, target, O_RDONLY);
 	if (src < 0) {
+		if (opened_dir_fd >= 0)
+			close(opened_dir_fd);
 		errno = EPERM;
 		return -1;
 	}
@@ -2020,18 +2172,24 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath)
 	if (fstat(src, &st) != 0) {
 		int e = errno;
 		close(src);
+		if (opened_dir_fd >= 0)
+			close(opened_dir_fd);
 		errno = e;
 		return -1;
 	}
 
-	if (copy_fd_to_path_atomic(src, newdirfd, linkpath,
-				   st.st_mode & 0777) != 0) {
-		int e = errno;
-		close(src);
+	/* The copy always lands at newdirfd+linkpath (that part was never
+	 * wrong -- only where we read `target` FROM needed the fix above). */
+	int copy_rc = copy_fd_to_path_atomic(src, newdirfd, linkpath,
+					     st.st_mode & 0777);
+	int e = errno;
+	close(src);
+	if (opened_dir_fd >= 0)
+		close(opened_dir_fd);
+	if (copy_rc != 0) {
 		errno = e;
 		return -1;
 	}
-	close(src);
 	return 0;
 }
 

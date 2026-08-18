@@ -41,6 +41,7 @@
 #include <sys/stat.h>
 #include <sys/epoll.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -463,6 +464,166 @@ static void test_close_range_unshare(void)
 		check(targ.close_range_rc == 0 && fd_is_open(fd), "close_range_unshare", detail);
 	}
 	close(fd);
+}
+
+/* close_range_fn is declared further below (test_close_range_libc_wrapper's
+ * section) — forward-declare the typedef name here too so both stress tests
+ * above that point can use it without reordering the whole file. */
+typedef int (*sigsys_stress_close_range_fn)(unsigned, unsigned, unsigned);
+
+static void *sigsys_guard_stress_thread(void *arg)
+{
+	int fd = *(int *)arg;
+	/* Resolved once per thread via dlsym, same reasoning as
+	 * test_close_range_libc_wrapper below: this musl doesn't export
+	 * close_range() at all, only the shim provides it when preloaded. */
+	sigsys_stress_close_range_fn fn =
+		(sigsys_stress_close_range_fn)dlsym(RTLD_DEFAULT, "close_range");
+	if (!fn)
+		return NULL;
+	for (int i = 0; i < 100; i++) {
+		/* CLOSE_RANGE_UNSHARE independently SIGSYS's on this device
+		 * (see close_range_unshare above) even after a flags=0 probe
+		 * already cached CR_PROBE_WORKS -- so every one of these
+		 * iterations, from every concurrently-running thread, drives
+		 * shim_guarded_syscall()'s install-ref/arm/disarm/unref
+		 * sequence for real, unlike a single-threaded call. */
+		fn((unsigned)fd, (unsigned)fd, CLOSE_RANGE_UNSHARE);
+	}
+	return NULL;
+}
+
+static void test_sigsys_guard_concurrent_stress(void)
+{
+	/* Phase 1a regression. Before the refcounted sigaction install +
+	 * thread-local "armed" flag, shim_guarded_syscall() blindly
+	 * installed/restored a *shared* SIGSYS handler on every call: N
+	 * threads racing through this at once could have one thread's exit
+	 * tear the handler out from under a still-active window on another
+	 * thread, or (worse) let a genuine SIGSYS on a thread that was never
+	 * inside a guarded window siglongjmp into that thread's never-
+	 * initialized jmp_buf. Not a deterministic repro (it's a race — the
+	 * old bug may not have misfired on every interleaving either); this
+	 * is a soak check under real concurrency. A crash here kills the
+	 * whole test binary, which is itself the failure signal (matches
+	 * this file's existing style for other race regressions, e.g.
+	 * close_range_unshare above). Correctness of the fix itself is
+	 * primarily argued in shim_guarded_syscall's own comment. */
+	if (!shim_is_loaded()) {
+		printf("SKIP  %-28s close_range() symbol not present (expected without preload)\n",
+		       "sigsys_guard_stress");
+		checks++;
+		return;
+	}
+
+	enum { NTHREADS = 8 };
+	pthread_t tids[NTHREADS];
+	int fds[NTHREADS];
+	int created[NTHREADS];
+	int ok = 1;
+	for (int i = 0; i < NTHREADS; i++) {
+		fds[i] = open("/dev/null", O_RDONLY);
+		created[i] = 0;
+		if (fds[i] < 0) {
+			ok = 0;
+			continue;
+		}
+		created[i] = pthread_create(&tids[i], NULL, sigsys_guard_stress_thread,
+					    &fds[i]) == 0;
+		if (!created[i])
+			ok = 0;
+	}
+	for (int i = 0; i < NTHREADS; i++) {
+		if (created[i])
+			pthread_join(tids[i], NULL);
+		if (fds[i] >= 0)
+			close(fds[i]);
+	}
+	check(ok, "sigsys_guard_stress",
+	      "8 threads x 100 concurrent CLOSE_RANGE_UNSHARE calls, process survives");
+}
+
+static void *fork_safety_lock_churn_thread(void *arg)
+{
+	volatile int *stop = arg;
+	int p[2];
+	if (pipe(p) != 0)
+		return NULL;
+	int epfd = epoll_create1(0);
+	struct epoll_event ev = {.events = EPOLLIN};
+	ev.data.fd = p[0];
+	while (!*stop) {
+		/* Every ADD/DEL pair takes g_ep_pipes_lock inside the shim
+		 * (ep_shim_ctl_done -> shim_forget_fd/ep_reg_*), same lock
+		 * close_range()'s /proc/self/fd fallback used to take
+		 * indirectly via its own close() calls before the Phase 1b
+		 * fix. */
+		epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev);
+		epoll_ctl(epfd, EPOLL_CTL_DEL, p[0], NULL);
+	}
+	close(epfd);
+	close(p[0]);
+	close(p[1]);
+	return NULL;
+}
+
+static void test_fork_safety_no_deadlock(void)
+{
+	/* Phase 1b regression: close_range()'s /proc/self/fd fallback used
+	 * to call opendir()/readdir() (malloc internally) and this shim's
+	 * own close() (which takes g_ep_pipes_lock via shim_forget_fd()) in
+	 * a loop. fork() only carries the calling thread into the child; if
+	 * a *different* thread held one of those locks at the exact instant
+	 * of fork(), the single surviving thread in the child deadlocks
+	 * forever on its very first iteration — precisely Bun's own pattern
+	 * (fork, then clean up the fd table via close_range before exec).
+	 * Reproduced by keeping a background thread constantly churning
+	 * epoll_ctl(ADD)/epoll_ctl(DEL) (holds g_ep_pipes_lock every call)
+	 * while the main thread forks repeatedly; with enough repetitions,
+	 * some fork() is virtually guaranteed to land inside the churn
+	 * thread's locked window. A hung child is caught by alarm()+SIGALRM
+	 * forcing a nonzero exit instead of hanging the whole suite. */
+	if (!shim_is_loaded()) {
+		printf("SKIP  %-28s close_range() symbol not present (expected without preload)\n",
+		       "fork_safety_no_deadlock");
+		checks++;
+		return;
+	}
+
+	int stop = 0;
+	pthread_t churn;
+	if (pthread_create(&churn, NULL, fork_safety_lock_churn_thread, (void *)&stop) != 0) {
+		check(0, "fork_safety_no_deadlock", "pthread_create failed");
+		return;
+	}
+
+	sigsys_stress_close_range_fn fn =
+		(sigsys_stress_close_range_fn)dlsym(RTLD_DEFAULT, "close_range");
+
+	int all_ok = 1;
+	enum { NFORKS = 30 };
+	for (int i = 0; i < NFORKS; i++) {
+		pid_t pid = fork();
+		if (pid == 0) {
+			alarm(3);
+			if (fn)
+				fn(3, 3, CLOSE_RANGE_CLOEXEC);
+			_exit(0);
+		} else if (pid > 0) {
+			int status = 0;
+			waitpid(pid, &status, 0);
+			if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0))
+				all_ok = 0;
+		} else {
+			all_ok = 0;
+		}
+	}
+
+	stop = 1;
+	pthread_join(churn, NULL);
+
+	check(all_ok, "fork_safety_no_deadlock",
+	      "30 forks while another thread churns epoll_ctl, no child hangs/deadlocks");
 }
 
 static void test_close_range_repeated(void)
@@ -1256,6 +1417,98 @@ cleanup:
 	rmdir(root);
 }
 
+static void test_symlinkat_dir_component_target_resolution(void)
+{
+	/* Phase 1c regression. Same limitation as symlinkat_rel_resolution
+	 * above and for the same reason: symlinkat() isn't EACCES-restricted
+	 * in TMPDIR on this device (unlike linkat/link — see those tests'
+	 * own INFO output), so the shim's EPERM/EACCES->copy branch inside
+	 * symlinkat() can never actually run here; a chmod-based attempt to
+	 * force a real EACCES was tried and rejected: the copy fallback's
+	 * own atomic write lands in the SAME directory as the link (see
+	 * copy_fd_to_path_atomic's design note), so removing that
+	 * directory's write bit to fail the real call also fails the
+	 * fallback's own write — the two can't be made to disagree via
+	 * POSIX permission bits alone. So, like the sibling test, this
+	 * verifies the RESOLUTION PRIMITIVE the fix's code computes rather
+	 * than driving the live fallback branch: given linkpath="sub/link"
+	 * (a directory component), the link's own directory is
+	 * newdirfd+"sub", and openat(that, target) must find the file while
+	 * openat(newdirfd, target) directly — the pre-fix behavior — must
+	 * NOT (it resolves one level up from where the link actually is). */
+	const char *tmp = getenv("TMPDIR");
+	if (!tmp)
+		tmp = "/data/storage/el2/base/tmp";
+	char root[4096], sub[4096], target_file[4096];
+	snprintf(root, sizeof(root), "%s/ohos-compat-fntest-symdircomp", tmp);
+	snprintf(sub, sizeof(sub), "%s/sub", root);
+	snprintf(target_file, sizeof(target_file), "%s/pkgfile", root);
+
+	unlink(target_file);
+	rmdir(sub);
+	rmdir(root);
+
+	int ok = (mkdir(root, 0700) == 0) && (mkdir(sub, 0700) == 0);
+	int wfd = ok ? open(target_file, O_CREAT | O_WRONLY, 0644) : -1;
+	if (wfd < 0) {
+		check(0, "symlinkat_dircomp", "could not set up fixture");
+		rmdir(sub);
+		rmdir(root);
+		return;
+	}
+	const char *payload = "dircomp-payload";
+	write(wfd, payload, strlen(payload));
+	close(wfd);
+
+	int rootfd = open(root, O_RDONLY | O_DIRECTORY);
+	int ok_all = rootfd >= 0;
+
+	/* Fixed resolution: compute dirname("sub/link") == "sub" exactly as
+	 * symlinkat()'s fallback does (strrchr('/'), everything before it),
+	 * open THAT relative to newdirfd, then resolve target against it. */
+	int hit = 0, miss_confirmed = 0;
+	if (ok_all) {
+		int subfd = openat(rootfd, "sub", O_RDONLY | O_DIRECTORY);
+		if (subfd >= 0) {
+			errno = 0;
+			int rfd = openat(subfd, "../pkgfile", O_RDONLY);
+			char buf[64] = {0};
+			if (rfd >= 0) {
+				ssize_t n = read(rfd, buf, sizeof(buf) - 1);
+				close(rfd);
+				hit = n == (ssize_t)strlen(payload) && strcmp(buf, payload) == 0;
+			}
+			close(subfd);
+		}
+
+		/* Pre-fix (wrong) resolution: target resolved directly against
+		 * newdirfd ("root"), not dirname(linkpath) ("root/sub"). ".."
+		 * from root is root's OWN parent, not root itself — "pkgfile"
+		 * there is whatever unrelated/absent file happens to live one
+		 * level up, never this fixture's payload. Must NOT match. */
+		errno = 0;
+		int bad = openat(rootfd, "../pkgfile", O_RDONLY);
+		char buf[64] = {0};
+		int bad_matches = 0;
+		if (bad >= 0) {
+			ssize_t n = read(bad, buf, sizeof(buf) - 1);
+			close(bad);
+			bad_matches = n == (ssize_t)strlen(payload) && strcmp(buf, payload) == 0;
+		}
+		miss_confirmed = !bad_matches;
+	}
+
+	if (rootfd >= 0)
+		close(rootfd);
+
+	check(ok_all && hit && miss_confirmed, "symlinkat_dircomp",
+	      "dirname(linkpath) resolution hits; newdirfd-direct (pre-fix) resolution misses");
+
+	unlink(target_file);
+	rmdir(sub);
+	rmdir(root);
+}
+
 static void test_symlink_two_arg_bun_fake_node(void)
 {
 	/* bun's `--bun` mode creates fake node executables via the 2-arg symlink()
@@ -1704,6 +1957,8 @@ int main(void)
 	test_close_range_einval_bad_flags();
 	test_close_range_wide_sparse_range();
 	test_close_range_unshare();
+	test_sigsys_guard_concurrent_stress();
+	test_fork_safety_no_deadlock();
 	test_close_range_repeated();
 	test_close_range_libc_wrapper();
 
@@ -1728,6 +1983,7 @@ int main(void)
 	test_linkat_bun_dirfd_source();
 	test_symlinkat_success_is_noop();
 	test_symlinkat_relative_target_resolution();
+	test_symlinkat_dir_component_target_resolution();
 	test_symlink_two_arg_bun_fake_node();
 
 	test_fchmodat2_applies_mode();
