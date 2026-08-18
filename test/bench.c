@@ -36,6 +36,7 @@
 #include <pwd.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <poll.h>
@@ -356,6 +357,68 @@ static void bench_epoll_ctl_churn(void)
 	close(pfd[1]);
 }
 
+/* NOTE on the epoll_pipe adaptive backoff (2a): deliberately NOT
+ * benchmarked here by calling epoll_wait(-1) directly. A pipe registered
+ * but never fed data means every slice is empty, so ep_shim_wait's
+ * infinite-wait loop (by design -- an infinite wait must only ever return
+ * with a real event or a signal, never a premature 0, see the 8daab67
+ * SIGABRT history above ep_shim_wait) never returns at all: there is no
+ * bounded way to observe "N calls completing" from outside. A FINITE
+ * outer timeout does return, but its own deadline caps total elapsed time
+ * regardless of how the interval grew internally, which masks growth
+ * rather than revealing it -- any wall-clock measurement attempted here
+ * either hangs or measures the wrong thing. Backoff growth is instead
+ * verified functionally (test/functional.c's bounded-deadline regression
+ * test) and by code inspection (the comment block above g_ep_backoff's
+ * declaration in src/ohos_compat_shim.c).
+ */
+
+/* poll(fds, n, -1) with NO fifo fd present -- the case Phase 2b's fix
+ * specifically targets paying nothing extra for: has_fifo is computed
+ * once (a cache-only scan) and, finding nothing, skips the post-call
+ * ioctl scan entirely rather than the old always-scan-after-return
+ * behavior. fds[0] is pre-signaled so every iteration returns immediately
+ * instead of actually blocking -- this measures shim call overhead, not
+ * real wait time. */
+static void bench_poll_infinite_no_fifo(int n)
+{
+	char name[40];
+	snprintf(name, sizeof(name), "poll_infinite_no_fifo_n%d", n);
+
+	int *fds = calloc((size_t)n, sizeof(int));
+	struct pollfd *pfds = calloc((size_t)n, sizeof(struct pollfd));
+	if (!fds || !pfds) {
+		printf("%-26s calloc failed\n", name);
+		free(fds);
+		free(pfds);
+		return;
+	}
+	for (int i = 0; i < n; i++) {
+		fds[i] = eventfd(0, EFD_NONBLOCK);
+		pfds[i].fd = fds[i];
+		pfds[i].events = POLLIN;
+	}
+	uint64_t one = 1;
+	if (write(fds[0], &one, sizeof(one)) < 0) {
+		printf("%-26s eventfd write failed\n", name);
+	}
+
+	long iters = 5000;
+	double t0 = now_ms();
+	for (long i = 0; i < iters; i++) {
+		for (int j = 0; j < n; j++)
+			pfds[j].revents = 0;
+		poll(pfds, (nfds_t)n, -1); /* infinite, but fds[0] is always ready */
+	}
+	report(name, iters, now_ms() - t0);
+
+	for (int i = 0; i < n; i++)
+		if (fds[i] >= 0)
+			close(fds[i]);
+	free(fds);
+	free(pfds);
+}
+
 int main(void)
 {
 	bench_syscall_passthrough();
@@ -374,5 +437,7 @@ int main(void)
 	bench_poll_patch_pipe_fds(128);
 	bench_epoll_wait_no_pipe();
 	bench_epoll_ctl_churn();
+	bench_poll_infinite_no_fifo(1);
+	bench_poll_infinite_no_fifo(128);
 	return 0;
 }

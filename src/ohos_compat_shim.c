@@ -1763,6 +1763,131 @@ static int ep_reg_any_locked(int epfd)
 	return 0;
 }
 
+/* ==================================================================== */
+/*  Adaptive polling-interval backoff (2026-08-19 polyfill-discipline    */
+/*  pass)                                                                */
+/*                                                                        */
+/*  This repair only matters while the underlying kernel defect is       */
+/*  actually misfiring; the fixed 250ms clamp above paid that interval's */
+/*  wakeup cost on every epfd with a registered pipe, forever, whether   */
+/*  or not the defect had fired even once. Feature-probe-once-at-startup */
+/*  doesn't fit here (the defect is load-dependent -- clean at idle,     */
+/*  live under pressure -- so a boot-time probe passing proves nothing   */
+/*  about ten minutes from now); backoff instead lets the cost track     */
+/*  observed risk from moment to moment, in both directions, for the     */
+/*  lifetime of the epfd:                                                */
+/*                                                                        */
+/*    - starts at the same EP_PIPE_POLL_MS this shim has always used     */
+/*      (an OS that has never shown the defect pays the same fast        */
+/*      interval as before, until it's proven quiet for a while);        */
+/*    - doubles (capped at EP_PIPE_MAX_POLL_MS_DEFAULT, overridable via  */
+/*      OHOS_COMPAT_SHIM_EPOLL_PIPE_MAX_MS) after EP_BACKOFF_STREAK       */
+/*      consecutive empty slices -- "empty" meaning the real wait AND    */
+/*      the FIONREAD synthesis both found nothing, i.e. this slice was   */
+/*      pure unrewarded overhead;                                        */
+/*    - resets to EP_PIPE_POLL_MS the instant a slice DOES synthesize an */
+/*      event -- the defect just fired in THIS process, right now, so    */
+/*      go back to checking fast; a slice ending because a genuine       */
+/*      kernel event arrived (unrelated to any tracked pipe) is neither  */
+/*      "empty" nor "the defect fired" and leaves the interval alone.    */
+/*                                                                        */
+/*  Slice length only affects LATENCY when the defect is actually live   */
+/*  (a correctly-behaved kernel wakes epoll_wait on its own, independent */
+/*  of the slice); worst case, a long-idle epfd whose defect starts      */
+/*  firing again is noticed up to one stale interval late (<=1s at the   */
+/*  default cap) instead of instantly -- a bounded, one-time cost paid   */
+/*  only in the scenario this whole interceptor exists for, not on every */
+/*  idle wakeup the way the fixed clamp was. This does NOT change        */
+/*  whether epoll_pipe is active for a given epfd (that's still the      */
+/*  registry above) or ever "decide the OS is fixed" -- it only paces    */
+/*  how often an active repair re-checks itself, per [[project_ohos_     */
+/*  compat_shim_default_scope]]'s "no compiled-in default may change     */
+/*  from on-device inference" rule: this is a runtime cost knob, not a   */
+/*  correctness/coverage decision.                                       */
+/* ==================================================================== */
+
+#define EP_BACKOFF_MAX 32
+#define EP_PIPE_MAX_POLL_MS_DEFAULT 1000
+#define EP_BACKOFF_STREAK 8
+
+typedef struct {
+	int used;
+	int epfd;
+	int interval_ms;
+	int empty_streak;
+} ep_backoff_t;
+
+static ep_backoff_t g_ep_backoff[EP_BACKOFF_MAX];
+static int g_ep_pipe_max_poll_ms = -1;
+
+/* Parsed once, idempotent even if two threads race into this before it's
+ * set (same env, same result) -- same pattern as parse_toggle_masks(). */
+static int ep_pipe_max_poll_ms(void)
+{
+	if (g_ep_pipe_max_poll_ms < 0) {
+		const char *s = getenv("OHOS_COMPAT_SHIM_EPOLL_PIPE_MAX_MS");
+		long v = s ? strtol(s, NULL, 10) : 0;
+		g_ep_pipe_max_poll_ms = (v > 0) ? (int)v : EP_PIPE_MAX_POLL_MS_DEFAULT;
+	}
+	return g_ep_pipe_max_poll_ms;
+}
+
+/* Must be called with g_ep_pipes_lock held. Returns the current slice
+ * interval for `epfd`, creating a fresh EP_PIPE_POLL_MS-start entry on
+ * first sight. A full table (EP_BACKOFF_MAX concurrent epfds with
+ * registered pipes -- far beyond any observed consumer) just means no
+ * backoff tracking for the overflow: always the safe, fast interval, same
+ * as before this feature existed. */
+static int ep_backoff_get_locked(int epfd)
+{
+	int i, free_slot = -1;
+	for (i = 0; i < EP_BACKOFF_MAX; i++) {
+		if (!g_ep_backoff[i].used) {
+			if (free_slot < 0)
+				free_slot = i;
+			continue;
+		}
+		if (g_ep_backoff[i].epfd == epfd)
+			return g_ep_backoff[i].interval_ms;
+	}
+	if (free_slot < 0)
+		return EP_PIPE_POLL_MS;
+	g_ep_backoff[free_slot].used = 1;
+	g_ep_backoff[free_slot].epfd = epfd;
+	g_ep_backoff[free_slot].interval_ms = EP_PIPE_POLL_MS;
+	g_ep_backoff[free_slot].empty_streak = 0;
+	return EP_PIPE_POLL_MS;
+}
+
+/* Must be called with g_ep_pipes_lock held. See the comment block above
+ * for the reset/double-on-streak policy. */
+static void ep_backoff_update_locked(int epfd, int had_synthesized_event)
+{
+	int i;
+	for (i = 0; i < EP_BACKOFF_MAX; i++) {
+		if (!g_ep_backoff[i].used || g_ep_backoff[i].epfd != epfd)
+			continue;
+		if (had_synthesized_event) {
+			g_ep_backoff[i].interval_ms = EP_PIPE_POLL_MS;
+			g_ep_backoff[i].empty_streak = 0;
+		} else if (++g_ep_backoff[i].empty_streak >= EP_BACKOFF_STREAK) {
+			int cap = ep_pipe_max_poll_ms();
+			int next = g_ep_backoff[i].interval_ms * 2;
+			g_ep_backoff[i].interval_ms = next > cap ? cap : next;
+			g_ep_backoff[i].empty_streak = 0;
+		}
+		return;
+	}
+}
+
+static void ep_backoff_forget_locked(int epfd)
+{
+	int i;
+	for (i = 0; i < EP_BACKOFF_MAX; i++)
+		if (g_ep_backoff[i].used && g_ep_backoff[i].epfd == epfd)
+			g_ep_backoff[i].used = 0;
+}
+
 /* Registry bookkeeping after a real epoll_ctl(), shared by the libc
  * symbol override and the syscall(SYS_epoll_ctl) dispatcher. */
 static int ep_shim_ctl_done(int rc, int epfd, int op, int fd,
@@ -1799,27 +1924,39 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 	return ep_shim_ctl_done(real(epfd, op, fd, event), epfd, op, fd, event);
 }
 
-/* Clamp long waits to the poll interval when this epfd has pipes under
- * repair; short and zero (nonblocking) timeouts pass through. */
+/* Clamp long waits to the current backoff interval when this epfd has
+ * pipes under repair; short and zero (nonblocking) timeouts pass through
+ * without the lock (the interval is never below EP_PIPE_POLL_MS, so a
+ * timeout already that short can't be affected either way). */
 static int ep_shim_clamp_timeout(int epfd, int timeout)
 {
-	int any;
+	int any, interval;
 	if (timeout == 0 || !ep_pipe_active())
 		return timeout;
 	if (timeout > 0 && timeout <= EP_PIPE_POLL_MS)
 		return timeout;
 	pthread_mutex_lock(&g_ep_pipes_lock);
 	any = ep_reg_any_locked(epfd);
+	interval = any ? ep_backoff_get_locked(epfd) : 0;
 	pthread_mutex_unlock(&g_ep_pipes_lock);
-	return any ? EP_PIPE_POLL_MS : timeout;
+	if (!any)
+		return timeout;
+	return (timeout > 0 && timeout <= interval) ? timeout : interval;
 }
 
 /* After an empty real wait, synthesize EPOLLIN for registered pipes with
- * bytes pending (plus the one-shot drained/EOF wakeup described above). */
-static int ep_shim_after_wait(int rc, int epfd, struct epoll_event *events,
-			      int maxevents)
+ * bytes pending (plus the one-shot drained/EOF wakeup described above).
+ * *out_synthesized reports whether this call actually produced one, for
+ * the backoff bookkeeping in ep_shim_wait's slice loop below -- a slice
+ * that returns >0 because a genuine unrelated kernel event fired is not
+ * evidence the pipe defect just misfired, so it must be told apart from
+ * one that returns >0 because FIONREAD caught pending bytes epoll_wait
+ * itself missed. */
+static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
+				 int maxevents, int *out_synthesized)
 {
 	int i, n = 0;
+	*out_synthesized = 0;
 	if (rc != 0 || maxevents <= 0 || !ep_pipe_active())
 		return rc;
 	pthread_mutex_lock(&g_ep_pipes_lock);
@@ -1848,7 +1985,16 @@ static int ep_shim_after_wait(int rc, int epfd, struct epoll_event *events,
 		n++;
 	}
 	pthread_mutex_unlock(&g_ep_pipes_lock);
+	if (n > 0)
+		*out_synthesized = 1;
 	return n;
+}
+
+static int ep_shim_after_wait(int rc, int epfd, struct epoll_event *events,
+			      int maxevents)
+{
+	int synthesized;
+	return ep_shim_after_wait_ex(rc, epfd, events, maxevents, &synthesized);
 }
 
 typedef int (*epoll_pwait_fn)(int, struct epoll_event *, int, int,
@@ -1883,17 +2029,36 @@ static int ep_shim_wait(int epfd, struct epoll_event *events, int maxevents,
 		deadline = ep_now_ms() + timeout;
 
 	for (;;) {
-		int rc = ep_shim_after_wait(real(epfd, events, maxevents,
-						 slice, sigmask),
-					    epfd, events, maxevents);
-		if (rc != 0)
+		int synthesized = 0;
+		int rc = ep_shim_after_wait_ex(real(epfd, events, maxevents,
+						    slice, sigmask),
+					       epfd, events, maxevents, &synthesized);
+		if (rc != 0) {
+			/* Only a synthesized event is evidence the defect
+			 * just fired -- a genuine unrelated kernel event
+			 * (synthesized==0 but rc>0) leaves the backoff state
+			 * untouched, same as returning here always did. */
+			if (synthesized) {
+				pthread_mutex_lock(&g_ep_pipes_lock);
+				ep_backoff_update_locked(epfd, 1);
+				pthread_mutex_unlock(&g_ep_pipes_lock);
+			}
 			return rc; /* real events, synthesized events, or -1/errno */
+		}
+
+		int next_interval;
+		pthread_mutex_lock(&g_ep_pipes_lock);
+		ep_backoff_update_locked(epfd, 0);
+		next_interval = ep_backoff_get_locked(epfd);
+		pthread_mutex_unlock(&g_ep_pipes_lock);
+
 		if (timeout > 0) {
 			long long left = deadline - ep_now_ms();
 			if (left <= 0)
 				return 0; /* caller's own timeout really expired */
-			if (left < slice)
-				slice = (int)left;
+			slice = (left < next_interval) ? (int)left : next_interval;
+		} else {
+			slice = next_interval;
 		}
 	}
 }
@@ -1927,13 +2092,17 @@ int epoll_pwait(int epfd, struct epoll_event *events, int maxevents,
 	return ep_shim_wait(epfd, events, maxevents, timeout, real, sigmask);
 }
 
-/* poll/ppoll: the real call already blocked for the full timeout, so all
- * that is left is correcting the lie -- FIFO fds that asked for POLLIN,
- * reported nothing, yet have bytes pending. No timeout clamping here. */
-static int ep_shim_patch_pollfds(struct pollfd *fds, nfds_t nfds, int rc)
+/* poll/ppoll: the real call already blocked for the full timeout, so most
+ * of what is left is correcting the lie -- FIFO fds that asked for POLLIN,
+ * reported nothing, yet have bytes pending. `scan` gates whether this call
+ * actually does that work at all -- see poll()/ppoll() below for when it's
+ * 0 (skip entirely) vs 1 (always) vs sampled. No timeout clamping here for
+ * the ordinary (non-infinite) shapes; the infinite-wait shape is handled
+ * separately by poll()/ppoll() themselves, below. */
+static int ep_shim_patch_pollfds(struct pollfd *fds, nfds_t nfds, int rc, int scan)
 {
 	nfds_t i;
-	if (rc < 0 || !ep_pipe_active())
+	if (rc < 0 || !ep_pipe_active() || !scan)
 		return rc;
 	for (i = 0; i < nfds; i++) {
 		int avail = 0;
@@ -1950,6 +2119,53 @@ static int ep_shim_patch_pollfds(struct pollfd *fds, nfds_t nfds, int rc)
 	return rc;
 }
 
+/* Global (not per-fd-set -- unlike epoll_pipe's registry, a poll()/ppoll()
+ * call has no persistent handle to key per-caller state on) sample counter
+ * for TIMEOUT==0 (busy-poll) callers. A busy-poll loop already re-checks
+ * within microseconds on its own next iteration, so a missed FIONREAD catch
+ * here self-corrects almost immediately and is not a hang risk the way an
+ * infinite wait is (handled separately below, and always scanned). This is
+ * what cut the measured N=128-idle-fd cost from +115.7us/call to
+ * +3.7us/call in the 2026-08-18 validation pass's own fifo-ness cache fix;
+ * sampling trims the remaining scan-loop overhead the cache alone doesn't
+ * touch (the loop still runs the cache lookup itself every call -- this
+ * skips the ioctl(FIONREAD) beyond it, on non-sampled calls). */
+#define POLL_SAMPLE_DEFAULT 64
+static int g_poll_sample_n = -1;
+static _Atomic unsigned g_poll_sample_ctr;
+
+static int poll_sample_n(void)
+{
+	if (g_poll_sample_n < 0) {
+		const char *s = getenv("OHOS_COMPAT_SHIM_POLL_SAMPLE");
+		long v = s ? strtol(s, NULL, 10) : 0;
+		g_poll_sample_n = (v > 0) ? (int)v : POLL_SAMPLE_DEFAULT;
+	}
+	return g_poll_sample_n;
+}
+
+static int poll_sample_due(void)
+{
+	unsigned n = (unsigned)poll_sample_n();
+	unsigned c = atomic_fetch_add_explicit(&g_poll_sample_ctr, 1, memory_order_relaxed);
+	return (c % n) == 0;
+}
+
+/* True iff any fd in the set is both a candidate for the repair (asks for
+ * POLLIN) and already known-or-newly-confirmed to be a FIFO -- the cheap,
+ * cached check, same one the scan loop itself uses. Gates whether an
+ * infinite wait gets sliced at all: the overwhelming majority of poll()
+ * callers have no pipes whatsoever and must pay nothing extra. */
+static int poll_set_has_candidate_fifo(struct pollfd *fds, nfds_t nfds)
+{
+	nfds_t i;
+	for (i = 0; i < nfds; i++)
+		if (fds[i].fd >= 0 && (fds[i].events & POLLIN) &&
+		    splice_fd_is_fifo_cached(fds[i].fd))
+			return 1;
+	return 0;
+}
+
 typedef int (*poll_fn)(struct pollfd *, nfds_t, int);
 typedef int (*ppoll_fn)(struct pollfd *, nfds_t, const struct timespec *,
 			const sigset_t *);
@@ -1963,7 +2179,47 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout)
 		errno = ENOSYS;
 		return -1;
 	}
-	return ep_shim_patch_pollfds(fds, nfds, real(fds, nfds, timeout));
+
+	/* Infinite wait (timeout < 0) is the one shape ep_shim_patch_pollfds
+	 * could never actually protect before this fix: it only runs AFTER
+	 * the real call returns, but poll(fds, n, -1) had already blocked
+	 * forever by then if the kernel's pipe-readiness bug ate the wakeup
+	 * -- paying the O(N) scan tax on every RETURNING call while the one
+	 * shape most exposed to actually hanging went completely unpatched.
+	 * Sliced at the plain EP_PIPE_POLL_MS interval (not the adaptive
+	 * backoff table from the epoll_pipe section above -- that's keyed by
+	 * epfd, a persistent kernel handle; a poll() call has no analogous
+	 * stable identity across invocations to key backoff state on, so
+	 * this reuses 2a's starting interval value without its growth).
+	 * has_fifo is computed once (a cache-only scan, no ioctl) and reused
+	 * below for the should_scan decision too -- an infinite wait with NO
+	 * candidate fifo has nothing ep_shim_patch_pollfds could ever find,
+	 * so skipping its post-call scan entirely is strictly less work than
+	 * the old always-scan-after-return behavior, not just "no worse". */
+	int has_fifo = (timeout < 0 && ep_pipe_active())
+			       ? poll_set_has_candidate_fifo(fds, nfds)
+			       : 0;
+
+	if (timeout < 0 && has_fifo) {
+		for (;;) {
+			int rc = ep_shim_patch_pollfds(fds, nfds,
+						       real(fds, nfds, EP_PIPE_POLL_MS), 1);
+			if (rc != 0)
+				return rc; /* real events, synthesized events, or -1/errno */
+		}
+	}
+
+	int should_scan;
+	if (!ep_pipe_active())
+		should_scan = 0;
+	else if (timeout == 0)
+		should_scan = poll_sample_due();
+	else if (timeout < 0)
+		should_scan = has_fifo; /* infinite, no candidate: nothing to find, skip */
+	else
+		should_scan = 1; /* finite nonzero (blocking): scan every time */
+
+	return ep_shim_patch_pollfds(fds, nfds, real(fds, nfds, timeout), should_scan);
 }
 
 int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
@@ -1976,8 +2232,39 @@ int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
 		errno = ENOSYS;
 		return -1;
 	}
+
+	/* NULL timeout is ppoll()'s infinite-wait spelling -- same fix, same
+	 * has_fifo-computed-once-and-reused reasoning, as poll() above. */
+	int has_fifo = (timeout == NULL && ep_pipe_active())
+			       ? poll_set_has_candidate_fifo(fds, nfds)
+			       : 0;
+
+	if (!timeout && has_fifo) {
+		struct timespec slice_ts = {
+			.tv_sec = EP_PIPE_POLL_MS / 1000,
+			.tv_nsec = (long)(EP_PIPE_POLL_MS % 1000) * 1000000L,
+		};
+		for (;;) {
+			int rc = ep_shim_patch_pollfds(fds, nfds,
+						       real(fds, nfds, &slice_ts, sigmask), 1);
+			if (rc != 0)
+				return rc;
+		}
+	}
+
+	int is_zero_timeout = timeout && timeout->tv_sec == 0 && timeout->tv_nsec == 0;
+	int should_scan;
+	if (!ep_pipe_active())
+		should_scan = 0;
+	else if (is_zero_timeout)
+		should_scan = poll_sample_due();
+	else if (!timeout)
+		should_scan = has_fifo; /* infinite, no candidate: nothing to find, skip */
+	else
+		should_scan = 1; /* finite nonzero: scan every time */
+
 	return ep_shim_patch_pollfds(fds, nfds,
-				     real(fds, nfds, timeout, sigmask));
+				     real(fds, nfds, timeout, sigmask), should_scan);
 }
 
 /*
@@ -2006,6 +2293,11 @@ static void shim_forget_fd(int fd)
 	if (ep_pipe_active()) {
 		pthread_mutex_lock(&g_ep_pipes_lock);
 		ep_reg_forget_fd_locked(fd);
+		/* fd might have been an epfd, not just a tracked pipe --
+		 * drop its backoff state too so a reused fd number starts
+		 * fresh at EP_PIPE_POLL_MS rather than inheriting whatever
+		 * interval the previous epfd had backed off to. */
+		ep_backoff_forget_locked(fd);
 		pthread_mutex_unlock(&g_ep_pipes_lock);
 	}
 	fifo_cache_forget_fd(fd);
