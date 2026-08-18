@@ -39,6 +39,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -373,6 +374,83 @@ static void bench_epoll_ctl_churn(void)
  * declaration in src/ohos_compat_shim.c).
  */
 
+/* Replaces the README's historical prose throughput number ("100MB through
+ * two-hop pipes: 101ms -> 129ms, 28% slower") with a reproducible bench
+ * entry. splice() to a FIFO destination with off_out==NULL is the one
+ * interceptor in this shim that's unconditionally replaced rather than
+ * probe-then-fallback (see splice()'s own comment: it never even attempts
+ * the real syscall on that path) -- so under LD_PRELOAD, every one of
+ * these chunks goes through splice_through_buffer's userspace bounce
+ * (read()+write() instead of zero-copy), which is exactly the cost this
+ * measures. 16KB chunks (comfortably under any plausible default pipe
+ * capacity, avoiding capacity-dependent partial-write/blocking edge cases
+ * from a value nearer 64KB) x 20MB total, single-threaded splice-then-
+ * drain each iteration so neither pipe's buffer can back up across
+ * iterations. */
+static void bench_splice_pipe_to_pipe(void)
+{
+	const char *name = "splice_pipe_to_pipe_20mb";
+	int p1[2], p2[2];
+	if (pipe(p1) != 0 || pipe(p2) != 0) {
+		printf("%-26s pipe() failed\n", name);
+		return;
+	}
+
+	const size_t chunk = 16384;
+	const size_t total = 20 * 1024 * 1024;
+	char *src = malloc(chunk);
+	char *drain = malloc(chunk);
+	if (!src || !drain) {
+		printf("%-26s malloc failed\n", name);
+		free(src);
+		free(drain);
+		close(p1[0]); close(p1[1]); close(p2[0]); close(p2[1]);
+		return;
+	}
+	memset(src, 'x', chunk);
+
+	double t0 = now_ms();
+	size_t remaining = total;
+	int broke = 0;
+	while (remaining > 0 && !broke) {
+		size_t want = remaining < chunk ? remaining : chunk;
+		if (write(p1[1], src, want) != (ssize_t)want) {
+			broke = 1;
+			break;
+		}
+		size_t spliced = 0;
+		while (spliced < want) {
+			ssize_t m = splice(p1[0], NULL, p2[1], NULL, want - spliced, SPLICE_F_MOVE);
+			if (m <= 0) {
+				broke = 1;
+				break;
+			}
+			spliced += (size_t)m;
+		}
+		size_t drained = 0;
+		while (drained < spliced) {
+			ssize_t r = read(p2[0], drain, chunk);
+			if (r <= 0) {
+				broke = 1;
+				break;
+			}
+			drained += (size_t)r;
+		}
+		remaining -= want;
+	}
+	double elapsed = now_ms() - t0;
+	if (broke) {
+		printf("%-26s aborted early (errno=%d %s)\n", name, errno, strerror(errno));
+	} else {
+		double mbps = elapsed > 0 ? ((double)total / 1024.0 / 1024.0) / (elapsed / 1000.0) : 0;
+		printf("%-26s %zu bytes in %.1fms (%.1f MB/s)\n", name, total, elapsed, mbps);
+	}
+
+	free(src);
+	free(drain);
+	close(p1[0]); close(p1[1]); close(p2[0]); close(p2[1]);
+}
+
 /* poll(fds, n, -1) with NO fifo fd present -- the case Phase 2b's fix
  * specifically targets paying nothing extra for: has_fifo is computed
  * once (a cache-only scan) and, finding nothing, skips the post-call
@@ -439,5 +517,6 @@ int main(void)
 	bench_epoll_ctl_churn();
 	bench_poll_infinite_no_fifo(1);
 	bench_poll_infinite_no_fifo(128);
+	bench_splice_pipe_to_pipe();
 	return 0;
 }

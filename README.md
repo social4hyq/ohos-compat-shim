@@ -23,10 +23,16 @@
 
 ## 前向兼容：优先自动尝试真实系统调用
 
-每个拦截点都会先通过 `dlsym(RTLD_NEXT, ...)` 解析出真实实现并尝试调用它，而不是先走 fallback 逻辑 —— 这不是一次性的系统版本判断，而是每个新进程都会重新做的实时探测（对 `close_range` 之外的符号来说，甚至是每一次调用都重新判断）。具体来说：
+**大多数**拦截点都会先通过 `dlsym(RTLD_NEXT, ...)` 解析出真实实现并尝试调用它，而不是先走 fallback 逻辑 —— 这不是一次性的系统版本判断，而是每个新进程都会重新做的实时探测（对 `close_range` 之外的符号来说，甚至是每一次调用都重新判断）。具体来说：
 
 - `close_range`：`cr_probe_syscall()` 每个进程只跑一次；如果真实系统调用成功，该进程就会缓存 `WORKS` 状态，之后再也不会碰用户态 fallback。
 - `getpwuid_r` / `tmpfile` / `getcwd` / `linkat` / `symlinkat` / `link`：**每次**调用都会先调用真实函数；shim 自己的逻辑只在真实调用失败、且失败特征与上表记录的 HarmonyOS 沙箱症状完全吻合时才会介入。
+- `getaddrinfo`：也是每次都先用真实结果，只在结果形状命中 `AI_ADDRCONFIG` 误判症状（见下表）时才改写。
+
+**但有两簇是例外，从不尝试真实路径**，因为这两个症状是负载相关的间歇性缺陷——空闲时探测大概率"通过"，压力上来时照样发作，一次性探测/尝试对这种缺陷不健全（同一原则也约束着[前向兼容](#前向兼容优先自动尝试真实系统调用)一节末尾"何时收口"的判断标准：单台设备/单次探测的"未复现"，永远只能产出该部署自行设置 `OHOS_COMPAT_SHIM_DISABLE` 的建议，不能作为改这里默认行为的依据）：
+
+- `splice()` 写入管道：目标是 FIFO 且 `off_out == NULL` 时直接走用户态 bounce buffer，从不调用真实 `splice()` —— 见[性能](#性能)一节 `splice_pipe_to_pipe_20mb` 基准，量化了放弃零拷贝的代价。
+- `epoll_pipe` 拦截簇（`poll`/`ppoll`/`epoll_ctl`/`epoll_wait`/`epoll_pwait`）：只要开关未被 `OHOS_COMPAT_SHIM_DISABLE=epoll_pipe` 关闭就常驻生效；`poll`/`ppoll` 每次返回后修正、`epoll_wait`/`epoll_pwait` 内部按自适应间隔切片轮询（2026-08-19 起：起始 250ms，连续空转 8 次后倍增、封顶 1000ms，一旦真合成出事件立即打回 250ms——细节见 `ep_backoff_*` 系列函数上方的注释块）。
 
 `getpwuid_r` 的 fallback 用户名来源：优先调用 `OH_OsAccount_GetName()`（`libos_account_ndk.so`，运行时 dlopen、句柄缓存，编译期零 SDK 依赖）取当前系统账号名——但只在查询的 uid 等于进程自身 uid 时（账号 API 没有 uid 参数）；失败或非自身 uid 时回落 `$LOGNAME`/`$USER`，最后退化为 `u<uid>` 占位符。其余字段（`pw_dir`/`pw_shell`/`pw_uid`/`pw_gid`）逻辑不变，账号 API 无法提供。
 
@@ -94,7 +100,7 @@
 
 任何"消费端用轮询"的管道都会因此永久死锁。GNU `cat` 在 stdout 是管道时用 `splice()` 供数，于是 `cat big | bun script.js` 永远挂着：bun 阻塞在 `epoll_wait`，cat 填满 512KB 管道后也阻塞在 `splice()`。`cat big | wc -c` 没事（wc 阻塞在 `read`），`dd ... | bun script.js` 也没事（dd 用 `write`）。
 
-**修法**：目标是管道时，把字节经用户态缓冲区搬过去，让管道由 `write()` 供数 —— 它的唤醒是好的。代价是多一次内存拷贝、这条路径上不再零拷贝。实测 100MB 过两级管道从 101ms 变成 129ms（**慢 28%**）。对一个以正确性为职责的 shim 来说这个交换是划算的，但收口时应当第一时间删掉。
+**修法**：目标是管道时，把字节经用户态缓冲区搬过去，让管道由 `write()` 供数 —— 它的唤醒是好的。代价是多一次内存拷贝、这条路径上不再零拷贝。可复跑基准见 `make bench` 的 `splice_pipe_to_pipe_20mb`（20MB、16KB 分块，逐块 splice 后立即排空对端管道，避免任一侧缓冲区跨块堆积）——本机最近一次实测：基线（真实零拷贝 `splice`）~2069 MB/s，shimmed（bounce buffer）~1957 MB/s，**慢约 5%**。对一个以正确性为职责的 shim 来说这个交换是划算的，但收口时应当第一时间删掉。
 
 曾经考虑过保住零拷贝的方案：**只扣下最后 1 个字节用 `write()` 送**，靠它产生唤醒。探针确认这个办法确实能唤醒 poll，但它**在真实场景里不成立**：cat 要往 512KB 的管道里搬 524288 字节，`splice()` 填满管道就短返回，那个收尾的 `write()` 根本走不到。一个"恰好在管道满时失效"的唤醒方案没有意义 —— 管道满正是读者一定在等的时刻。
 
