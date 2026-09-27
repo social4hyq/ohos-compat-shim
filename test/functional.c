@@ -2125,6 +2125,53 @@ static void test_poll_infinite_wait_with_fifo_still_works(void)
 	      "poll_infinite_fifo_still_works", detail);
 }
 
+static void test_epoll_oneshot_tty_write_end(void)
+{
+	/* 2026-09-27 second defect variant, same family as the FIFO one:
+	 * this kernel ignores EPOLLONESHOT auto-disarm for tty/pty
+	 * write-end registrations too (an interactive claude-code musl
+	 * session spun its event loop at 129% CPU idle; 7.0M re-fired
+	 * EPOLLOUT events over ~10s, 99.98% of everything epoll returned).
+	 * Contract under test: exactly ONE delivery per arm -- the wait
+	 * after the first delivery must time out (rc=0), not see the same
+	 * entry again, until an ADD/MOD re-arms it. With the shim this is
+	 * enforced in userspace (strip + kernel-side disarm of re-fires);
+	 * on a compliant kernel the kernel itself disarms after the first
+	 * delivery, so the check passes there natively too. Only the
+	 * unsuppressed defect fails it -- which is exactly what the
+	 * no-shim baseline run on this device shows. */
+	int m = posix_openpt(O_RDWR | O_NOCTTY);
+	if (m < 0 || grantpt(m) != 0 || unlockpt(m) != 0) {
+		check(0, "epoll_oneshot_tty", "posix_openpt failed");
+		if (m >= 0)
+			close(m);
+		return;
+	}
+	int epfd = epoll_create1(0);
+	struct epoll_event ev = {
+		.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLONESHOT,
+		.data.fd = m,
+	};
+	if (epfd < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, m, &ev) != 0) {
+		check(0, "epoll_oneshot_tty", "epoll setup failed");
+		close(m);
+		if (epfd >= 0)
+			close(epfd);
+		return;
+	}
+	struct epoll_event out, out2;
+	int first = epoll_wait(epfd, &out, 1, 300);
+	int refire = first == 1 ? epoll_wait(epfd, &out2, 1, 300) : -99;
+	close(m);
+	close(epfd);
+
+	char detail2[160];
+	snprintf(detail2, sizeof(detail2),
+		 "first=%d refire=%d (want first=1, refire=0 -- exactly one delivery per arm)",
+		 first, refire);
+	check(first == 1 && refire == 0, "epoll_oneshot_tty", detail2);
+}
+
 int main(void)
 {
 	/* linkat/symlinkat have been default-on since commit 3cb9f08 (which
@@ -2184,6 +2231,7 @@ int main(void)
 	test_epoll_wait_backoff_deadline_honored();
 	test_epoll_pipe_backoff_resets_on_event();
 	test_poll_infinite_wait_with_fifo_still_works();
+	test_epoll_oneshot_tty_write_end();
 
 	printf("%s (%d/%d checks failed)\n", failures == 0 ? "ALL PASS" : "SOME FAILED",
 	       failures, checks);

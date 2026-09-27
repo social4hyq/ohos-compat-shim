@@ -78,6 +78,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1491,6 +1492,49 @@ static void fifo_cache_forget_fd(int fd)
 }
 
 /*
+ * ONESHOT-enforcement eligibility beyond FIFOs: PTY/tty write ends. The same
+ * kernel defect family ignores EPOLLONESHOT auto-disarm there too -- measured
+ * 2026-09-27 on an interactive claude-code (musl) session: stdout/stderr are
+ * /dev/pts entries (S_ISCHR, invisible to S_ISFIFO), registered 0x4000001c, and the
+ * loop spun at ~240k immediate epoll_pwait returns/s, 99.98% pure EPOLLOUT
+ * (7.0M OUT vs 1.3K IN over ~10s; main thread 129% CPU + scavenger 56%).
+ * Detection is TCGETS (exactly isatty(3)'s own probe): PTY master and slave
+ * both answer it; /dev/null, /dev/urandom, eventfd/signalfd/timerfd
+ * (anon_inode) and sockets all fail it, so none become eligible.
+ */
+static int splice_fd_is_tty(int fd)
+{
+	struct termios tio;
+	return ioctl(fd, TCGETS, &tio) == 0;
+}
+
+static _Atomic uint32_t g_tty_cache[FIFO_CACHE_SIZE];
+
+static int splice_fd_is_tty_cached(int fd)
+{
+	if (fd < 0)
+		return 0;
+	unsigned idx = (unsigned)fd % FIFO_CACHE_SIZE;
+	uint32_t slot = atomic_load_explicit(&g_tty_cache[idx], memory_order_relaxed);
+	if (slot != 0 && (int)(slot >> 1) - 1 == fd)
+		return (int)(slot & 1);
+	int is_tty = splice_fd_is_tty(fd);
+	uint32_t encoded = (((uint32_t)fd + 1) << 1) | (is_tty ? 1u : 0u);
+	atomic_store_explicit(&g_tty_cache[idx], encoded, memory_order_relaxed);
+	return is_tty;
+}
+
+static void tty_cache_forget_fd(int fd)
+{
+	if (fd < 0)
+		return;
+	unsigned idx = (unsigned)fd % FIFO_CACHE_SIZE;
+	uint32_t slot = atomic_load_explicit(&g_tty_cache[idx], memory_order_relaxed);
+	if (slot != 0 && (int)(slot >> 1) - 1 == fd)
+		atomic_store_explicit(&g_tty_cache[idx], 0, memory_order_relaxed);
+}
+
+/*
  * One bounded chunk, source -> userspace -> destination. Returning less than
  * `len` is allowed by splice(2) and every splice-based copy loop already
  * handles it, so a 64KB ceiling costs nothing but bounds the stack.
@@ -1698,6 +1742,165 @@ static void ep_oneshot_recount_locked(void)
 			      memory_order_release);
 }
 
+static long long ep_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* ==================================================================== */
+/*  Unknown-key EPOLLOUT storm suppression                                */
+/*                                                                        */
+/*  The ONESHOT enforcement above keys on registrations the shim SAW --   */
+/*  but some arms never reach any interceptable path: bun's Rust code     */
+/*  issues epoll_ctl through rustix's linux_raw inline svc, which never   */
+/*  touches a libc symbol, so the registry never learns the entry.        */
+/*  Measured 2026-09-28 on an interactive claude-code (musl) TUI          */
+/*  session: an eventfd registered ONESHOT|EPOLLOUT (mask 0x4000001c,     */
+/*  visible in fdinfo) that no interceptable epoll_ctl ever armed,        */
+/*  re-fired a pure ev=0x4 event on EVERY epoll_pwait -- one pinned core  */
+/*  plus mimalloc's scavenger ~50% downstream. Same defect family as      */
+/*  ohos-bun 408a29c0b4's on-device trace ("kernel keeps delivering       */
+/*  ready events for that fd indefinitely, even after CTL_DEL reports     */
+/*  success"): ONESHOT discipline on this kernel is flaky over time, and  */
+/*  for the TTY/writer shape userspace cannot always make it stop.        */
+/*                                                                        */
+/*  Detection mirrors ohos-bun's accepted signature: the same (epfd,      */
+/*  data) pure-EPOLLOUT event arriving with <=10ms gaps, 20+ times in a   */
+/*  row, is a storm; legitimate drain-then-idle cycles are ms-to-seconds  */
+/*  apart, and the FIRST event after a >10ms gap always passes (streak    */
+/*  resets to 1 -- ONESHOT's one-delivery-per-arm stays honored for       */
+/*  genuinely re-armed entries). On storm onset the shim (a) reverse-maps */
+/*  data -> fd via /proc/self/fdinfo/<epfd> and CTL_DELs it kernel-side   */
+/*  (stops the still-registered case cold on today's kernel), and (b) if  */
+/*  the kernel keeps delivering anyway (the traced ghost-delivery case),  */
+/*  strips the event and paces the re-wait loop with a 2ms sleep per      */
+/*  stripped iteration -- bounded latency, only ever paid mid-storm.      */
+/* ==================================================================== */
+
+#define EP_STORM_MAX 16
+#define EP_STORM_GAP_MS 10
+#define EP_STORM_STREAK 20
+#define EP_STORM_SLEEP_NS 2000000LL
+
+typedef struct {
+	int used;
+	int epfd;
+	uint64_t data;
+	int streak;
+	long long last_ms;
+	int storm;
+	int del_tried;
+} ep_storm_t;
+
+static ep_storm_t g_ep_storm[EP_STORM_MAX];
+
+/* Pure-EPOLLOUT events are the storm's shape: OUT and nothing else. */
+static int ev_is_pure_epollout(uint32_t e)
+{
+	return (e & EPOLLOUT) &&
+	       !(e & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP));
+}
+
+/* Reverse-map (epfd, data) -> registered fd by parsing /proc/self/fdinfo.
+ * Returns the fd or -1. Called at storm onset only (del_tried gates), so
+ * the procfs read cost is one-shot per storm key. */
+static int ep_storm_find_fd(int epfd, uint64_t data)
+{
+	char path[64];
+	snprintf(path, sizeof path, "/proc/self/fdinfo/%d", epfd);
+	FILE *f = fopen(path, "re");
+	if (!f)
+		return -1;
+	int found = -1;
+	char line[256];
+	while (fgets(line, sizeof line, f)) {
+		int tfd;
+		unsigned ev;
+		unsigned long long d;
+		if (sscanf(line, "tfd: %d events: %x data: %llx",
+			   &tfd, &ev, &d) == 3 && d == data) {
+			found = tfd;
+			break;
+		}
+	}
+	fclose(f);
+	return found;
+}
+
+/* Observe one pure-EPOLLOUT event that matched no registry entry; sets
+ * *suppress when this key is in storm mode. The table update runs under
+ * g_ep_pipes_lock; the one-shot fdinfo scan + CTL_DEL run outside it. */
+static void ep_storm_observe(int epfd, uint64_t data, int *suppress)
+{
+	long long now = ep_now_ms();
+	int i, slot = -1, oldest = -1;
+	long long oldest_ms = 0;
+
+	*suppress = 0;
+	pthread_mutex_lock(&g_ep_pipes_lock);
+	for (i = 0; i < EP_STORM_MAX; i++) {
+		if (!g_ep_storm[i].used) {
+			if (slot < 0)
+				slot = i;
+			continue;
+		}
+		if (g_ep_storm[i].epfd == epfd && g_ep_storm[i].data == data)
+			break;
+	}
+	if (i >= EP_STORM_MAX && slot >= 0) {
+		i = slot;
+	} else if (i >= EP_STORM_MAX) {
+		/* full: recycle the quietest slot */
+		for (i = 0; i < EP_STORM_MAX; i++) {
+			if (!g_ep_storm[i].used)
+				continue;
+			if (oldest < 0 || g_ep_storm[i].last_ms < oldest_ms) {
+				oldest = i;
+				oldest_ms = g_ep_storm[i].last_ms;
+			}
+		}
+		i = oldest;
+	}
+	if (i >= 0 && i < EP_STORM_MAX) {
+		if (!g_ep_storm[i].used || g_ep_storm[i].epfd != epfd ||
+		    g_ep_storm[i].data != data) {
+			memset(&g_ep_storm[i], 0, sizeof g_ep_storm[i]);
+			g_ep_storm[i].used = 1;
+			g_ep_storm[i].epfd = epfd;
+			g_ep_storm[i].data = data;
+		}
+		ep_storm_t *s = &g_ep_storm[i];
+		s->streak = (now - s->last_ms <= EP_STORM_GAP_MS) ?
+				    s->streak + 1 :
+				    1;
+		s->last_ms = now;
+		if (s->streak >= EP_STORM_STREAK)
+			s->storm = 1; /* sticky until a >gap quiet period */
+		*suppress = s->storm;
+	}
+	int try_del = *suppress && !g_ep_storm[i].del_tried;
+	if (try_del)
+		g_ep_storm[i].del_tried = 1;
+	pthread_mutex_unlock(&g_ep_pipes_lock);
+
+	if (try_del) {
+		int fd = ep_storm_find_fd(epfd, data);
+		if (fd >= 0) {
+			static int (*real_ctl)(int, int, int,
+					       struct epoll_event *) = NULL;
+			if (!real_ctl)
+				real_ctl = (int (*)(int, int, int,
+						    struct epoll_event *))dlsym(
+					RTLD_NEXT, "epoll_ctl");
+			if (real_ctl)
+				real_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+		}
+	}
+}
+
+
 /* fork() only carries the calling thread into the child; if some *other*
  * thread held g_ep_pipes_lock at the instant of fork(), it stays locked
  * forever in the child (its owner doesn't exist there to unlock it) --
@@ -1728,6 +1931,7 @@ static void cr_atfork_child(void)
 	 * no other thread survives the fork to have been counted. */
 	pthread_mutex_init(&cr_sigsys_lock, NULL);
 	cr_sigsys_refcount = 0;
+	memset(g_ep_storm, 0, sizeof(g_ep_storm));
 }
 
 __attribute__((constructor))
@@ -1771,8 +1975,9 @@ static void ep_reg_update_locked(int epfd, int fd, const struct epoll_event *ev)
 			return;
 		}
 	}
-	if (free_slot < 0)
+	if (free_slot < 0) {
 		return;	/* full: this pipe just never gets repaired */
+	}
 	g_ep_pipes[free_slot].used = 1;
 	g_ep_pipes[free_slot].epfd = epfd;
 	g_ep_pipes[free_slot].fd = fd;
@@ -1991,6 +2196,16 @@ static int ep_shim_ctl_done(int rc, int epfd, int op, int fd,
 		 * bit): registered for the ONESHOT enforcement pass in
 		 * ep_shim_after_wait_ex(), never for synthesis. */
 		ep_reg_update_locked(epfd, fd, ev);
+	} else if (ev &&
+		   ((ev->events & (EPOLLOUT | EPOLLONESHOT)) ==
+		    (EPOLLOUT | EPOLLONESHOT)) &&
+		   splice_fd_is_tty_cached(fd)) {
+		/* TTY/PTY write ends (interactive stdio): same ONESHOT
+		 * enforcement as the FIFO case above, same kernel defect
+		 * family (see the measurement note on splice_fd_is_tty()).
+		 * EPOLLIN synthesis deliberately does NOT extend to TTYs --
+		 * the missed-wakeup repair it exists for is pipe-specific. */
+		ep_reg_update_locked(epfd, fd, ev);
 	} else {
 		/* No repair interest: make sure a recycled fd number doesn't
 		 * stay tracked from a previous registration. */
@@ -2043,10 +2258,12 @@ static int ep_shim_clamp_timeout(int epfd, int timeout)
  * one that returns >0 because FIONREAD caught pending bytes epoll_wait
  * itself missed. */
 static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
-				 int maxevents, int *out_synthesized)
+				 int maxevents, int *out_synthesized,
+				 int *out_suppressed)
 {
 	int i, j, n = 0;
 	*out_synthesized = 0;
+	*out_suppressed = 0;
 	if (maxevents <= 0 || !ep_pipe_active())
 		return rc;
 
@@ -2063,43 +2280,81 @@ static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
 	 * ep_shim_ctl_done translates MOD on a kdel'd entry back into ADD.
 	 * Zero cost when no eligible entry is registered (atomic count
 	 * gates the lock). */
-	if (rc > 0 &&
-	    atomic_load_explicit(&g_ep_oneshot_watch_count,
-				 memory_order_acquire) > 0) {
+	if (rc > 0) {
 		static int (*real_ctl)(int, int, int,
 				       struct epoll_event *) = NULL;
 		if (!real_ctl)
 			real_ctl = (int (*)(int, int, int,
 					    struct epoll_event *))dlsym(
 				RTLD_NEXT, "epoll_ctl");
-		pthread_mutex_lock(&g_ep_pipes_lock);
-		for (j = 0; j < rc; j++) {
-			for (i = 0; i < EP_REG_MAX; i++) {
-				ep_pipe_reg_t *r = &g_ep_pipes[i];
-				if (!r->used || r->epfd != epfd ||
-				    !ep_reg_oneshot_watch(r) ||
-				    r->ev.data.u64 != events[j].data.u64)
-					continue;
-				if (!r->disarmed) {
-					r->disarmed = 1;
-				} else {
-					if (!r->kdel && real_ctl) {
-						if (real_ctl(epfd,
-							     EPOLL_CTL_DEL,
-							     r->fd,
-							     NULL) == 0)
-							r->kdel = 1;
+		unsigned char *matched = NULL;
+		if (atomic_load_explicit(&g_ep_oneshot_watch_count,
+					 memory_order_acquire) > 0) {
+			pthread_mutex_lock(&g_ep_pipes_lock);
+			/* matched[] needs one byte per returned event; rc is
+			 * small in practice (the storm itself returns 1-2).
+			 * malloc-free cap: skip matching entirely for
+			 * absurdly wide returns. */
+			if (rc <= 256) {
+				matched = alloca((size_t)rc);
+				memset(matched, 0, (size_t)rc);
+			}
+			for (j = 0; j < rc; j++) {
+				for (i = 0; i < EP_REG_MAX; i++) {
+					ep_pipe_reg_t *r = &g_ep_pipes[i];
+					if (!r->used || r->epfd != epfd ||
+					    !ep_reg_oneshot_watch(r) ||
+					    r->ev.data.u64 !=
+						    events[j].data.u64)
+						continue;
+					if (matched)
+						matched[j] = 1;
+					if (!r->disarmed) {
+						r->disarmed = 1;
+					} else {
+						if (!r->kdel && real_ctl) {
+							if (real_ctl(epfd,
+								     EPOLL_CTL_DEL,
+								     r->fd,
+								     NULL) == 0) {
+								r->kdel = 1;
+							}
+						}
+						memmove(&events[j],
+							&events[j + 1],
+							(size_t)(rc - j - 1) *
+								sizeof(events[0]));
+						rc--;
+						j--;
 					}
-					memmove(&events[j], &events[j + 1],
-						(size_t)(rc - j - 1) *
-							sizeof(events[0]));
-					rc--;
-					j--;
+					break;
 				}
-				break;
+			}
+			pthread_mutex_unlock(&g_ep_pipes_lock);
+		}
+
+		/* Unknown-key EPOLLOUT storm pass (see the storm block below
+		 * ep_now_ms): pure-EPOLLOUT events that no interceptable
+		 * epoll_ctl ever armed -- bun registers some via rustix's
+		 * inline-svc path, invisible to LD_PRELOAD. Observing them
+		 * here is the only hook the shim has. */
+		for (j = 0; j < rc; j++) {
+			if (matched && matched[j])
+				continue;
+			if (!ev_is_pure_epollout(events[j].events))
+				continue;
+			int suppress = 0;
+			ep_storm_observe(epfd, events[j].data.u64,
+					 &suppress);
+			if (suppress) {
+				memmove(&events[j], &events[j + 1],
+					(size_t)(rc - j - 1) *
+						sizeof(events[0]));
+				rc--;
+				j--;
+				(*out_suppressed)++;
 			}
 		}
-		pthread_mutex_unlock(&g_ep_pipes_lock);
 	}
 
 	if (rc != 0)
@@ -2141,22 +2396,8 @@ static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
 	return n;
 }
 
-static int ep_shim_after_wait(int rc, int epfd, struct epoll_event *events,
-			      int maxevents)
-{
-	int synthesized;
-	return ep_shim_after_wait_ex(rc, epfd, events, maxevents, &synthesized);
-}
-
 typedef int (*epoll_pwait_fn)(int, struct epoll_event *, int, int,
 			      const sigset_t *);
-
-static long long ep_now_ms(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
 
 /* Wait with the repair slice ep_shim_clamp_timeout() dictates, but WITHOUT
  * leaking the slicing to the caller: an empty 250ms repair poll is answered
@@ -2171,10 +2412,12 @@ static int ep_shim_wait(int epfd, struct epoll_event *events, int maxevents,
 {
 	int slice = ep_shim_clamp_timeout(epfd, timeout);
 	if (slice == timeout) {
-		if (timeout == 0)
-			return ep_shim_after_wait(real(epfd, events,
-							maxevents, 0, sigmask),
-						  epfd, events, maxevents);
+		if (timeout == 0) {
+			int syn, sup;
+			return ep_shim_after_wait_ex(
+				real(epfd, events, maxevents, 0, sigmask),
+				epfd, events, maxevents, &syn, &sup);
+		}
 		/* A wait that didn't need slicing can still come back empty
 		 * HERE: ONESHOT enforcement may have stripped the kernel's
 		 * re-fired events after the real call returned instantly.
@@ -2182,14 +2425,26 @@ static int ep_shim_wait(int epfd, struct epoll_event *events, int maxevents,
 		 * the exact epoll_wait contract violation the sliced loop
 		 * below exists to prevent -- so re-wait for the caller's
 		 * remaining time. A genuine timeout still returns 0, after
-		 * at most one extra clock read. */
+		 * at most one extra clock read. When the strip was storm
+		 * suppression (unknown key, possibly ghost-delivering even
+		 * after our one-shot CTL_DEL), pace the re-wait so a
+		 * re-firing kernel cannot turn this loop into the spin we
+		 * just removed from the caller. */
 		long long deadline = timeout > 0 ? ep_now_ms() + timeout : 0;
 		for (;;) {
-			int rc = ep_shim_after_wait(
+			int syn, sup = 0;
+			int rc = ep_shim_after_wait_ex(
 				real(epfd, events, maxevents, timeout, sigmask),
-				epfd, events, maxevents);
+				epfd, events, maxevents, &syn, &sup);
 			if (rc != 0)
 				return rc;
+			if (sup > 0) {
+				struct timespec zzz = {
+					.tv_sec = 0,
+					.tv_nsec = EP_STORM_SLEEP_NS,
+				};
+				nanosleep(&zzz, NULL);
+			}
 			if (timeout > 0) {
 				long long left = deadline - ep_now_ms();
 				if (left <= 0)
@@ -2204,10 +2459,11 @@ static int ep_shim_wait(int epfd, struct epoll_event *events, int maxevents,
 		deadline = ep_now_ms() + timeout;
 
 	for (;;) {
-		int synthesized = 0;
+		int synthesized = 0, suppressed = 0;
 		int rc = ep_shim_after_wait_ex(real(epfd, events, maxevents,
 						    slice, sigmask),
-					       epfd, events, maxevents, &synthesized);
+					       epfd, events, maxevents,
+					       &synthesized, &suppressed);
 		if (rc != 0) {
 			/* Only a synthesized event is evidence the defect
 			 * just fired -- a genuine unrelated kernel event
@@ -2226,6 +2482,17 @@ static int ep_shim_wait(int epfd, struct epoll_event *events, int maxevents,
 		ep_backoff_update_locked(epfd, 0);
 		next_interval = ep_backoff_get_locked(epfd);
 		pthread_mutex_unlock(&g_ep_pipes_lock);
+
+		if (suppressed > 0) {
+			/* storm pacing: same rationale as the single-shot
+			 * loop above -- a ghost-delivering kernel must not
+			 * turn the slice loop into the spin */
+			struct timespec zzz = {
+				.tv_sec = 0,
+				.tv_nsec = EP_STORM_SLEEP_NS,
+			};
+			nanosleep(&zzz, NULL);
+		}
 
 		if (timeout > 0) {
 			long long left = deadline - ep_now_ms();
@@ -2476,6 +2743,7 @@ static void shim_forget_fd(int fd)
 		pthread_mutex_unlock(&g_ep_pipes_lock);
 	}
 	fifo_cache_forget_fd(fd);
+	tty_cache_forget_fd(fd);
 }
 
 typedef int (*close_fn)(int);

@@ -1,6 +1,21 @@
 # 诊断：musl 版 claude-code（bun 单文件）经 LD_PRELOAD 运行时闲时 CPU ~150-180%
 
-日期：2026-09-27 · 环境：HarmonyOS 真机应用沙箱 · 结论级别：已实测定性（v2，含复核修正）
+日期：2026-09-27/28 · 环境：HarmonyOS 真机应用沙箱 · 结论级别：已实测定性（v3）
+
+> **v3 增补（交互 TUI 形态）**：用户报告「musl 版闲时 CPU 仍很高」属实——交互
+> TUI（PTY stdio）存在**第四层**自旋。修复链（分支 `fix/epoll-oneshot-tty`，
+> commit 9ce9472）：①PTY 写端登记（TCGETS 缓存判定）；②未知 key 纯 EPOLLOUT
+> 风暴抑制（rustix 内联 arm 不可见 → 同 (epfd,data) ≤10ms 间隔连击 ≥20 判定
+> 风暴 → fdinfo 反查 fd 内核侧 CTL_DEL + 剥除 + re-wait 2ms 步进）。修复后
+> 风暴活跃 session 实测 **129%+56% → 12 秒 0 ticks**，functional 46/46。
+> **但存在结构性极限**：TUI 主循环的等待本身可能走 bun raw 内联
+> `epoll_pwait2`（svc 直发）——该层风暴整段不跨任何可拦截符号（10s trace
+> 0 字节、stime 主导 80%），**LD_PRELOAD 无解，只有源码修复（tap bun）能治**。
+> 且内核行为间歇漂移（同一晚上有无自旋两种 session 并存，与 ohos-bun
+> 408a29c0b4 revert 记录的"探针结果互相冲突"一致）。
+> **运维结论：`~/.shellrc` 默认改回 `CLAUDE_CODE_RUNTIME=bun`（TUI 日常），
+> musl 逃生通道仅用于非交互形态（`-p` / `mcp serve` / 管道——这些已被
+> shim 完整治好，实测 1%/0%）。**
 
 > v2 修订：初版报告有两处错误，已由追加实验修正——
 > ①「等待走 raw syscall、LD_PRELOAD 不可见」**错**：waitprobe 实测主循环等待走
