@@ -22,6 +22,11 @@
 #   make check         -> build, sign, and run ohos-compat-check (`ohos-shim
 #                         check`'s payload) with a forced clean LD_PRELOAD
 #                         baseline -- see src/ohos_compat_check.c
+#   make ghost         -> build, sign, and run test/epoll_ghost.c -- a
+#                         deterministic kernel-fault-injection unit test for
+#                         the ONESHOT-enforcement re-fire path (no LD_PRELOAD:
+#                         it #includes ohos_compat_shim.c directly and drives
+#                         ep_shim_wait() with a mock "real" epoll_pwait)
 #   make clean
 
 OHOS_NDK_HOME ?= $(shell ls -d $(HOME)/.harmonybrew/Cellar/ohos-sdk/*/native 2>/dev/null | sort -V | tail -1)
@@ -37,13 +42,14 @@ SMOKE := test/smoke
 FUNCTIONAL := test/functional
 BENCH := test/bench
 RVF := test/real_vs_fallback
+GHOST := test/epoll_ghost
 # Flat next to $(LIB)/$(CHECKDEP), not under src/ -- resolve_sibling_lib()'s
 # dev-layout fallback expects the check binary and both .so's as siblings.
 CHECK := ohos-compat-check
 
-.PHONY: all sign smoke functional bench real-vs-fallback check clean
+.PHONY: all sign smoke functional bench real-vs-fallback check ghost clean
 
-all: $(LIB) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF) $(CHECK) $(CHECKDEP)
+all: $(LIB) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF) $(CHECK) $(CHECKDEP) $(GHOST)
 
 $(LIB): src/ohos_compat_shim.c
 	$(CC) $(CFLAGS) -shared -fPIC $< -o $@ $(LDFLAGS)
@@ -66,13 +72,16 @@ $(CHECKDEP): src/checkdep.c
 $(CHECK): src/ohos_compat_check.c
 	$(CC) $(CFLAGS) -rdynamic -pthread $< -o $@ $(LDFLAGS)
 
+$(GHOST): test/epoll_ghost.c src/ohos_compat_shim.c
+	$(CC) $(CFLAGS) -pthread $< -o $@ $(LDFLAGS)
+
 # Sign via a temp file + atomic rename, never in place (-inFile == -outFile):
 # in-place signing sporadically fails on-device with FILE_NOT_FOUND right
 # after "write code sign data success" (observed on test/smoke,
 # test/real_vs_fallback, test/functional — then the half-written file makes
 # every later in-place attempt fail too). Temp + mv has never failed.
 sign: all
-	@for f in $(LIB) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF) $(CHECK) $(CHECKDEP); do \
+	@for f in $(LIB) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF) $(CHECK) $(CHECKDEP) $(GHOST); do \
 		echo "sign $$f"; \
 		binary-sign-tool sign -selfSign 1 -inFile $$f -outFile $$f.signed && \
 		chmod +x $$f.signed && mv -f $$f.signed $$f || exit 1; \
@@ -120,5 +129,10 @@ bench: sign
 check: sign
 	@env -u LD_PRELOAD ./$(CHECK)
 
+# No LD_PRELOAD dichotomy: this drives the shim's internals directly, not
+# through libc symbol interposition (see the make-target comment above).
+ghost: sign
+	@env -u LD_PRELOAD ./$(GHOST)
+
 clean:
-	rm -f $(LIB) $(CHECKDEP) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF) $(CHECK)
+	rm -f $(LIB) $(CHECKDEP) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF) $(CHECK) $(GHOST)

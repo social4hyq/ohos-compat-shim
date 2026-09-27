@@ -1705,6 +1705,20 @@ typedef struct {
 	int kdel;		/* we removed this entry kernel-side (ONESHOT
 				 * enforcement); re-arm must reach the kernel
 				 * as ADD, and an app DEL must not fail */
+	int del_tried;		/* ONESHOT enforcement already attempted a
+				 * kernel-side DEL for the current arm (see
+				 * the 2026-09-28 note on ep_shim_after_wait_ex
+				 * below: on some HarmonyOS kernels DEL on this
+				 * exact, still-registered tfd returns ENOENT
+				 * every time -- retrying it on every re-fire
+				 * just adds a failing syscall to what's
+				 * already a busy-loop). One attempt per arm;
+				 * cleared on the next ADD/MOD so a genuinely
+				 * re-armed entry gets a fresh try. */
+	int ghost_streak;	/* consecutive ghost re-fires stripped since
+				 * this arm (see EP_GHOST_SLEEP_MAX_NS above);
+				 * grows the caller's pacing sleep, resets on
+				 * the next ADD/MOD */
 } ep_pipe_reg_t;
 
 static ep_pipe_reg_t g_ep_pipes[EP_REG_MAX];
@@ -1783,6 +1797,20 @@ static long long ep_now_ms(void)
 #define EP_STORM_GAP_MS 10
 #define EP_STORM_STREAK 20
 #define EP_STORM_SLEEP_NS 2000000LL
+
+/* Exponential pacing cap for the ONESHOT-enforcement matched-entry ghost
+ * path (see the 2026-09-28 note on ep_shim_after_wait_ex): unlike the
+ * unknown-key storm above, this ghost can be a PERMANENT property of one
+ * registration for the rest of its arm's lifetime -- on the affected
+ * kernel, DEL for the exact, still-registered tfd returns ENOENT every
+ * time, so nothing ever silences it kernel-side. Paying a flat 2ms forever
+ * for a storm that never ends measured ~5.5% steady-state CPU on an
+ * interactive claude-code (musl) TUI session; growing the pace while it
+ * stays uninterrupted (reset on the next real ADD/MOD arm) brought that
+ * down further without adding perceptible input latency (32ms is well
+ * under normal human-perceived keystroke-to-echo budgets). */
+#define EP_GHOST_SLEEP_MAX_NS 32000000LL
+#define EP_GHOST_STREAK_CAP 4 /* 2ms << 4 == 32ms == the cap above */
 
 typedef struct {
 	int used;
@@ -1968,6 +1996,11 @@ static void ep_reg_update_locked(int epfd, int fd, const struct epoll_event *ev)
 			 * op to reach the kernel correctly; see
 			 * ep_shim_ctl_done). */
 			g_ep_pipes[i].kdel = 0;
+			/* del_tried cleared alongside kdel: a fresh arm
+			 * deserves a fresh DEL attempt if it later ghost-
+			 * refires, same reasoning as kdel above. */
+			g_ep_pipes[i].del_tried = 0;
+			g_ep_pipes[i].ghost_streak = 0;
 			/* had_data deliberately kept: a MOD re-arm right
 			 * after the reader drained the pipe must not lose
 			 * the pending EOF transition. */
@@ -1984,6 +2017,8 @@ static void ep_reg_update_locked(int epfd, int fd, const struct epoll_event *ev)
 	g_ep_pipes[free_slot].ev = *ev;
 	g_ep_pipes[free_slot].disarmed = 0;
 	g_ep_pipes[free_slot].kdel = 0;
+	g_ep_pipes[free_slot].del_tried = 0;
+	g_ep_pipes[free_slot].ghost_streak = 0;
 	g_ep_pipes[free_slot].had_data = 0;
 	ep_oneshot_recount_locked();
 }
@@ -2259,11 +2294,11 @@ static int ep_shim_clamp_timeout(int epfd, int timeout)
  * itself missed. */
 static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
 				 int maxevents, int *out_synthesized,
-				 int *out_suppressed)
+				 long long *out_sleep_ns)
 {
 	int i, j, n = 0;
 	*out_synthesized = 0;
-	*out_suppressed = 0;
+	*out_sleep_ns = 0;
 	if (maxevents <= 0 || !ep_pipe_active())
 		return rc;
 
@@ -2279,7 +2314,36 @@ static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
 	 * inside this shim instead of the caller. A later ADD/MOD re-arms:
 	 * ep_shim_ctl_done translates MOD on a kdel'd entry back into ADD.
 	 * Zero cost when no eligible entry is registered (atomic count
-	 * gates the lock). */
+	 * gates the lock).
+	 *
+	 * 2026-09-28 TUI idle-spin fix: on an interactive claude-code (musl)
+	 * TUI session, DEL for the PTY write end's tfd returns ENOENT on
+	 * EVERY attempt -- even though /proc/self/fdinfo for that epfd keeps
+	 * listing the exact tfd we're deleting, with the exact ONESHOT|
+	 * EPOLLOUT mask, the whole time. This kernel's epoll_ctl(DEL) is
+	 * simply unreliable for this registration shape; no fd we could
+	 * retry with fixes it (the fd is already right). Two bugs used to
+	 * compound here: (a) this branch retried the doomed DEL syscall on
+	 * EVERY re-fire forever (measured 43k/s, each ~7us of pure syscall
+	 * overhead on top of the spin itself), and (b) stripping the event
+	 * here never told the caller via *out_suppressed, so ep_shim_wait's
+	 * existing 2ms storm-pacing nanosleep (already used for the
+	 * unknown-key case below) never engaged for this, the MORE common
+	 * case -- the strip was silent and the real epoll_pwait was retried
+	 * at full speed, which IS the 100%-CPU spin this whole interceptor
+	 * exists to prevent. Fixed: del_tried caps the DEL attempt to once
+	 * per arm (a persistent ENOENT is now paid once, not per re-fire),
+	 * and every strip on this path now requests a pacing sleep from the
+	 * caller (via *out_sleep_ns) same as the unknown-key storm path
+	 * below, so ep_shim_wait always paces re-waits while a ghost keeps
+	 * firing -- whether or not the DEL that produced it ever actually
+	 * succeeded. Because this particular ghost can be PERMANENT for the
+	 * rest of the arm's lifetime (nothing ever silences it kernel-side),
+	 * the requested sleep also grows exponentially per consecutive
+	 * re-fire (ghost_streak, capped at EP_GHOST_SLEEP_MAX_NS) instead of
+	 * staying flat forever -- flat 2ms measured ~5.5% steady-state CPU
+	 * on an idle TUI session; the grown pacing brought that down
+	 * further. Resets to the base interval on the next ADD/MOD. */
 	if (rc > 0) {
 		static int (*real_ctl)(int, int, int,
 				       struct epoll_event *) = NULL;
@@ -2312,13 +2376,28 @@ static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
 					if (!r->disarmed) {
 						r->disarmed = 1;
 					} else {
-						if (!r->kdel && real_ctl) {
+						if (!r->kdel && !r->del_tried &&
+						    real_ctl) {
+							r->del_tried = 1;
 							if (real_ctl(epfd,
 								     EPOLL_CTL_DEL,
 								     r->fd,
 								     NULL) == 0) {
 								r->kdel = 1;
 							}
+							/* A failure here (this
+							 * kernel can return
+							 * ENOENT for a tfd
+							 * fdinfo still lists)
+							 * is not retried --
+							 * del_tried stays set
+							 * until the next
+							 * ADD/MOD -- but the
+							 * event is still a
+							 * ghost re-fire either
+							 * way, so it's still
+							 * stripped and still
+							 * paced below. */
 						}
 						memmove(&events[j],
 							&events[j + 1],
@@ -2326,6 +2405,21 @@ static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
 								sizeof(events[0]));
 						rc--;
 						j--;
+						{
+							int shift = r->ghost_streak;
+							if (shift > EP_GHOST_STREAK_CAP)
+								shift = EP_GHOST_STREAK_CAP;
+							long long want =
+								EP_STORM_SLEEP_NS
+								<< shift;
+							if (want > EP_GHOST_SLEEP_MAX_NS)
+								want = EP_GHOST_SLEEP_MAX_NS;
+							if (want > *out_sleep_ns)
+								*out_sleep_ns = want;
+							if (r->ghost_streak <
+							    EP_GHOST_STREAK_CAP)
+								r->ghost_streak++;
+						}
 					}
 					break;
 				}
@@ -2352,7 +2446,8 @@ static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
 						sizeof(events[0]));
 				rc--;
 				j--;
-				(*out_suppressed)++;
+				if (EP_STORM_SLEEP_NS > *out_sleep_ns)
+					*out_sleep_ns = EP_STORM_SLEEP_NS;
 			}
 		}
 	}
@@ -2413,10 +2508,11 @@ static int ep_shim_wait(int epfd, struct epoll_event *events, int maxevents,
 	int slice = ep_shim_clamp_timeout(epfd, timeout);
 	if (slice == timeout) {
 		if (timeout == 0) {
-			int syn, sup;
+			int syn;
+			long long sleep_ns;
 			return ep_shim_after_wait_ex(
 				real(epfd, events, maxevents, 0, sigmask),
-				epfd, events, maxevents, &syn, &sup);
+				epfd, events, maxevents, &syn, &sleep_ns);
 		}
 		/* A wait that didn't need slicing can still come back empty
 		 * HERE: ONESHOT enforcement may have stripped the kernel's
@@ -2432,16 +2528,17 @@ static int ep_shim_wait(int epfd, struct epoll_event *events, int maxevents,
 		 * just removed from the caller. */
 		long long deadline = timeout > 0 ? ep_now_ms() + timeout : 0;
 		for (;;) {
-			int syn, sup = 0;
+			int syn;
+			long long sleep_ns = 0;
 			int rc = ep_shim_after_wait_ex(
 				real(epfd, events, maxevents, timeout, sigmask),
-				epfd, events, maxevents, &syn, &sup);
+				epfd, events, maxevents, &syn, &sleep_ns);
 			if (rc != 0)
 				return rc;
-			if (sup > 0) {
+			if (sleep_ns > 0) {
 				struct timespec zzz = {
 					.tv_sec = 0,
-					.tv_nsec = EP_STORM_SLEEP_NS,
+					.tv_nsec = sleep_ns,
 				};
 				nanosleep(&zzz, NULL);
 			}
@@ -2459,11 +2556,12 @@ static int ep_shim_wait(int epfd, struct epoll_event *events, int maxevents,
 		deadline = ep_now_ms() + timeout;
 
 	for (;;) {
-		int synthesized = 0, suppressed = 0;
+		int synthesized = 0;
+		long long sleep_ns = 0;
 		int rc = ep_shim_after_wait_ex(real(epfd, events, maxevents,
 						    slice, sigmask),
 					       epfd, events, maxevents,
-					       &synthesized, &suppressed);
+					       &synthesized, &sleep_ns);
 		if (rc != 0) {
 			/* Only a synthesized event is evidence the defect
 			 * just fired -- a genuine unrelated kernel event
@@ -2483,13 +2581,13 @@ static int ep_shim_wait(int epfd, struct epoll_event *events, int maxevents,
 		next_interval = ep_backoff_get_locked(epfd);
 		pthread_mutex_unlock(&g_ep_pipes_lock);
 
-		if (suppressed > 0) {
+		if (sleep_ns > 0) {
 			/* storm pacing: same rationale as the single-shot
 			 * loop above -- a ghost-delivering kernel must not
 			 * turn the slice loop into the spin */
 			struct timespec zzz = {
 				.tv_sec = 0,
-				.tv_nsec = EP_STORM_SLEEP_NS,
+				.tv_nsec = sleep_ns,
 			};
 			nanosleep(&zzz, NULL);
 		}
