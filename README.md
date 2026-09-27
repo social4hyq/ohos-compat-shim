@@ -32,7 +32,7 @@
 **但有两簇是例外，从不尝试真实路径**，因为这两个症状是负载相关的间歇性缺陷——空闲时探测大概率"通过"，压力上来时照样发作，一次性探测/尝试对这种缺陷不健全（同一原则也约束着[前向兼容](#前向兼容优先自动尝试真实系统调用)一节末尾"何时收口"的判断标准：单台设备/单次探测的"未复现"，永远只能产出该部署自行设置 `OHOS_COMPAT_SHIM_DISABLE` 的建议，不能作为改这里默认行为的依据）：
 
 - `splice()` 写入管道：目标是 FIFO 且 `off_out == NULL` 时直接走用户态 bounce buffer，从不调用真实 `splice()` —— 见[性能](#性能)一节 `splice_pipe_to_pipe_20mb` 基准，量化了放弃零拷贝的代价。
-- `epoll_pipe` 拦截簇（`poll`/`ppoll`/`epoll_ctl`/`epoll_wait`/`epoll_pwait`）：只要开关未被 `OHOS_COMPAT_SHIM_DISABLE=epoll_pipe` 关闭就常驻生效；`poll`/`ppoll` 每次返回后修正、`epoll_wait`/`epoll_pwait` 内部按自适应间隔切片轮询（2026-08-19 起：起始 250ms，连续空转 8 次后倍增、封顶 1000ms，一旦真合成出事件立即打回 250ms——细节见 `ep_backoff_*` 系列函数上方的注释块）。
+- `epoll_pipe` 拦截簇（`poll`/`ppoll`/`epoll_ctl`/`epoll_wait`/`epoll_pwait`）：只要开关未被 `OHOS_COMPAT_SHIM_DISABLE=epoll_pipe` 关闭就常驻生效；`poll`/`ppoll` 每次返回后修正、`epoll_wait`/`epoll_pwait` 内部按自适应间隔切片轮询（2026-08-19 起：起始 250ms，连续空转 8 次后倍增、封顶 1000ms，一旦真合成出事件立即打回 250ms——细节见 `ep_backoff_*` 系列函数上方的注释块）。2026-09-27 起该簇新增第三个子修复：**EPOLLONESHOT 缴械强制**——本内核对以 `EPOLLONESHOT|EPOLLOUT` 注册的管道写端无视 ONESHOT 自动缴械、每次等待都重发 EPOLLOUT（官方 claude-code musl 单文件上实测 ~51 万次/秒立即返回、事件 100% 纯 EPOLLOUT，其事件循环闲时自旋 120% CPU + mimalloc scavenger 下游 ~50%；证据与修法实测见 `logs/2026-09-27-claude-code-musl-idle-spin.md`）。首个事件放行并缴械（合规内核的原生行为）；已缴械条目的重发被剥除，并**内核侧 CTL_DEL**（纯用户态剥除只会把自旋搬进 shim 内部）；调用方随后的重臂 `MOD` 由 shim 翻译回 `ADD`、`DEL` 的 `ENOENT` 被吞掉——调用方对强制过程完全无感。修复后同二进制闲时 120%+56% → 1%+0%。无符合条目时经原子计数快路径零开销；`EPOLLIN` 方向的登记与合成逻辑不受影响（`functional` 45/45 全绿）。
 
 `getpwuid_r` 的 fallback 用户名来源：优先调用 `OH_OsAccount_GetName()`（`libos_account_ndk.so`，运行时 dlopen、句柄缓存，编译期零 SDK 依赖）取当前系统账号名——但只在查询的 uid 等于进程自身 uid 时（账号 API 没有 uid 参数）；失败或非自身 uid 时回落 `$LOGNAME`/`$USER`，最后退化为 `u<uid>` 占位符。其余字段（`pw_dir`/`pw_shell`/`pw_uid`/`pw_gid`）逻辑不变，账号 API 无法提供。
 
