@@ -11,3 +11,7 @@ libexec/
 # Editor/tool caches
 .arts/
 node_modules/
+
+# Session-local diagnostic artifacts (raw traces, samplers, fdinfo dumps)
+# -- the dated .md findings reports in logs/ ARE tracked, the bulk data is not
+logs/data-*

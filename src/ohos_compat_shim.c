@@ -1658,10 +1658,45 @@ typedef struct {
 	struct epoll_event ev;	/* registration mask + udata */
 	int disarmed;		/* ONESHOT: synthesized event delivered */
 	int had_data;		/* FIONREAD was non-zero at last check */
+	int kdel;		/* we removed this entry kernel-side (ONESHOT
+				 * enforcement); re-arm must reach the kernel
+				 * as ADD, and an app DEL must not fail */
 } ep_pipe_reg_t;
 
 static ep_pipe_reg_t g_ep_pipes[EP_REG_MAX];
 static pthread_mutex_t g_ep_pipes_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ONESHOT-enforcement eligibility: FIFO registrations that ask for
+ * EPOLLOUT under EPOLLONESHOT -- Bun's PosixPipeWriter shape. This kernel
+ * ignores EPOLLONESHOT auto-disarm for such entries and re-delivers
+ * EPOLLOUT on every wait (measured 2026-09-27: ~510k immediate
+ * epoll_pwait returns/s, 100% pure EPOLLOUT, on the official
+ * claude-code linux-arm64-musl binary; see
+ * logs/2026-09-27-claude-code-musl-idle-spin.md). EPOLLIN-bearing
+ * registrations are deliberately NOT enforcement-eligible: they are the
+ * existing synthesis repair's domain and no re-fire storm was ever
+ * observed in that direction. */
+static int ep_reg_oneshot_watch(const ep_pipe_reg_t *r)
+{
+	return (r->ev.events & (EPOLLOUT | EPOLLONESHOT)) ==
+	       (EPOLLOUT | EPOLLONESHOT);
+}
+
+/* Count of currently-registered enforcement-eligible entries (atomic so
+ * the wait-side fast path can skip the lock entirely when zero -- the
+ * wait path never needs the exact value, only ever "are there any").
+ * Maintained by recount under g_ep_pipes_lock on every registry mutation. */
+static _Atomic int g_ep_oneshot_watch_count;
+
+static void ep_oneshot_recount_locked(void)
+{
+	int i, n = 0;
+	for (i = 0; i < EP_REG_MAX; i++)
+		if (g_ep_pipes[i].used && ep_reg_oneshot_watch(&g_ep_pipes[i]))
+			n++;
+	atomic_store_explicit(&g_ep_oneshot_watch_count, n,
+			      memory_order_release);
+}
 
 /* fork() only carries the calling thread into the child; if some *other*
  * thread held g_ep_pipes_lock at the instant of fork(), it stays locked
@@ -1683,6 +1718,8 @@ static void cr_atfork_child(void)
 {
 	pthread_mutex_init(&g_ep_pipes_lock, NULL);
 	memset(g_ep_pipes, 0, sizeof(g_ep_pipes));
+	atomic_store_explicit(&g_ep_oneshot_watch_count, 0,
+			      memory_order_release);
 	/* cr_sigsys_lock (shim_guarded_syscall's refcounted SIGSYS handler
 	 * install/restore, above) has the identical fork hazard -- reset the
 	 * same way. cr_sigsys_refcount resetting to 0 is safe: the forking
@@ -1720,9 +1757,17 @@ static void ep_reg_update_locked(int epfd, int fd, const struct epoll_event *ev)
 		if (g_ep_pipes[i].epfd == epfd && g_ep_pipes[i].fd == fd) {
 			g_ep_pipes[i].ev = *ev;
 			g_ep_pipes[i].disarmed = 0;
+			/* kdel deliberately cleared: an ADD/MOD reaching the
+			 * registry bookkeeping means the app (re)armed this
+			 * entry, so any kernel-side removal we did for ONESHOT
+			 * enforcement is superseded (the caller translated the
+			 * op to reach the kernel correctly; see
+			 * ep_shim_ctl_done). */
+			g_ep_pipes[i].kdel = 0;
 			/* had_data deliberately kept: a MOD re-arm right
 			 * after the reader drained the pipe must not lose
 			 * the pending EOF transition. */
+			ep_oneshot_recount_locked();
 			return;
 		}
 	}
@@ -1733,7 +1778,9 @@ static void ep_reg_update_locked(int epfd, int fd, const struct epoll_event *ev)
 	g_ep_pipes[free_slot].fd = fd;
 	g_ep_pipes[free_slot].ev = *ev;
 	g_ep_pipes[free_slot].disarmed = 0;
+	g_ep_pipes[free_slot].kdel = 0;
 	g_ep_pipes[free_slot].had_data = 0;
+	ep_oneshot_recount_locked();
 }
 
 static void ep_reg_del_locked(int epfd, int fd)
@@ -1743,6 +1790,7 @@ static void ep_reg_del_locked(int epfd, int fd)
 		if (g_ep_pipes[i].used && g_ep_pipes[i].epfd == epfd &&
 		    g_ep_pipes[i].fd == fd)
 			g_ep_pipes[i].used = 0;
+	ep_oneshot_recount_locked();
 }
 
 static void ep_reg_forget_fd_locked(int fd)
@@ -1752,6 +1800,7 @@ static void ep_reg_forget_fd_locked(int fd)
 		if (g_ep_pipes[i].used &&
 		    (g_ep_pipes[i].fd == fd || g_ep_pipes[i].epfd == fd))
 			g_ep_pipes[i].used = 0;
+	ep_oneshot_recount_locked();
 }
 
 static int ep_reg_any_locked(int epfd)
@@ -1893,17 +1942,58 @@ static void ep_backoff_forget_locked(int epfd)
 static int ep_shim_ctl_done(int rc, int epfd, int op, int fd,
 			    struct epoll_event *ev)
 {
-	if (rc != 0 || !ep_pipe_active())
+	static int (*real_ctl)(int, int, int, struct epoll_event *) = NULL;
+	if (!real_ctl)
+		real_ctl = (int (*)(int, int, int,
+				    struct epoll_event *))dlsym(
+			RTLD_NEXT, "epoll_ctl");
+	if (!ep_pipe_active())
+		return rc;
+
+	/* ONESHOT-enforcement masking: entries we removed kernel-side
+	 * (kdel) still exist as far as the app knows, so its re-arm MOD
+	 * would hit ENOENT -- translate it to ADD -- and its DEL would
+	 * likewise fail -- suppress to success. Foreign ENOENTs (entries
+	 * we never touched) pass through untouched. */
+	if (rc != 0 && errno == ENOENT) {
+		int i, ours = 0;
+		pthread_mutex_lock(&g_ep_pipes_lock);
+		for (i = 0; i < EP_REG_MAX && !ours; i++)
+			if (g_ep_pipes[i].used && g_ep_pipes[i].epfd == epfd &&
+			    g_ep_pipes[i].fd == fd && g_ep_pipes[i].kdel)
+				ours = 1;
+		if (ours) {
+			if (op == EPOLL_CTL_DEL) {
+				ep_reg_del_locked(epfd, fd);
+				rc = 0;
+			} else if (op == EPOLL_CTL_MOD && ev && real_ctl) {
+				rc = real_ctl(epfd, EPOLL_CTL_ADD, fd, ev);
+				if (rc == 0)
+					ep_reg_update_locked(epfd, fd, ev);
+			}
+		}
+		pthread_mutex_unlock(&g_ep_pipes_lock);
+		return rc;
+	}
+
+	if (rc != 0)
 		return rc;
 	pthread_mutex_lock(&g_ep_pipes_lock);
 	if (op == EPOLL_CTL_DEL) {
 		ep_reg_del_locked(epfd, fd);
-	} else if (ev && (ev->events & EPOLLIN) && splice_fd_is_fifo_cached(fd)) {
+	} else if (ev &&
+		   ((ev->events & EPOLLIN) ||
+		    ((ev->events & (EPOLLOUT | EPOLLONESHOT)) ==
+		     (EPOLLOUT | EPOLLONESHOT))) &&
+		   splice_fd_is_fifo_cached(fd)) {
+		/* EPOLLIN-bearing FIFOs: the existing missed-wakeup synthesis
+		 * repair (unchanged). ONESHOT|EPOLLOUT FIFOs (no EPOLLIN
+		 * bit): registered for the ONESHOT enforcement pass in
+		 * ep_shim_after_wait_ex(), never for synthesis. */
 		ep_reg_update_locked(epfd, fd, ev);
 	} else {
-		/* No EPOLLIN requested, or not a pipe: make sure a
-		 * recycled fd number doesn't stay tracked from a previous
-		 * registration. */
+		/* No repair interest: make sure a recycled fd number doesn't
+		 * stay tracked from a previous registration. */
 		ep_reg_del_locked(epfd, fd);
 	}
 	pthread_mutex_unlock(&g_ep_pipes_lock);
@@ -1955,15 +2045,76 @@ static int ep_shim_clamp_timeout(int epfd, int timeout)
 static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
 				 int maxevents, int *out_synthesized)
 {
-	int i, n = 0;
+	int i, j, n = 0;
 	*out_synthesized = 0;
-	if (rc != 0 || maxevents <= 0 || !ep_pipe_active())
+	if (maxevents <= 0 || !ep_pipe_active())
+		return rc;
+
+	/* ONESHOT enforcement: this kernel ignores EPOLLONESHOT auto-disarm
+	 * for EPOLLOUT FIFO registrations and re-delivers the event on every
+	 * wait -- measured at ~510k immediate epoll_pwait returns/s (100%
+	 * pure EPOLLOUT) on the official claude-code musl binary, spinning
+	 * its event loop at 100% CPU while idle. The first delivery passes
+	 * through and disarms (what a compliant kernel does); re-fires are
+	 * stripped, and the entry is removed kernel-side (CTL_DEL) so the
+	 * kernel itself goes quiet -- a userspace-only strip would leave
+	 * the real wait returning instantly forever, moving the spin
+	 * inside this shim instead of the caller. A later ADD/MOD re-arms:
+	 * ep_shim_ctl_done translates MOD on a kdel'd entry back into ADD.
+	 * Zero cost when no eligible entry is registered (atomic count
+	 * gates the lock). */
+	if (rc > 0 &&
+	    atomic_load_explicit(&g_ep_oneshot_watch_count,
+				 memory_order_acquire) > 0) {
+		static int (*real_ctl)(int, int, int,
+				       struct epoll_event *) = NULL;
+		if (!real_ctl)
+			real_ctl = (int (*)(int, int, int,
+					    struct epoll_event *))dlsym(
+				RTLD_NEXT, "epoll_ctl");
+		pthread_mutex_lock(&g_ep_pipes_lock);
+		for (j = 0; j < rc; j++) {
+			for (i = 0; i < EP_REG_MAX; i++) {
+				ep_pipe_reg_t *r = &g_ep_pipes[i];
+				if (!r->used || r->epfd != epfd ||
+				    !ep_reg_oneshot_watch(r) ||
+				    r->ev.data.u64 != events[j].data.u64)
+					continue;
+				if (!r->disarmed) {
+					r->disarmed = 1;
+				} else {
+					if (!r->kdel && real_ctl) {
+						if (real_ctl(epfd,
+							     EPOLL_CTL_DEL,
+							     r->fd,
+							     NULL) == 0)
+							r->kdel = 1;
+					}
+					memmove(&events[j], &events[j + 1],
+						(size_t)(rc - j - 1) *
+							sizeof(events[0]));
+					rc--;
+					j--;
+				}
+				break;
+			}
+		}
+		pthread_mutex_unlock(&g_ep_pipes_lock);
+	}
+
+	if (rc != 0)
 		return rc;
 	pthread_mutex_lock(&g_ep_pipes_lock);
 	for (i = 0; i < EP_REG_MAX && n < maxevents; i++) {
 		int avail = 0;
 		if (!g_ep_pipes[i].used || g_ep_pipes[i].epfd != epfd ||
 		    g_ep_pipes[i].disarmed)
+			continue;
+		/* OUT-only entries (ONESHOT enforcement) never take part in
+		 * EPOLLIN synthesis -- the write end of a pipe is not a
+		 * reader. (Pre-existing entries always carry EPOLLIN, so
+		 * this gate is a no-op for them.) */
+		if (!(g_ep_pipes[i].ev.events & EPOLLIN))
 			continue;
 		if (ioctl(g_ep_pipes[i].fd, FIONREAD, &avail) != 0) {
 			/* fd is gone; the kernel drops closed fds from the
@@ -2019,10 +2170,34 @@ static int ep_shim_wait(int epfd, struct epoll_event *events, int maxevents,
 			const sigset_t *sigmask)
 {
 	int slice = ep_shim_clamp_timeout(epfd, timeout);
-	if (slice == timeout)
-		return ep_shim_after_wait(real(epfd, events, maxevents,
-					       timeout, sigmask),
-					  epfd, events, maxevents);
+	if (slice == timeout) {
+		if (timeout == 0)
+			return ep_shim_after_wait(real(epfd, events,
+							maxevents, 0, sigmask),
+						  epfd, events, maxevents);
+		/* A wait that didn't need slicing can still come back empty
+		 * HERE: ONESHOT enforcement may have stripped the kernel's
+		 * re-fired events after the real call returned instantly.
+		 * Returning that 0 early would leak a premature timeout --
+		 * the exact epoll_wait contract violation the sliced loop
+		 * below exists to prevent -- so re-wait for the caller's
+		 * remaining time. A genuine timeout still returns 0, after
+		 * at most one extra clock read. */
+		long long deadline = timeout > 0 ? ep_now_ms() + timeout : 0;
+		for (;;) {
+			int rc = ep_shim_after_wait(
+				real(epfd, events, maxevents, timeout, sigmask),
+				epfd, events, maxevents);
+			if (rc != 0)
+				return rc;
+			if (timeout > 0) {
+				long long left = deadline - ep_now_ms();
+				if (left <= 0)
+					return 0;
+				timeout = left > INT_MAX ? INT_MAX : (int)left;
+			}
+		}
+	}
 
 	long long deadline = 0;
 	if (timeout > 0)
