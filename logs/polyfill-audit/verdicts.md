@@ -42,3 +42,12 @@
 - 真机与容器都一致的项：直接照表处置。
 - 仅真机复现（`epoll_pipe` ONESHOT 强制、`splice` EOF、`splice` 唤醒）：按硬约束 #7"真机结果才是能否上线的依据"，真机优先，保留。
 - 真机与容器结论相反的唯一一项（`getaddrinfo` 非法字符）：两边都是真实平台/构建，转成探测优先原生的实现，两边各自受益。
+
+## 收尾：远程 docker 恢复后的完整容器回归（最终代码）
+
+远程 docker 主机在整改后期一度掉线，恢复后用最终提交（`b64167d`）的完整源码在容器里从零重新构建 + 跑了一遍全部测试，确认最后几处收尾编辑（`shim_disabled` 位掩码重构、注释调整）没有引入回归：
+
+- `functional`：baseline 32/32、加 shim 33/33，全绿。
+- `smoke`/`epoll_ghost`：全绿。
+- `ohos-compat-check --with-shim`：与真机结论完全吻合，并验证了 `getaddrinfo` 原生优先重构两个方向都工作正常——baseline 轮该容器解析器仍慢（5011ms，判"仍需要"，与之前容器数据一致）；**加 shim 那一遍，shim 自己后台探测线程判定本容器解析器慢，本地拦截照常生效（1ms 本地拒绝，判"可关闭"——这里"可关闭"是 shim 自身保护正常工作的意思，不代表这台设备该设 `OHOS_COMPAT_SHIM_DISABLE=getaddrinfo`）**。同一份代码，真机侧探测到原生已修好就纯透传，容器侧探测到没修好就继续保护，不需要手工按设备区分。
+- `bench`/`real_vs_fallback`：跑通，数字仅供参考——容器里 `getpwuid_r` fallback 比真机慢得多（容器没有 `libos_account_ndk.so`，`OH_OsAccount_GetName` 的 dlopen 每次调用都重新尝试且失败），这是探测逻辑本身"失败不缓存 handle"的既有特征，早于本轮改动存在，不在本次整改范围内。
