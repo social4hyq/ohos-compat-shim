@@ -1,9 +1,7 @@
 #!/bin/sh
 # ohos-shim -- run any command with libohos_compat.so preloaded.
 #
-# Generalizes examples/opencode-wrapper.sh (which you copy next to one
-# specific binary and hardcode the target into) into a single reusable
-# command: point it at whatever you'd normally run.
+# Point this reusable command at any program you would normally run.
 #
 #   ohos-shim node script.js
 #   ohos-shim atomcode

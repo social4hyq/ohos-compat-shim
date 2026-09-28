@@ -47,7 +47,7 @@ exec "/path/to/real-binary" "$@"
 ohos-shim -- real-binary arg1 arg2
 ```
 
-仓库包含 `index.js` 和 `index.d.ts` 的 Node.js wrapper API。当前 npm registry 尚未提供 `@ohos-ports/compat-shim`，因此暂不能通过 `npm install` 安装；可从源码或 Homebrew 使用。单体二进制 wrapper 示例见 [`examples/`](examples/)。
+仓库包含 `index.js` 和 `index.d.ts` 的 Node.js wrapper API。当前 npm registry 尚未提供 `@ohos-ports/compat-shim`，因此暂不能通过 `npm install` 安装；可从源码或 Homebrew 使用。
 
 ### 运行时开关
 
@@ -105,7 +105,7 @@ make clean
 
 `make smoke`、`make functional` 和 `make bench` 会显式清除基线进程的 `LD_PRELOAD`，避免继承 shell 环境中已有的预加载库。`make ghost` 是使用模拟 epoll 实现的状态机测试，不是内核故障注入。发布工作流复用 Makefile 编译共享库和 smoke 程序，在云端签名后以真机 smoke 检查作为发布门禁。
 
-设备实测和历史性能测量见[性能记录](logs/performance.md)及[审计记录](logs/polyfill-audit/verdicts.md)；这些结果不保证适用于其他设备。
+历史设备验证见[审计记录](logs/polyfill-audit/verdicts.md)和[epoll ONESHOT 调查](logs/2026-09-27-claude-code-musl-idle-spin.md)；这些结果不保证适用于其他设备。
 
 ## License
 
