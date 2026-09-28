@@ -29,10 +29,8 @@ jobs:
 
       - name: Build libohos_compat.so + smoke test binary
         run: |
-          CLANG="${OHOS_SDK_NATIVE}/llvm/bin/clang --target=aarch64-linux-ohos --sysroot=${OHOS_SDK_NATIVE}/sysroot"
-          $CLANG -O2 -g -Wall -Wextra -shared -fPIC src/ohos_compat_shim.c -o libohos_compat.so -ldl
-          $CLANG -O2 -g -Wall -Wextra test/smoke.c -o smoke -ldl
-          file libohos_compat.so smoke
+          make OHOS_NDK_HOME="${OHOS_SDK_NATIVE}" libohos_compat.so test/smoke
+          file libohos_compat.so test/smoke
 
       - name: Self-sign both artifacts
         run: |
@@ -45,7 +43,7 @@ jobs:
           name: ohos-compat-shim-aarch64-unknown-linux-ohos
           path: |
             libohos_compat.so
-            smoke
+            test/smoke
 
   smoke-test:
     name: Real-device smoke test
@@ -59,12 +57,12 @@ jobs:
 
       - name: Baseline (no shim) — expected to show the known HM sandbox failures
         run: |
-          chmod +x ./smoke
-          ./smoke || true
+          chmod +x ./test/smoke
+          ./test/smoke || true
 
       - name: With LD_PRELOAD — all three checks must pass
         run: |
-          LD_PRELOAD="$(pwd)/libohos_compat.so" ./smoke
+          LD_PRELOAD="$(pwd)/libohos_compat.so" ./test/smoke
 
   release:
     needs: [build, smoke-test]

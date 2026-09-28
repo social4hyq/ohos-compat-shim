@@ -87,10 +87,11 @@ ohos-shim check --with-shim         # 同时检查加载 shim 后的结果
 
 ## 构建与检查
 
-本地构建需要 Harmonybrew 安装的 OHOS NDK。`make` 构建共享库、检查程序和测试/诊断程序；运行各测试目标需要可执行文件签名工具 `binary-sign-tool`。
+本地构建需要 OHOS NDK。`make` 只构建运行时共享库；运行设备测试目标还需要 `binary-sign-tool` 为对应产物签名。
 
 ```sh
-make                  # 构建全部目标，不运行测试
+make                  # 只构建运行时共享库
+make all              # 构建共享库、检查程序和全部测试/诊断程序
 make smoke            # 基础 smoke 检查：无 shim 基线及加载 shim
 make functional       # 功能检查：无 shim 基线及加载 shim
 make check            # 运行 ohos-shim check 的检查程序
@@ -100,7 +101,9 @@ make real-vs-fallback # 对比原生实现与 fallback
 make clean
 ```
 
-`make smoke`、`make functional` 和 `make bench` 会显式清除基线进程的 `LD_PRELOAD`，避免继承 shell 环境中已有的预加载库。`make ghost` 是使用模拟 epoll 实现的状态机测试，不是内核故障注入。发布工作流在云端交叉编译和签名，并以真机 smoke 检查作为发布门禁。
+编译器优先使用 OHOS NDK 的 `llvm/bin/cc`，不存在时使用 `llvm/bin/clang`；不会回退到宿主机 PATH 中的编译器。可通过 `OHOS_NDK_HOME` 指定 SDK 根目录，也可通过 `OHOS_CC` 指定 NDK 中的编译器。需要执行测试的目标只签名各自用到的产物；`make sign` 会构建并签名全部目标。
+
+`make smoke`、`make functional` 和 `make bench` 会显式清除基线进程的 `LD_PRELOAD`，避免继承 shell 环境中已有的预加载库。`make ghost` 是使用模拟 epoll 实现的状态机测试，不是内核故障注入。发布工作流复用 Makefile 编译共享库和 smoke 程序，在云端签名后以真机 smoke 检查作为发布门禁。
 
 设备实测和历史性能测量见[性能记录](logs/performance.md)及[审计记录](logs/polyfill-audit/verdicts.md)；这些结果不保证适用于其他设备。
 

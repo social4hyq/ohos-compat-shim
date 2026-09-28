@@ -1,40 +1,23 @@
-# ohos-compat-shim/Makefile
-#
-# Local (on-device) build for development/smoke-testing. The npm-published
-# artifact is built by .github/workflows/release.yml on a cloud x86 runner
-# cross-compiling with the same OHOS NDK clang invocation — this Makefile is
-# for iterating directly on a HarmonyOS device or any host with the OHOS NDK
-# installed via harmonybrew.
-#
-# Targets:
-#   make               -> build libohos_compat.so + test/smoke
-#   make sign          -> build then self-sign libohos_compat.so + smoke
-#   make smoke         -> build, sign, and run the smoke test WITHOUT the shim
-#                         preloaded (baseline) then WITH it preloaded
-#   make functional    -> build, sign, and run test/functional.c the same way
-#   make bench         -> build, sign, and run test/bench.c the same way
-#   make real-vs-fallback -> build, sign, and run test/real_vs_fallback.c
-#                         (--dump, then the performance comparison) — never
-#                         needs LD_PRELOAD, it calls both implementations
-#                         directly in a single unshimmed process (still
-#                         needs signing to execute on a real HarmonyOS
-#                         device, same as every other binary here)
-#   make check         -> build, sign, and run ohos-compat-check (`ohos-shim
-#                         check`'s payload) with a forced clean LD_PRELOAD
-#                         baseline -- see src/ohos_compat_check.c
-#   make ghost         -> build, sign, and run test/epoll_ghost.c -- a
-#                         deterministic kernel-fault-injection unit test for
-#                         the ONESHOT-enforcement re-fire path (no LD_PRELOAD:
-#                         it #includes ohos_compat_shim.c directly and drives
-#                         ep_shim_wait() with a mock "real" epoll_pwait)
-#   make clean
+# Local OHOS build and on-device checks. Override OHOS_NDK_HOME to use a
+# specific SDK; by default, use OHOS_SDK_NATIVE or the latest Harmonybrew SDK.
 
-OHOS_NDK_HOME ?= $(shell ls -d $(HOME)/.harmonybrew/Cellar/ohos-sdk/*/native 2>/dev/null | sort -V | tail -1)
-CLANG := $(OHOS_NDK_HOME)/llvm/bin/clang
-SYSROOT := $(OHOS_NDK_HOME)/sysroot
-CC = $(CLANG) --target=aarch64-linux-ohos --sysroot=$(SYSROOT)
-CFLAGS = -O2 -g -Wall -Wextra
-LDFLAGS = -ldl
+OHOS_NDK_HOME ?= $(OHOS_SDK_NATIVE)
+ifeq ($(strip $(OHOS_NDK_HOME)),)
+OHOS_NDK_HOME := $(shell ls -d $(HOME)/.harmonybrew/Cellar/ohos-sdk/*/native 2>/dev/null | sort -V | tail -1)
+endif
+
+OHOS_TARGET ?= aarch64-linux-ohos
+OHOS_SYSROOT ?= $(OHOS_NDK_HOME)/sysroot
+ifeq ($(origin OHOS_CC),undefined)
+ifneq ($(wildcard $(OHOS_NDK_HOME)/llvm/bin/cc),)
+OHOS_CC := $(OHOS_NDK_HOME)/llvm/bin/cc
+else
+OHOS_CC := $(OHOS_NDK_HOME)/llvm/bin/clang
+endif
+endif
+CC = $(OHOS_CC) --target=$(OHOS_TARGET) --sysroot=$(OHOS_SYSROOT)
+CFLAGS ?= -O2 -g -Wall -Wextra
+LDFLAGS ?= -ldl
 
 LIB := libohos_compat.so
 CHECKDEP := libohos_compat_checkdep.so
@@ -43,13 +26,15 @@ FUNCTIONAL := test/functional
 BENCH := test/bench
 RVF := test/real_vs_fallback
 GHOST := test/epoll_ghost
-# Flat next to $(LIB)/$(CHECKDEP), not under src/ -- resolve_sibling_lib()'s
-# dev-layout fallback expects the check binary and both .so's as siblings.
 CHECK := ohos-compat-check
+ARTIFACTS := $(LIB) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF) $(CHECK) $(CHECKDEP) $(GHOST)
 
+.DEFAULT_GOAL := $(LIB)
 .PHONY: all sign smoke functional bench real-vs-fallback check ghost clean
 
-all: $(LIB) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF) $(CHECK) $(CHECKDEP) $(GHOST)
+# `make` builds the runtime library; `make all` also builds every test and
+# diagnostic executable. Compilation never signs or runs the outputs.
+all: $(ARTIFACTS)
 
 $(LIB): src/ohos_compat_shim.c
 	$(CC) $(CFLAGS) -shared -fPIC $< -o $@ $(LDFLAGS)
@@ -69,70 +54,72 @@ $(RVF): test/real_vs_fallback.c
 $(CHECKDEP): src/checkdep.c
 	$(CC) $(CFLAGS) -shared -fPIC $< -o $@ $(LDFLAGS)
 
+# The check program resolves checkdep beside itself or in the Homebrew lib dir.
 $(CHECK): src/ohos_compat_check.c
 	$(CC) $(CFLAGS) -rdynamic -pthread $< -o $@ $(LDFLAGS)
 
 $(GHOST): test/epoll_ghost.c src/ohos_compat_shim.c
 	$(CC) $(CFLAGS) -pthread $< -o $@ $(LDFLAGS)
 
-# Sign via a temp file + atomic rename, never in place (-inFile == -outFile):
-# in-place signing sporadically fails on-device with FILE_NOT_FOUND right
-# after "write code sign data success" (observed on test/smoke,
-# test/real_vs_fallback, test/functional — then the half-written file makes
-# every later in-place attempt fail too). Temp + mv has never failed.
+# Sign to a temporary file and atomically replace the unsigned output. Signing
+# in place can fail on-device and leave a truncated artifact.
+define sign_files
+	@set -e; for file in $(1); do \
+		tmp="$${file}.signed"; \
+		trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+		echo "sign $$file"; \
+		binary-sign-tool sign -selfSign 1 -inFile "$$file" -outFile "$$tmp"; \
+		chmod +x "$$tmp"; \
+		mv -f "$$tmp" "$$file"; \
+	done; trap - EXIT HUP INT TERM
+endef
+
 sign: all
-	@for f in $(LIB) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF) $(CHECK) $(CHECKDEP) $(GHOST); do \
-		echo "sign $$f"; \
-		binary-sign-tool sign -selfSign 1 -inFile $$f -outFile $$f.signed && \
-		chmod +x $$f.signed && mv -f $$f.signed $$f || exit 1; \
-	done
+	$(call sign_files,$(ARTIFACTS))
 
-real-vs-fallback: sign
-	@echo "=== functional: real vs fallback ==="
-	@./$(RVF) --dump
-	@echo ""
-	@echo "=== performance: real vs fallback ==="
-	@./$(RVF)
-
-# IMPORTANT: "baseline" runs use `env -u LD_PRELOAD` rather than assuming the
-# ambient shell has none set. Bitten by this once already during development
-# — an unrelated command (indirectly) left LD_PRELOAD exported pointing at a
-# *different*, unrelated preload library in a
-# long-lived shell, which silently made every "baseline" run in that shell
-# actually shimmed by something else, invalidating comparisons until caught.
-# `env -u` strips it for this one invocation regardless of shell state.
-smoke: sign
+# Baseline runs must not inherit an unrelated LD_PRELOAD from the shell.
+smoke: $(LIB) $(SMOKE)
+	$(call sign_files,$^)
 	@echo "=== baseline (no shim) ==="
 	@env -u LD_PRELOAD ./$(SMOKE) || true
 	@echo ""
 	@echo "=== with LD_PRELOAD=$(LIB) ==="
 	@env LD_PRELOAD=$(CURDIR)/$(LIB) ./$(SMOKE)
 
-functional: sign
+functional: $(LIB) $(FUNCTIONAL)
+	$(call sign_files,$^)
 	@echo "=== baseline (no shim) ==="
 	@env -u LD_PRELOAD ./$(FUNCTIONAL) || true
 	@echo ""
 	@echo "=== with LD_PRELOAD=$(LIB) ==="
 	@env LD_PRELOAD=$(CURDIR)/$(LIB) ./$(FUNCTIONAL)
 
-bench: sign
+bench: $(LIB) $(BENCH)
+	$(call sign_files,$^)
 	@echo "=== baseline (no shim) ==="
 	@env -u LD_PRELOAD ./$(BENCH) || true
 	@echo ""
 	@echo "=== with LD_PRELOAD=$(LIB) ==="
 	@env LD_PRELOAD=$(CURDIR)/$(LIB) ./$(BENCH)
 
-# check does its own `env -u LD_PRELOAD` equivalent internally (unsetenv at
-# startup, see src/ohos_compat_check.c) so this doesn't wrap it here -- but
-# do it anyway for defense in depth against a shell that has something else
-# entirely exported.
-check: sign
+real-vs-fallback: $(RVF)
+	$(call sign_files,$^)
+	@echo "=== functional: real vs fallback ==="
+	@./$(RVF) --dump
+	@echo ""
+	@echo "=== performance: real vs fallback ==="
+	@./$(RVF)
+
+# The checker clears LD_PRELOAD itself; keep the environment clean as well.
+check: $(CHECK) $(CHECKDEP)
+	$(call sign_files,$^)
 	@env -u LD_PRELOAD ./$(CHECK)
 
-# No LD_PRELOAD dichotomy: this drives the shim's internals directly, not
-# through libc symbol interposition (see the make-target comment above).
-ghost: sign
+# This deterministic state-machine test mocks epoll_pwait; it does not need
+# the shared library or LD_PRELOAD.
+ghost: $(GHOST)
+	$(call sign_files,$^)
 	@env -u LD_PRELOAD ./$(GHOST)
 
 clean:
-	rm -f $(LIB) $(CHECKDEP) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF) $(CHECK) $(GHOST)
+	rm -f $(ARTIFACTS)
