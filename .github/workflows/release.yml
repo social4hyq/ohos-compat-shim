@@ -2,7 +2,7 @@ name: Release
 
 # Fully cloud-built: no Homebrew formula, no self-hosted build runner. A
 # GitHub-hosted x86 runner cross-compiles libohos_compat.so with the OHOS
-# NDK clang and self-signs it with ohos-bst-light's self-sign.py (the
+# NDK clang and self-signs it with ohos-selfsign's self-sign.py (the
 # device-only binary-sign-tool/ohos-signpost don't run on a stock cloud
 # runner). Only the smoke-test step needs a real HarmonyOS device, since
 # the cloud runner can't execute an OHOS binary itself — that step gates

@@ -31,9 +31,9 @@
  * ONESHOT-enforcement cluster (epoll_ctl/epoll_wait/epoll_pwait; see that
  * section's own comment).
  *
- * close_range()/syscall(SYS_close_range) handling is adapted from
- * https://github.com/hqzing/close-range-shim (MIT), which established this
- * probe-then-fallback pattern for the same HarmonyOS seccomp behavior.
+ * close_range()/syscall(SYS_close_range) probes the native syscall and
+ * falls back to userspace handling when the operation is unavailable or
+ * blocked.
  *
  * Build: see ../Makefile (OHOS NDK clang, -shared -fPIC -ldl).
  * Usage: LD_PRELOAD=/path/to/libohos_compat.so <program> ...
@@ -339,8 +339,7 @@ static void ohos_shim_init_std_streams(void)
 /* ==================================================================== */
 /*  1. close_range() / syscall(SYS_close_range, ...)                    */
 /*     Probe-once + SIGSYS catch + userspace fallback via /proc/self/fd */
-/*     enumeration — pattern adapted from close-range-shim (MIT)        */
-/*     https://github.com/hqzing/close-range-shim.                      */
+/*     enumeration.                                                     */
 /*                                                                       */
 /*  IMPORTANT — confirmed on-device with a guarded standalone repro,    */
 /*  not just reading docs: syscall(SYS_close_range, ...) unconditionally */

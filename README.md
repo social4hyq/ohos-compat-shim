@@ -106,4 +106,4 @@ make clean
 
 ## License
 
-MIT，见 [LICENSE](LICENSE)。`close_range` 的探测后回退模式改编自 [close-range-shim](https://github.com/hqzing/close-range-shim)（MIT）；`scripts/ohos/self-sign.py` 引入自 [ohos-bst-light](https://github.com/hqzing/ohos-bst-light)（MIT）。
+BSD Zero Clause License (0BSD)，见 [LICENSE](LICENSE)。`scripts/ohos/self-sign.py` 来自 [hqzing/ohos-selfsign](https://github.com/hqzing/ohos-selfsign)，同样采用 0BSD。

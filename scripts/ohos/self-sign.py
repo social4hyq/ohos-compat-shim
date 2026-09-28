@@ -3,7 +3,7 @@
 """
 self-sign.py — OpenHarmony ELF self-signing implementation (Python 3, hashlib only)
 
-Vendored from https://github.com/hqzing/ohos-bst-light (MIT License).
+Vendored from https://github.com/hqzing/ohos-selfsign (0BSD License).
 Signs cross-compiled OHOS aarch64 ELF/.so/.node files on cloud x86 CI runners,
 without the device-only binary-sign-tool / ohos-signpost.
 

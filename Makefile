@@ -97,7 +97,7 @@ real-vs-fallback: sign
 # IMPORTANT: "baseline" runs use `env -u LD_PRELOAD` rather than assuming the
 # ambient shell has none set. Bitten by this once already during development
 # — an unrelated command (indirectly) left LD_PRELOAD exported pointing at a
-# *different* preload library (the older, narrower close-range-shim) in a
+# *different*, unrelated preload library in a
 # long-lived shell, which silently made every "baseline" run in that shell
 # actually shimmed by something else, invalidating comparisons until caught.
 # `env -u` strips it for this one invocation regardless of shell state.
