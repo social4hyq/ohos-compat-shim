@@ -13,26 +13,23 @@
  * dynamically-linked libc symbol (syscall(), getpwuid_r(), tmpfile(), ...).
  * Code that issues the syscall via inline assembly (e.g. Bun's rustix
  * `linux_raw` backend for openat2/epoll_pwait2) never touches these symbols
- * and cannot be reached by LD_PRELOAD interposition — see
- * docs/ohos-preload-shim-feasibility.md for the full matrix. Nothing here
- * replaces a source-level port; it only helps *prebuilt* dynamic-musl
- * binaries survive the sandbox without a rebuild.
+ * and cannot be reached by LD_PRELOAD interposition — see the sibling
+ * ohos-preflight repo's docs/ohos-preload-shim-feasibility.md for the full
+ * matrix. Nothing here replaces a source-level port; it only helps
+ * *prebuilt* dynamic-musl binaries survive the sandbox without a rebuild.
  *
  * Design rule for every intercepted symbol: resolve the real implementation
- * via dlsym(RTLD_NEXT, ...) first and prefer it. Only fall back when the real
- * call fails with the specific HarmonyOS-sandbox symptom (SIGSYS / ENOENT /
- * EPERM as documented per-symbol below). For getpwuid_r/tmpfile/getcwd this
- * makes the shim a safe no-op on any target where the real call already
- * works — confirmed on-device. close_range is the one exception: on-device
- * testing found that close_range() unconditionally raises SIGSYS on real
- * HarmonyOS hardware for every parameter combination tried, independent of
- * whether this (or any) library is preloaded — matching ohos-preflight's
- * own a10_close_range probe (OH-container pass, HM-device fail) from the
- * start. So the probe-then-fallback path below always lands on the
- * fallback on this class of device; see the detailed note above
- * close_range's probe for the full story (including a testing-methodology
- * lesson: verify baseline behavior with `env -u LD_PRELOAD`, never trust a
- * shell's ambient environment).
+ * via dlsym(RTLD_NEXT, ...) first and prefer it. Most fall back only when
+ * the real call fails with the specific HarmonyOS-sandbox symptom (SIGSYS /
+ * ENOENT / EPERM as documented per-symbol below), making the shim a safe
+ * no-op on any target where the real call already works. Two exceptions
+ * never take that probe-first path because their symptom is a real,
+ * consistently-reproducing kernel behavior rather than something to detect
+ * per call: close_range()/syscall(SYS_close_range) (unconditional SIGSYS on
+ * this class of device, independent of whether anything is preloaded —
+ * matching ohos-preflight's own a10_close_range probe) and the epoll_pipe
+ * ONESHOT-enforcement cluster (epoll_ctl/epoll_wait/epoll_pwait; see that
+ * section's own comment).
  *
  * close_range()/syscall(SYS_close_range) handling is adapted from
  * https://github.com/hqzing/close-range-shim (MIT), which established this
@@ -43,13 +40,13 @@
  *
  * Runtime toggles (comma-separated symbol names):
  *   OHOS_COMPAT_SHIM_DISABLE — turn OFF a default-on interceptor
- *                              (close_range, getpwuid_r, tmpfile, getcwd,
- *                               fchmodat2, link, linkat, symlinkat, splice,
- *                               epoll_pipe, getaddrinfo)
+ *                              (close_range, getpwuid_r, tmpfile,
+ *                               fchmodat2, link, linkat, splice,
+ *                               epoll_pipe, getaddrinfo, std_streams)
  *
  * Deliberately NOT implemented: pthread_cancel (musl stub is a no-op;
  * emulating cancellation needs cooperative checkpoints in the target
- * program, which a preload shim cannot inject). See README TODO.
+ * program, which a preload shim cannot inject).
  */
 
 #define _GNU_SOURCE
@@ -136,15 +133,13 @@ enum {
 	SD_CLOSE_RANGE = 1 << 0,
 	SD_GETPWUID_R  = 1 << 1,
 	SD_TMPFILE     = 1 << 2,
-	SD_GETCWD      = 1 << 3,
-	SD_FCHMODAT2   = 1 << 4,
-	SD_LINKAT      = 1 << 5,
-	SD_SYMLINKAT   = 1 << 6,
-	SD_SPLICE      = 1 << 7,
-	SD_EPOLL_PIPE  = 1 << 8,
-	SD_GETADDRINFO = 1 << 9,
-	SD_LINK        = 1 << 10,
-	SD_STD_STREAMS = 1 << 11,
+	SD_FCHMODAT2   = 1 << 3,
+	SD_LINKAT      = 1 << 4,
+	SD_SPLICE      = 1 << 5,
+	SD_EPOLL_PIPE  = 1 << 6,
+	SD_GETADDRINFO = 1 << 7,
+	SD_LINK        = 1 << 8,
+	SD_STD_STREAMS = 1 << 9,
 };
 
 static int g_disable_mask = -1;
@@ -161,14 +156,10 @@ static void parse_toggle_masks(void)
 		d |= SD_GETPWUID_R;
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "tmpfile"))
 		d |= SD_TMPFILE;
-	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "getcwd"))
-		d |= SD_GETCWD;
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "fchmodat2"))
 		d |= SD_FCHMODAT2;
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "linkat"))
 		d |= SD_LINKAT;
-	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "symlinkat"))
-		d |= SD_SYMLINKAT;
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "splice"))
 		d |= SD_SPLICE;
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "epoll_pipe"))
@@ -182,34 +173,15 @@ static void parse_toggle_masks(void)
 	g_disable_mask = d; /* set last: non-negative value doubles as "done" */
 }
 
-static int shim_disabled(const char *name)
+/* Takes the SD_* bit directly rather than a name string: every call site
+ * knows its own toggle at compile time, so there is no reason to pay a
+ * string-compare chain on what is often a hot path (syscall()'s dispatcher
+ * runs this on every raw syscall the process makes once this library is
+ * preloaded). */
+static int shim_disabled(int bit)
 {
 	parse_toggle_masks();
-	if (strcmp(name, "close_range") == 0)
-		return !!(g_disable_mask & SD_CLOSE_RANGE);
-	if (strcmp(name, "getpwuid_r") == 0)
-		return !!(g_disable_mask & SD_GETPWUID_R);
-	if (strcmp(name, "tmpfile") == 0)
-		return !!(g_disable_mask & SD_TMPFILE);
-	if (strcmp(name, "getcwd") == 0)
-		return !!(g_disable_mask & SD_GETCWD);
-	if (strcmp(name, "fchmodat2") == 0)
-		return !!(g_disable_mask & SD_FCHMODAT2);
-	if (strcmp(name, "linkat") == 0)
-		return !!(g_disable_mask & SD_LINKAT);
-	if (strcmp(name, "symlinkat") == 0)
-		return !!(g_disable_mask & SD_SYMLINKAT);
-	if (strcmp(name, "splice") == 0)
-		return !!(g_disable_mask & SD_SPLICE);
-	if (strcmp(name, "epoll_pipe") == 0)
-		return !!(g_disable_mask & SD_EPOLL_PIPE);
-	if (strcmp(name, "getaddrinfo") == 0)
-		return !!(g_disable_mask & SD_GETADDRINFO);
-	if (strcmp(name, "link") == 0)
-		return !!(g_disable_mask & SD_LINK);
-	if (strcmp(name, "std_streams") == 0)
-		return !!(g_disable_mask & SD_STD_STREAMS);
-	return 0;
+	return !!(g_disable_mask & bit);
 }
 
 
@@ -226,11 +198,21 @@ static int shim_disabled(const char *name)
  * self-copy that leaves the slot at its .bss initial value NULL. The first
  * stdio call (e.g. bun's setvbuf(stdout, NULL, _IOLBF, 0)) then dies in
  * the hardened libc assert "setvbuf: parameter is null". Verified against
- * the official claude-code 2.1.229-2.1.233 linux-arm64-musl binaries.
+ * official prebuilt claude-code linux-arm64-musl binaries.
  *
- * Fix: at load time, scan the main executable's .rela.dyn for COPY relocs
- * against those three names and write libc's real FILE* into each NULL
- * slot. Pure no-op for executables without such relocations.
+ * This constructor scans the main executable's .rela.dyn for COPY relocs
+ * against those three names and writes libc's real FILE* into each NULL
+ * slot found (pure no-op for executables without such relocations). That
+ * patch is confirmed to make the crash go away when this .so is preloaded.
+ * What is NOT confirmed: that this patch is the (or the only) reason —
+ * disabling it via OHOS_COMPAT_SHIM_DISABLE=std_streams, and even building
+ * a stripped-down .so with none of this file's other interceptors, still
+ * avoided the crash in testing, while a truly minimal preload .so did not.
+ * Something about this file's full symbol table/relocation footprint
+ * appears to matter independent of this constructor's own logic, and that
+ * mechanism was not further isolated. Kept as the one documented, coded
+ * fix rather than removed, since it is correct and harmless on its own
+ * terms even if it isn't the full explanation.
  */
 
 #define OHOS_R_AARCH64_COPY 1024
@@ -316,7 +298,7 @@ static void *std_streams_libc_file(const char *name)
 __attribute__((constructor))
 static void ohos_shim_init_std_streams(void)
 {
-	if (shim_disabled("std_streams"))
+	if (shim_disabled(SD_STD_STREAMS))
 		return;
 
 	struct std_fixup f[3] = {
@@ -710,7 +692,7 @@ int close_range(unsigned int first, unsigned int last, unsigned int flags)
 	 * skipping our own EINVAL validation above. No probe, no fallback
 	 * safety net: if the real call gets SIGSYS'd, so does the caller,
 	 * exactly matching genuine no-shim behavior. */
-	if (shim_disabled("close_range")) {
+	if (shim_disabled(SD_CLOSE_RANGE)) {
 		return (int)cr_real_syscall(__NR_close_range, (long)first,
 					    (long)last, (long)flags, 0, 0, 0);
 	}
@@ -753,7 +735,7 @@ long syscall(long number, ...)
 	a5 = va_arg(ap, long);
 	va_end(ap);
 
-	if (number == __NR_close_range && !shim_disabled("close_range")) {
+	if (number == __NR_close_range && !shim_disabled(SD_CLOSE_RANGE)) {
 		unsigned int first = (unsigned int)a0;
 		unsigned int last = (unsigned int)a1;
 		unsigned int flags = (unsigned int)a2;
@@ -762,7 +744,7 @@ long syscall(long number, ...)
 		return cr_dispatch(first, last, flags);
 	}
 
-	if (number == __NR_fchmodat2 && !shim_disabled("fchmodat2")) {
+	if (number == __NR_fchmodat2 && !shim_disabled(SD_FCHMODAT2)) {
 		return fc2_dispatch((int)a0, (const char *)a1, (mode_t)a2, (int)a3);
 	}
 
@@ -771,7 +753,7 @@ long syscall(long number, ...)
 	 * so the epoll_ctl() override below never sees those calls. Route
 	 * them through the same registry bookkeeping here. cr_real_syscall
 	 * is libc's syscall(): libc-convention return, errno set on -1. */
-	if (number == __NR_epoll_ctl && !shim_disabled("epoll_pipe")) {
+	if (number == __NR_epoll_ctl && !shim_disabled(SD_EPOLL_PIPE)) {
 		return ep_shim_ctl_done(
 			(int)cr_real_syscall(__NR_epoll_ctl, a0, a1, a2, a3, 0, 0),
 			(int)a0, (int)a1, (int)a2, (struct epoll_event *)a3);
@@ -913,7 +895,7 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
 	if (!real)
 		real = (getpwuid_r_fn)dlsym(RTLD_NEXT, "getpwuid_r");
 
-	if (!shim_disabled("getpwuid_r") && real) {
+	if (!shim_disabled(SD_GETPWUID_R) && real) {
 		int rc = real(uid, pwd, buf, buflen, result);
 		if (rc == 0 && *result != NULL)
 			return 0; /* real lookup succeeded, use it */
@@ -923,7 +905,7 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
 		return real(uid, pwd, buf, buflen, result);
 	}
 
-	if (shim_disabled("getpwuid_r")) {
+	if (shim_disabled(SD_GETPWUID_R)) {
 		*result = NULL;
 		return ENOENT;
 	}
@@ -1000,23 +982,32 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
 }
 
 /* ==================================================================== */
-/*  2b. getaddrinfo() — HarmonyOS's AI_ADDRCONFIG wrongly filters IPv4   */
-/*     loopback: on a host with no global IPv4, "localhost" resolves to  */
-/*     ::1 only, so Happy-Eyeballs callers (autoSelectFamily) have no    */
-/*     IPv4 address to fall back to when ::1 refuses. When the real      */
-/*     call with AI_ADDRCONFIG yields only IPv6-loopback results, redo   */
-/*     the query without AI_ADDRCONFIG and append the AF_INET entries.   */
-/*     (bun T49; verified against OHOS_TEST_STATUS.md's probe chain.)    */
+/*  2b. getaddrinfo() — a hostname with characters outside the DNS/       */
+/*     hostname alphabet is forwarded to the network instead of          */
+/*     rejected locally, so a lookup that should fail instantly          */
+/*     (EAI_NONAME) instead blocks for a full resolver timeout (several  */
+/*     seconds, observed). Probed once per process in a background       */
+/*     thread, never on the caller's path: if the real resolver already  */
+/*     rejects a synthetic invalid hostname fast, this interceptor       */
+/*     becomes a pure passthrough for the rest of the process's life.    */
+/*     Until the probe resolves (or if it confirms the slow behavior),   */
+/*     a local syntax pre-check matching glibc's accepted alphabet       */
+/*     stands in. Disable via OHOS_COMPAT_SHIM_DISABLE=getaddrinfo       */
+/*     (skips both the probe and the pre-check).                        */
 /* ==================================================================== */
 
 typedef int (*getaddrinfo_fn)(const char *, const char *,
 			      const struct addrinfo *, struct addrinfo **);
 
-/* glibc getaddrinfo rejects names with characters outside the DNS/hostname
- * alphabet locally (EAI_NONAME); HarmonyOS's resolver forwards them to the
- * network where they hang until timeout (~4s observed). That kills tests and
- * code that rely on a fast local reject (bun's udp_socket "bind fails" case
- * does it 200 times). Match glibc: fail fast, no network round-trip. */
+static getaddrinfo_fn g_real_getaddrinfo;
+
+static getaddrinfo_fn gai_real(void)
+{
+	if (!g_real_getaddrinfo)
+		g_real_getaddrinfo = (getaddrinfo_fn)dlsym(RTLD_NEXT, "getaddrinfo");
+	return g_real_getaddrinfo;
+}
+
 static int hostname_has_invalid_chars(const char *node)
 {
 	for (const unsigned char *p = (const unsigned char *)node; *p; p++) {
@@ -1030,105 +1021,74 @@ static int hostname_has_invalid_chars(const char *node)
 	return 0;
 }
 
+/* 0 = still checking (safe default: the local pre-check stays active);
+ * 1 = this host's real resolver already rejects fast, confirmed by the
+ * probe thread -- never reset back to 0 once set. */
+static _Atomic int g_gai_native_rejects_fast = 0;
+static _Atomic int g_gai_probe_launched = 0;
+
+/* GAI_PROBE_SLOW_MS is deliberately generous: it only has to tell "rejected
+ * locally, no network touched" (single-digit to double-digit ms, measured)
+ * apart from "forwarded to the network" (multi-second timeout, measured) --
+ * not chase a tight bound. */
+#define GAI_PROBE_SLOW_MS 500
+
+static void *gai_probe_thread(void *arg)
+{
+	(void)arg;
+	struct addrinfo hints = { 0 };
+	struct addrinfo *res = NULL;
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	int rc = gai_real()("bad host!", NULL, &hints, &res);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	if (rc == 0)
+		freeaddrinfo(res);
+	long ms = (t1.tv_sec - t0.tv_sec) * 1000 +
+		 (t1.tv_nsec - t0.tv_nsec) / 1000000;
+	if (rc != 0 && ms < GAI_PROBE_SLOW_MS)
+		atomic_store_explicit(&g_gai_native_rejects_fast, 1,
+				      memory_order_release);
+	return NULL;
+}
+
+/* Launched from the first getaddrinfo() call this process ever makes, not
+ * from a library-load constructor: a constructor would race the host
+ * program's own startup for no benefit, since nothing needs the answer
+ * until the first real lookup. Detached and fire-and-forget -- the result
+ * is read via the atomic above, never joined. */
+static void gai_probe_launch_once(void)
+{
+	if (atomic_exchange_explicit(&g_gai_probe_launched, 1,
+				     memory_order_acq_rel))
+		return;
+	pthread_t th;
+	if (pthread_create(&th, NULL, gai_probe_thread, NULL) == 0)
+		pthread_detach(th);
+}
+
 int getaddrinfo(const char *node, const char *service,
 		const struct addrinfo *hints, struct addrinfo **res)
 {
-	static getaddrinfo_fn real = NULL;
-	if (!real)
-		real = (getaddrinfo_fn)dlsym(RTLD_NEXT, "getaddrinfo");
+	getaddrinfo_fn real = gai_real();
 	if (!real) {
 		errno = ENOSYS;
 		return EAI_SYSTEM;
 	}
+	if (shim_disabled(SD_GETADDRINFO))
+		return real(node, service, hints, res);
 
-	if (!shim_disabled("getaddrinfo") && node && *node &&
-	    hostname_has_invalid_chars(node))
+	gai_probe_launch_once();
+	if (!atomic_load_explicit(&g_gai_native_rejects_fast, memory_order_acquire) &&
+	    node && *node && hostname_has_invalid_chars(node))
 		return EAI_NONAME;
 
-	int rc = real(node, service, hints, res);
-
-	if (getenv("OHOS_GAI_DEBUG"))
-		fprintf(stderr,
-			"[gai-shim] node=%s flags=0x%x family=%d socktype=%d rc=%d\n",
-			node ? node : "(null)", hints ? hints->ai_flags : -1,
-			hints ? hints->ai_family : -1, hints ? hints->ai_socktype : -1,
-			rc);
-
-	if (shim_disabled("getaddrinfo") || rc != 0 || !hints || !node ||
-	    !(hints->ai_flags & AI_ADDRCONFIG))
-		return rc;
-
-	/* Only the broken case: every returned address is IPv6 loopback
-	 * (and there is at least one). Anything else passes through. */
-	int n = 0, all_v6_loopback = 1;
-	for (struct addrinfo *ai = *res; ai; ai = ai->ai_next) {
-		n++;
-		if (ai->ai_family != AF_INET6 ||
-		    ai->ai_addrlen < sizeof(struct sockaddr_in6) ||
-		    !IN6_IS_ADDR_LOOPBACK(
-			    &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr)) {
-			all_v6_loopback = 0;
-			break;
-		}
-	}
-	if (n == 0 || !all_v6_loopback) {
-		if (getenv("OHOS_GAI_DEBUG"))
-			fprintf(stderr, "[gai-shim] merge skipped: n=%d all_v6_lb=%d\n",
-				n, all_v6_loopback);
-		return rc;
-	}
-
-	struct addrinfo hints2 = *hints;
-	hints2.ai_flags &= ~AI_ADDRCONFIG;
-	/* Force AF_INET for the retry: an AF_UNSPEC no-ADDRCONFIG query on this
-	 * resolver can still come back v6-only (it is stateful), but an explicit
-	 * AF_INET query for a loopback name is answered from /etc/hosts. */
-	hints2.ai_family = AF_INET;
-	struct addrinfo *res2 = NULL;
-	if (real(node, service, &hints2, &res2) != 0) {
-		if (getenv("OHOS_GAI_DEBUG"))
-			fprintf(stderr, "[gai-shim] retry failed\n");
-		return rc; /* retry failed: keep the original (broken) answer */
-	}
-	if (getenv("OHOS_GAI_DEBUG"))
-		fprintf(stderr, "[gai-shim] retry ok, substituting\n");
-
-	/* Do NOT splice res2's nodes onto *res's tail: this shim does not
-	 * interpose freeaddrinfo(), so whatever list *res ends up pointing to
-	 * is freed by the real, unmodified musl freeaddrinfo() later. musl
-	 * allocates one contiguous `struct aibuf` array per getaddrinfo()
-	 * call and derives that block's base address (and the amount to
-	 * decrement its refcount by) from the LAST node in the list it is
-	 * asked to free -- see musl's freeaddrinfo.c:
-	 *   for (cnt=1; p->ai_next; cnt++, p=p->ai_next);
-	 *   struct aibuf *b = (void *)((char *)p - offsetof(struct aibuf, ai));
-	 *   b -= b->slot;
-	 *   if (!(b->ref -= cnt)) free(b);
-	 * A list spanning *res's original block and res2's block breaks that
-	 * invariant both ways: freeaddrinfo(*res) would derive `b` from
-	 * res2's block (since it's now the tail) and decrement its ref by
-	 * the *combined* node count (underflowing it -- res2's block would
-	 * never reach ref==0 and never get freed), while *res's own block is
-	 * never freed at all (nothing ever computes its base to free it) --
-	 * a guaranteed leak of *res's original allocation plus permanently
-	 * corrupted refcount metadata on res2's, on every AI_ADDRCONFIG
-	 * IPv6-loopback-only lookup this repairs. Caught by the 2026-08-18
-	 * shim validation pass; verified against musl's actual freeaddrinfo
-	 * source, not just its header-declared contract.
-	 *
-	 * The original *res is IPv6-loopback-only, i.e. useless to the
-	 * caller by construction (that's the whole reason this retry ran) --
-	 * so simply discarding it and returning res2 (a single, genuine,
-	 * unmodified musl allocation) in its place is both safe *and*
-	 * functionally equivalent to what the merge was trying to achieve. */
-	freeaddrinfo(*res);
-	*res = res2;
-	return rc;
+	return real(node, service, hints, res);
 }
 
 /* ==================================================================== */
 /*  3. tmpfile() — P_tmpdir is unwritable in the HarmonyOS app sandbox;  */
-/*     fall back to an unlinked file under $HOME.                       */
+/*     fall back to an unlinked file under $TMPDIR (or $HOME if unset). */
 /* ==================================================================== */
 
 typedef FILE *(*tmpfile_fn)(void);
@@ -1139,7 +1099,7 @@ FILE *tmpfile(void)
 	if (!real)
 		real = (tmpfile_fn)dlsym(RTLD_NEXT, "tmpfile");
 
-	if (!shim_disabled("tmpfile") && real) {
+	if (!shim_disabled(SD_TMPFILE) && real) {
 		FILE *f = real();
 		if (f)
 			return f;
@@ -1148,7 +1108,7 @@ FILE *tmpfile(void)
 		return real();
 	}
 
-	if (shim_disabled("tmpfile"))
+	if (shim_disabled(SD_TMPFILE))
 		return NULL;
 
 	const char *dir = getenv("TMPDIR");
@@ -1179,96 +1139,13 @@ FILE *tmpfile(void)
 	return f;
 }
 
-/* ==================================================================== */
-/*  4. getcwd() — cwd removed out from under the process (lifecycle      */
-/*     scripts, `rm -rf` of a worktree) returns ENOENT on both OH and    */
-/*     HM; fall back to $HOME so callers get a valid path instead of     */
-/*     erroring out entirely. Default ON, opt-out via                   */
-/*     OHOS_COMPAT_SHIM_DISABLE=getcwd.                                 */
-/* ==================================================================== */
-
-/* Copy a NUL-terminated cwd candidate into the caller's buffer (or a freshly
- * malloc'd one when buf==NULL, per getcwd(3)'s GNU auto-allocate extension),
- * honoring the size/ERANGE contract. Returns buf/out on success, NULL+ERANGE
- * on a too-small caller buffer, NULL+ENOMEM on malloc failure. */
-static char *cwd_copy_out(const char *src, char *buf, size_t size)
-{
-	size_t need = strlen(src) + 1;
-	if (buf) {
-		if (size < need) {
-			errno = ERANGE;
-			return NULL;
-		}
-		memcpy(buf, src, need);
-		return buf;
-	}
-	size_t alloc_size = size ? size : need;
-	if (alloc_size < need) {
-		errno = ERANGE;
-		return NULL;
-	}
-	char *out = malloc(alloc_size);
-	if (!out)
-		return NULL;
-	memcpy(out, src, need);
-	return out;
-}
-
-typedef char *(*getcwd_fn)(char *, size_t);
-
-char *getcwd(char *buf, size_t size)
-{
-	static getcwd_fn real = NULL;
-	if (!real)
-		real = (getcwd_fn)dlsym(RTLD_NEXT, "getcwd");
-
-	char *r = real ? real(buf, size) : NULL;
-	if (r || shim_disabled("getcwd"))
-		return r;
-	/* Only engage the fallback on "couldn't resolve the cwd" errors (EACCES:
-	 * an ancestor lacks +x on hmdfs/tmpfs; ENOENT: cwd rmdir'd). Argument/
-	 * buffer errors (EINVAL size=0, ERANGE buf-too-small, EFAULT) must pass
-	 * through untouched so callers see the real errno. */
-	if (errno != EACCES && errno != ENOENT)
-		return r;
-	/* getcwd()'s userspace parent-walk (readdir("..") up to /) needs +x on
-	 * every ancestor; HarmonyOS sandbox dirs on hmdfs/tmpfs and rmdir'd
-	 * cwds trip it with EACCES/ENOENT. The kernel still knows the real cwd:
-	 * /proc/self/cwd is resolved server-side via d_path() with NO userspace
-	 * permission check, so it succeeds exactly where getcwd()'s walk fails
-	 * and yields the REAL cwd — what bash and lifecycle scripts actually
-	 * need, not a $HOME guess. (This is what lets bun drop its ohos_set_pwd
-	 * / cd-prefix workarounds once the shim is preloaded.) */
-	char proc_buf[PATH_MAX];
-	ssize_t n = readlink("/proc/self/cwd", proc_buf, sizeof(proc_buf) - 1);
-	if (n > 0) {
-		proc_buf[n] = '\0';
-		struct stat st;
-		/* Trust the kernel-reported path unless it is provably gone: stat
-		 * ENOENT means the cwd was rmdir'd (a dangling path is worse than
-		 * $HOME), so fall through. Any other stat outcome (success, or an
-		 * EACCES on an ancestor that doesn't invalidate the path) keeps it. */
-		if (stat(proc_buf, &st) == 0 || errno != ENOENT)
-			return cwd_copy_out(proc_buf, buf, size);
-	}
-
-	/* Last resort: somewhere valid so the caller doesn't hard-crash. */
-	const char *home = getenv("HOME");
-	if (!home)
-		home = "/data/storage/el2/base";
-	return cwd_copy_out(home, buf, size);
-}
 
 /* ==================================================================== */
-/*  5. linkat()/symlinkat() — sandboxed target dirs return EPERM/EACCES  */
-/*     for hardlinks; fall back to a byte copy (linkat) or, for          */
-/*     symlinkat, a copy of the link *target file* when it exists.      */
-/*     Semantically lossy (loses hardlink/symlink identity — a later     */
-/*     symlink target cannot be copied). Default ON since 0.2.0 (bun          */
-/*     install needs hardlinks and the sandbox blocks the real linkat         */
-/*     for all apps). Disable individually via                                */
-/*     OHOS_COMPAT_SHIM_DISABLE=linkat,symlinkat if true link semantics       */
-/*     matter for your workload.                                              */
+/*  5. linkat() — sandboxed target dirs return EPERM/EACCES for          */
+/*     hardlinks; fall back to a byte copy. Semantically lossy (loses    */
+/*     hardlink identity: the copy is a separate inode, not a second     */
+/*     name for the same one). Disable via OHOS_COMPAT_SHIM_DISABLE=     */
+/*     linkat if true hardlink semantics matter for your workload.       */
 static int copy_fd_contents(int src_fd, int dst_fd)
 {
 	char buf[65536];
@@ -1405,20 +1282,11 @@ typedef ssize_t (*splice_fn)(int, off_t *, int, off_t *, size_t, unsigned int);
  * A reader blocked in read() is woken correctly, which is why the defect
  * hides behind anything that reads synchronously.
  *
- * Measured with a standalone probe (no Bun involved), waiter blocked
- * first, 4096 bytes sent 300ms later:
- *
- *   waiter        fed by splice()        fed by write()
- *   poll          2000ms timeout         woken in 300ms
- *   epoll LT      2000ms timeout         woken in 301ms
- *   epoll ET      2000ms timeout         woken in 301ms
- *   read          woken in 301ms         woken in 301ms
- *
  * It deadlocks any pipeline whose consumer polls: GNU cat feeds stdout
  * with splice() when it is a pipe, so `cat big | bun script.js` hangs
- * forever -- Bun sits in epoll_wait, cat fills the 512KB pipe and then
- * blocks in splice() too. `cat big | wc -c` is fine (wc blocks in read),
- * and `dd ... | bun script.js` is fine (dd uses write).
+ * forever -- Bun sits in epoll_wait, cat fills the pipe and then blocks
+ * in splice() too. `cat big | wc -c` is fine (wc blocks in read), and
+ * `dd ... | bun script.js` is fine (dd uses write).
  *
  * Fix: when the destination is a pipe, move the bytes through a userspace
  * buffer so the pipe is fed by write(), whose wakeup works. That costs one
@@ -1427,11 +1295,10 @@ typedef ssize_t (*splice_fn)(int, off_t *, int, off_t *, size_t, unsigned int);
  *
  * Holding the last byte back and sending only that one with write() would
  * have kept the zero-copy bulk transfer, and a probe confirmed it wakes the
- * poller -- but it does not survive the real case: cat asks for 524288
- * bytes into a 512KB pipe, splice fills the pipe and returns short, and the
- * trailing write() is never reached. A wakeup scheme that fails exactly
- * when the pipe is full is no use, since that is when the reader is
- * guaranteed to be waiting.
+ * poller -- but it does not survive the real case: a full-pipe splice
+ * returns short, and the trailing write() is never reached. A wakeup
+ * scheme that fails exactly when the pipe is full is no use, since that is
+ * when the reader is guaranteed to be waiting.
  */
 #ifndef SPLICE_F_NONBLOCK
 #define SPLICE_F_NONBLOCK 2
@@ -1444,22 +1311,16 @@ static int splice_fd_is_fifo(int fd)
 }
 
 /*
- * splice_fd_is_fifo() is called on every idle fd on every poll()/ppoll()
- * return while epoll_pipe is enabled (ep_shim_patch_pollfds() below) -- an
- * uncached fstat() there is the dominant measured cost of that interceptor
- * (2026-08-18 validation pass: test/bench.c measured +115.7us/call at 128
- * idle fds). Cache the result per fd, direct-mapped by fd number so a hit
- * is a single atomic load, no lock: a slot holding a *different* fd (or an
- * empty slot) is simply treated as a cache miss and falls through to the
+ * Cache splice_fd_is_fifo()'s result per fd, direct-mapped by fd number so a
+ * hit is a single atomic load, no lock: a slot holding a *different* fd (or
+ * an empty slot) is simply treated as a cache miss and falls through to the
  * real fstat() -- a wrong/stale hit is structurally impossible, only a
- * missed opportunity to skip the syscall. That means correctness rests
- * entirely on invalidating a slot whenever its fd number can start meaning
- * a different file, which is why every place that can do that --
- * close(fd), dup2/dup3(_, newfd), and the raw-syscall paths bun's Rust
- * event loop uses instead of those libc symbols -- calls
- * shim_forget_fd() below before the fd changes meaning. (This closes the
- * same class of staleness the pre-existing g_ep_pipes registry only
- * partially guarded against via close() alone; see shim_forget_fd().)
+ * missed opportunity to skip the syscall. Correctness rests entirely on
+ * invalidating a slot whenever its fd number can start meaning a different
+ * file, which is why every place that can do that -- close(fd),
+ * dup2/dup3(_, newfd), and the raw-syscall paths bun's Rust event loop uses
+ * instead of those libc symbols -- calls shim_forget_fd() below before the
+ * fd changes meaning.
  *
  * Slot encoding: 0 = empty. A live entry is ((fd+1) << 1) | is_fifo, so
  * fd 0 (often stdin) is representable and distinct from "empty".
@@ -1606,14 +1467,14 @@ ssize_t splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
 	/* off_out must be NULL when the destination is a pipe (kernel rule);
 	   testing it as well keeps this path off any call the kernel would
 	   have rejected anyway. */
-	if (len > 0 && off_out == NULL && !shim_disabled("splice") &&
+	if (len > 0 && off_out == NULL && !shim_disabled(SD_SPLICE) &&
 	    splice_fd_is_fifo_cached(fd_out))
 		return splice_through_buffer(fd_in, off_in, fd_out, len, flags);
 
 	ssize_t rc = real(fd_in, off_in, fd_out, off_out, len, flags);
 	if (rc >= 0 || errno != EPIPE)
 		return rc;
-	if (shim_disabled("splice"))
+	if (shim_disabled(SD_SPLICE))
 		return rc;
 
 	int saved = errno;
@@ -1635,64 +1496,44 @@ ssize_t splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
 }
 
 /* ==================================================================== */
-/*  epoll/poll pipe-readiness repair (OHOS_TEST_STATUS.md T50)          */
+/*  epoll_pipe: EPOLLONESHOT is not honored for EPOLLOUT registrations   */
 /* ==================================================================== */
 /*
- * Third pipe defect on HarmonyOS, distinct from the two splice() ones
- * above: a shell-created pipe (e.g. `cat big | bun script.js`) can lose
- * its read-readiness *state* entirely. Bytes sit in the pipe buffer
- * (FIONREAD reports them), but poll() and epoll_wait() -- even a freshly
- * created epoll instance registering the fd for the first time -- report
- * the fd as not-readable, and stay wrong after bytes are drained. Node.js
- * as the reader hangs the same way, so this is a kernel pipe-state bug,
- * not a Bun one. The repro rate tracks system load (near 100% under
- * memory pressure, sporadic when idle).
+ * This kernel ignores EPOLLONESHOT's auto-disarm for a FIFO write end or a
+ * PTY/TTY fd registered with EPOLLOUT|EPOLLONESHOT (detected via TCGETS,
+ * the same probe isatty(3) uses): after the first delivery, which should be
+ * the only one until an explicit re-arm, the kernel keeps re-delivering the
+ * same event on every subsequent epoll_wait/epoll_pwait -- observed at
+ * several hundred thousand pure-EPOLLOUT returns per second on an idle
+ * interactive session, pinning a core. Detection is TCGETS for TTYs and
+ * S_ISFIFO for pipes; sockets, eventfd/signalfd/timerfd, and other anon
+ * inodes are never eligible.
  *
- * Bun cannot avoid the affected object -- the shell owns the write end --
- * so this shim repairs readiness in userspace:
+ * Repair: the first delivery for a tracked entry passes through untouched
+ * (matches a compliant kernel) and marks the entry disarmed; every
+ * subsequent delivery for that entry is stripped from the returned event
+ * array (see ep_shim_after_wait_ex()) and the entry is also removed
+ * kernel-side (EPOLL_CTL_DEL) so the kernel stops re-delivering it, not
+ * just this shim. A later ADD/MOD from the application re-arms it (see
+ * ep_shim_ctl_done()'s ENOENT translation, for a kernel where DEL on this
+ * exact registration itself returns ENOENT despite still listing the fd in
+ * /proc/self/fdinfo -- del_tried caps that one failing attempt to once per
+ * arm instead of retrying it on every re-fire).
  *
- *   epoll_ctl(ADD/MOD)  remember (epfd, fd, event) for FIFO fds whose
- *                       mask asks for EPOLLIN; DEL forgets. Calls arrive
- *                       both via the libc symbol (usockets) and via raw
- *                       syscall(SYS_epoll_ctl) (Bun's Rust event loop) --
- *                       the syscall() override above funnels the latter
- *                       into the same bookkeeping.
- *   epoll_wait/pwait    when any pipe is registered on this epfd, poll
- *                       internally in EP_PIPE_POLL_MS slices and, on an
- *                       empty return, FIONREAD each registered pipe and
- *                       synthesize EPOLLIN with the registered udata for
- *                       those with bytes pending. The slicing is HIDDEN
- *                       from the caller: an empty slice is answered by
- *                       re-waiting, never by returning 0, until the
- *                       caller's own timeout genuinely expires (an
- *                       infinite wait must only return with an event or
- *                       signal — libuv's uv__io_poll asserts exactly
- *                       that, and the leaked premature 0 crashed pnpm
- *                       with SIGABRT).
- *   poll/ppoll          after the real call, patch revents for FIFO fds
- *                       that asked for POLLIN, reported nothing, yet
- *                       have bytes pending (covers is_readable paths).
- *   close               drop registry entries naming the closing fd
- *                       (whether it was an epfd or a pipe), so a reused
- *                       fd number never inherits stale udata.
+ * A second, narrower case: some EPOLLOUT|EPOLLONESHOT registrations are
+ * armed through a path this shim never sees at all (e.g. Bun's Rust event
+ * loop issuing epoll_ctl via a raw inlined syscall), so no registry entry
+ * ever exists for them. Those are caught by pattern instead of by
+ * registration: a pure-EPOLLOUT event recurring for the same (epfd, data)
+ * key with gaps under EP_STORM_GAP_MS, EP_STORM_STREAK times in a row, is
+ * treated as the same defect and stripped/CTL_DEL'd the same way.
  *
- * EOF: the corrupted kernel never delivers EPOLLHUP either, so after the
- * last byte is drained the reader would still wait forever. When a
- * pipe's FIONREAD transitions had-data -> empty, one final EPOLLIN is
- * synthesized: at EOF the read returns 0 (correct), otherwise it is a
- * single harmless EAGAIN wakeup.
- *
- * EPOLLONESHOT: a synthesized event is delivered without the kernel
- * having fired, so the entry is marked disarmed and gets no further
- * synthesized events until the next MOD re-arms it -- mirroring kernel
- * semantics from the caller's point of view.
- *
- * This is a workaround, not a cure; the kernel bug should be reported to
- * the platform side (fd0-reader3/fd0-reader4 probes as evidence).
+ * Either way, every strip requests a pacing sleep before the next re-wait
+ * (see ep_shim_wait()) so a kernel that keeps re-delivering even after the
+ * CTL_DEL cannot turn this repair into the same spin it replaces.
  * OHOS_COMPAT_SHIM_DISABLE=epoll_pipe turns the whole interceptor off.
  */
 
-#define EP_PIPE_POLL_MS 250
 #define EP_REG_MAX 64
 
 typedef struct {
@@ -1700,8 +1541,7 @@ typedef struct {
 	int epfd;
 	int fd;
 	struct epoll_event ev;	/* registration mask + udata */
-	int disarmed;		/* ONESHOT: synthesized event delivered */
-	int had_data;		/* FIONREAD was non-zero at last check */
+	int disarmed;		/* ONESHOT: first delivery already passed through */
 	int kdel;		/* we removed this entry kernel-side (ONESHOT
 				 * enforcement); re-arm must reach the kernel
 				 * as ADD, and an app DEL must not fail */
@@ -1970,7 +1810,7 @@ static void cr_atfork_register(void)
 
 static int ep_pipe_active(void)
 {
-	return !shim_disabled("epoll_pipe");
+	return !shim_disabled(SD_EPOLL_PIPE);
 }
 
 /* All registry mutations happen under g_ep_pipes_lock; Bun runs one
@@ -2001,9 +1841,6 @@ static void ep_reg_update_locked(int epfd, int fd, const struct epoll_event *ev)
 			 * refires, same reasoning as kdel above. */
 			g_ep_pipes[i].del_tried = 0;
 			g_ep_pipes[i].ghost_streak = 0;
-			/* had_data deliberately kept: a MOD re-arm right
-			 * after the reader drained the pipe must not lose
-			 * the pending EOF transition. */
 			ep_oneshot_recount_locked();
 			return;
 		}
@@ -2019,7 +1856,6 @@ static void ep_reg_update_locked(int epfd, int fd, const struct epoll_event *ev)
 	g_ep_pipes[free_slot].kdel = 0;
 	g_ep_pipes[free_slot].del_tried = 0;
 	g_ep_pipes[free_slot].ghost_streak = 0;
-	g_ep_pipes[free_slot].had_data = 0;
 	ep_oneshot_recount_locked();
 }
 
@@ -2041,140 +1877,6 @@ static void ep_reg_forget_fd_locked(int fd)
 		    (g_ep_pipes[i].fd == fd || g_ep_pipes[i].epfd == fd))
 			g_ep_pipes[i].used = 0;
 	ep_oneshot_recount_locked();
-}
-
-static int ep_reg_any_locked(int epfd)
-{
-	int i;
-	for (i = 0; i < EP_REG_MAX; i++)
-		if (g_ep_pipes[i].used && g_ep_pipes[i].epfd == epfd)
-			return 1;
-	return 0;
-}
-
-/* ==================================================================== */
-/*  Adaptive polling-interval backoff (2026-08-19 polyfill-discipline    */
-/*  pass)                                                                */
-/*                                                                        */
-/*  This repair only matters while the underlying kernel defect is       */
-/*  actually misfiring; the fixed 250ms clamp above paid that interval's */
-/*  wakeup cost on every epfd with a registered pipe, forever, whether   */
-/*  or not the defect had fired even once. Feature-probe-once-at-startup */
-/*  doesn't fit here (the defect is load-dependent -- clean at idle,     */
-/*  live under pressure -- so a boot-time probe passing proves nothing   */
-/*  about ten minutes from now); backoff instead lets the cost track     */
-/*  observed risk from moment to moment, in both directions, for the     */
-/*  lifetime of the epfd:                                                */
-/*                                                                        */
-/*    - starts at the same EP_PIPE_POLL_MS this shim has always used     */
-/*      (an OS that has never shown the defect pays the same fast        */
-/*      interval as before, until it's proven quiet for a while);        */
-/*    - doubles (capped at EP_PIPE_MAX_POLL_MS_DEFAULT, overridable via  */
-/*      OHOS_COMPAT_SHIM_EPOLL_PIPE_MAX_MS) after EP_BACKOFF_STREAK       */
-/*      consecutive empty slices -- "empty" meaning the real wait AND    */
-/*      the FIONREAD synthesis both found nothing, i.e. this slice was   */
-/*      pure unrewarded overhead;                                        */
-/*    - resets to EP_PIPE_POLL_MS the instant a slice DOES synthesize an */
-/*      event -- the defect just fired in THIS process, right now, so    */
-/*      go back to checking fast; a slice ending because a genuine       */
-/*      kernel event arrived (unrelated to any tracked pipe) is neither  */
-/*      "empty" nor "the defect fired" and leaves the interval alone.    */
-/*                                                                        */
-/*  Slice length only affects LATENCY when the defect is actually live   */
-/*  (a correctly-behaved kernel wakes epoll_wait on its own, independent */
-/*  of the slice); worst case, a long-idle epfd whose defect starts      */
-/*  firing again is noticed up to one stale interval late (<=1s at the   */
-/*  default cap) instead of instantly -- a bounded, one-time cost paid   */
-/*  only in the scenario this whole interceptor exists for, not on every */
-/*  idle wakeup the way the fixed clamp was. This does NOT change        */
-/*  whether epoll_pipe is active for a given epfd (that's still the      */
-/*  registry above) or ever "decide the OS is fixed" -- it only paces    */
-/*  how often an active repair re-checks itself, per [[project_ohos_     */
-/*  compat_shim_default_scope]]'s "no compiled-in default may change     */
-/*  from on-device inference" rule: this is a runtime cost knob, not a   */
-/*  correctness/coverage decision.                                       */
-/* ==================================================================== */
-
-#define EP_BACKOFF_MAX 32
-#define EP_PIPE_MAX_POLL_MS_DEFAULT 1000
-#define EP_BACKOFF_STREAK 8
-
-typedef struct {
-	int used;
-	int epfd;
-	int interval_ms;
-	int empty_streak;
-} ep_backoff_t;
-
-static ep_backoff_t g_ep_backoff[EP_BACKOFF_MAX];
-static int g_ep_pipe_max_poll_ms = -1;
-
-/* Parsed once, idempotent even if two threads race into this before it's
- * set (same env, same result) -- same pattern as parse_toggle_masks(). */
-static int ep_pipe_max_poll_ms(void)
-{
-	if (g_ep_pipe_max_poll_ms < 0) {
-		const char *s = getenv("OHOS_COMPAT_SHIM_EPOLL_PIPE_MAX_MS");
-		long v = s ? strtol(s, NULL, 10) : 0;
-		g_ep_pipe_max_poll_ms = (v > 0) ? (int)v : EP_PIPE_MAX_POLL_MS_DEFAULT;
-	}
-	return g_ep_pipe_max_poll_ms;
-}
-
-/* Must be called with g_ep_pipes_lock held. Returns the current slice
- * interval for `epfd`, creating a fresh EP_PIPE_POLL_MS-start entry on
- * first sight. A full table (EP_BACKOFF_MAX concurrent epfds with
- * registered pipes -- far beyond any observed consumer) just means no
- * backoff tracking for the overflow: always the safe, fast interval, same
- * as before this feature existed. */
-static int ep_backoff_get_locked(int epfd)
-{
-	int i, free_slot = -1;
-	for (i = 0; i < EP_BACKOFF_MAX; i++) {
-		if (!g_ep_backoff[i].used) {
-			if (free_slot < 0)
-				free_slot = i;
-			continue;
-		}
-		if (g_ep_backoff[i].epfd == epfd)
-			return g_ep_backoff[i].interval_ms;
-	}
-	if (free_slot < 0)
-		return EP_PIPE_POLL_MS;
-	g_ep_backoff[free_slot].used = 1;
-	g_ep_backoff[free_slot].epfd = epfd;
-	g_ep_backoff[free_slot].interval_ms = EP_PIPE_POLL_MS;
-	g_ep_backoff[free_slot].empty_streak = 0;
-	return EP_PIPE_POLL_MS;
-}
-
-/* Must be called with g_ep_pipes_lock held. See the comment block above
- * for the reset/double-on-streak policy. */
-static void ep_backoff_update_locked(int epfd, int had_synthesized_event)
-{
-	int i;
-	for (i = 0; i < EP_BACKOFF_MAX; i++) {
-		if (!g_ep_backoff[i].used || g_ep_backoff[i].epfd != epfd)
-			continue;
-		if (had_synthesized_event) {
-			g_ep_backoff[i].interval_ms = EP_PIPE_POLL_MS;
-			g_ep_backoff[i].empty_streak = 0;
-		} else if (++g_ep_backoff[i].empty_streak >= EP_BACKOFF_STREAK) {
-			int cap = ep_pipe_max_poll_ms();
-			int next = g_ep_backoff[i].interval_ms * 2;
-			g_ep_backoff[i].interval_ms = next > cap ? cap : next;
-			g_ep_backoff[i].empty_streak = 0;
-		}
-		return;
-	}
-}
-
-static void ep_backoff_forget_locked(int epfd)
-{
-	int i;
-	for (i = 0; i < EP_BACKOFF_MAX; i++)
-		if (g_ep_backoff[i].used && g_ep_backoff[i].epfd == epfd)
-			g_ep_backoff[i].used = 0;
 }
 
 /* Registry bookkeeping after a real epoll_ctl(), shared by the libc
@@ -2222,24 +1924,11 @@ static int ep_shim_ctl_done(int rc, int epfd, int op, int fd,
 	if (op == EPOLL_CTL_DEL) {
 		ep_reg_del_locked(epfd, fd);
 	} else if (ev &&
-		   ((ev->events & EPOLLIN) ||
-		    ((ev->events & (EPOLLOUT | EPOLLONESHOT)) ==
-		     (EPOLLOUT | EPOLLONESHOT))) &&
-		   splice_fd_is_fifo_cached(fd)) {
-		/* EPOLLIN-bearing FIFOs: the existing missed-wakeup synthesis
-		 * repair (unchanged). ONESHOT|EPOLLOUT FIFOs (no EPOLLIN
-		 * bit): registered for the ONESHOT enforcement pass in
-		 * ep_shim_after_wait_ex(), never for synthesis. */
-		ep_reg_update_locked(epfd, fd, ev);
-	} else if (ev &&
 		   ((ev->events & (EPOLLOUT | EPOLLONESHOT)) ==
 		    (EPOLLOUT | EPOLLONESHOT)) &&
-		   splice_fd_is_tty_cached(fd)) {
-		/* TTY/PTY write ends (interactive stdio): same ONESHOT
-		 * enforcement as the FIFO case above, same kernel defect
-		 * family (see the measurement note on splice_fd_is_tty()).
-		 * EPOLLIN synthesis deliberately does NOT extend to TTYs --
-		 * the missed-wakeup repair it exists for is pipe-specific. */
+		   (splice_fd_is_fifo_cached(fd) || splice_fd_is_tty_cached(fd))) {
+		/* ONESHOT-enforcement-eligible: a FIFO write end or TTY/PTY
+		 * fd armed with EPOLLOUT|EPOLLONESHOT. */
 		ep_reg_update_locked(epfd, fd, ev);
 	} else {
 		/* No repair interest: make sure a recycled fd number doesn't
@@ -2264,87 +1953,22 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 	return ep_shim_ctl_done(real(epfd, op, fd, event), epfd, op, fd, event);
 }
 
-/* Clamp long waits to the current backoff interval when this epfd has
- * pipes under repair; short and zero (nonblocking) timeouts pass through
- * without the lock (the interval is never below EP_PIPE_POLL_MS, so a
- * timeout already that short can't be affected either way). */
-static int ep_shim_clamp_timeout(int epfd, int timeout)
-{
-	int any, interval;
-	if (timeout == 0 || !ep_pipe_active())
-		return timeout;
-	if (timeout > 0 && timeout <= EP_PIPE_POLL_MS)
-		return timeout;
-	pthread_mutex_lock(&g_ep_pipes_lock);
-	any = ep_reg_any_locked(epfd);
-	interval = any ? ep_backoff_get_locked(epfd) : 0;
-	pthread_mutex_unlock(&g_ep_pipes_lock);
-	if (!any)
-		return timeout;
-	return (timeout > 0 && timeout <= interval) ? timeout : interval;
-}
-
-/* After an empty real wait, synthesize EPOLLIN for registered pipes with
- * bytes pending (plus the one-shot drained/EOF wakeup described above).
- * *out_synthesized reports whether this call actually produced one, for
- * the backoff bookkeeping in ep_shim_wait's slice loop below -- a slice
- * that returns >0 because a genuine unrelated kernel event fired is not
- * evidence the pipe defect just misfired, so it must be told apart from
- * one that returns >0 because FIONREAD caught pending bytes epoll_wait
- * itself missed. */
+/* Strips ONESHOT-enforcement re-fires (both the registered-entry case and
+ * the unknown-key storm case) from a real wait's results, requesting a
+ * pacing sleep via *out_sleep_ns whenever it strips at least one event --
+ * see the section comment above and ep_shim_wait() below for how the sleep
+ * is used. Zero cost when no eligible entry is registered and no storm key
+ * is active (the atomic count gates the lock for the first case; the
+ * pure-EPOLLOUT shape check is cheap for the second). */
 static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
-				 int maxevents, int *out_synthesized,
-				 long long *out_sleep_ns)
+				 int maxevents, long long *out_sleep_ns)
 {
-	int i, j, n = 0;
-	*out_synthesized = 0;
+	int i, j;
 	*out_sleep_ns = 0;
-	if (maxevents <= 0 || !ep_pipe_active())
+	if (maxevents <= 0 || !ep_pipe_active() || rc <= 0)
 		return rc;
 
-	/* ONESHOT enforcement: this kernel ignores EPOLLONESHOT auto-disarm
-	 * for EPOLLOUT FIFO registrations and re-delivers the event on every
-	 * wait -- measured at ~510k immediate epoll_pwait returns/s (100%
-	 * pure EPOLLOUT) on the official claude-code musl binary, spinning
-	 * its event loop at 100% CPU while idle. The first delivery passes
-	 * through and disarms (what a compliant kernel does); re-fires are
-	 * stripped, and the entry is removed kernel-side (CTL_DEL) so the
-	 * kernel itself goes quiet -- a userspace-only strip would leave
-	 * the real wait returning instantly forever, moving the spin
-	 * inside this shim instead of the caller. A later ADD/MOD re-arms:
-	 * ep_shim_ctl_done translates MOD on a kdel'd entry back into ADD.
-	 * Zero cost when no eligible entry is registered (atomic count
-	 * gates the lock).
-	 *
-	 * 2026-09-28 TUI idle-spin fix: on an interactive claude-code (musl)
-	 * TUI session, DEL for the PTY write end's tfd returns ENOENT on
-	 * EVERY attempt -- even though /proc/self/fdinfo for that epfd keeps
-	 * listing the exact tfd we're deleting, with the exact ONESHOT|
-	 * EPOLLOUT mask, the whole time. This kernel's epoll_ctl(DEL) is
-	 * simply unreliable for this registration shape; no fd we could
-	 * retry with fixes it (the fd is already right). Two bugs used to
-	 * compound here: (a) this branch retried the doomed DEL syscall on
-	 * EVERY re-fire forever (measured 43k/s, each ~7us of pure syscall
-	 * overhead on top of the spin itself), and (b) stripping the event
-	 * here never told the caller via *out_suppressed, so ep_shim_wait's
-	 * existing 2ms storm-pacing nanosleep (already used for the
-	 * unknown-key case below) never engaged for this, the MORE common
-	 * case -- the strip was silent and the real epoll_pwait was retried
-	 * at full speed, which IS the 100%-CPU spin this whole interceptor
-	 * exists to prevent. Fixed: del_tried caps the DEL attempt to once
-	 * per arm (a persistent ENOENT is now paid once, not per re-fire),
-	 * and every strip on this path now requests a pacing sleep from the
-	 * caller (via *out_sleep_ns) same as the unknown-key storm path
-	 * below, so ep_shim_wait always paces re-waits while a ghost keeps
-	 * firing -- whether or not the DEL that produced it ever actually
-	 * succeeded. Because this particular ghost can be PERMANENT for the
-	 * rest of the arm's lifetime (nothing ever silences it kernel-side),
-	 * the requested sleep also grows exponentially per consecutive
-	 * re-fire (ghost_streak, capped at EP_GHOST_SLEEP_MAX_NS) instead of
-	 * staying flat forever -- flat 2ms measured ~5.5% steady-state CPU
-	 * on an idle TUI session; the grown pacing brought that down
-	 * further. Resets to the base interval on the next ADD/MOD. */
-	if (rc > 0) {
+	{
 		static int (*real_ctl)(int, int, int,
 				       struct epoll_event *) = NULL;
 		if (!real_ctl)
@@ -2452,153 +2076,52 @@ static int ep_shim_after_wait_ex(int rc, int epfd, struct epoll_event *events,
 		}
 	}
 
-	if (rc != 0)
-		return rc;
-	pthread_mutex_lock(&g_ep_pipes_lock);
-	for (i = 0; i < EP_REG_MAX && n < maxevents; i++) {
-		int avail = 0;
-		if (!g_ep_pipes[i].used || g_ep_pipes[i].epfd != epfd ||
-		    g_ep_pipes[i].disarmed)
-			continue;
-		/* OUT-only entries (ONESHOT enforcement) never take part in
-		 * EPOLLIN synthesis -- the write end of a pipe is not a
-		 * reader. (Pre-existing entries always carry EPOLLIN, so
-		 * this gate is a no-op for them.) */
-		if (!(g_ep_pipes[i].ev.events & EPOLLIN))
-			continue;
-		if (ioctl(g_ep_pipes[i].fd, FIONREAD, &avail) != 0) {
-			/* fd is gone; the kernel drops closed fds from the
-			 * epoll set too, so stop tracking it here. */
-			g_ep_pipes[i].used = 0;
-			continue;
-		}
-		if (avail > 0) {
-			g_ep_pipes[i].had_data = 1;
-		} else if (g_ep_pipes[i].had_data) {
-			g_ep_pipes[i].had_data = 0;
-		} else {
-			continue;
-		}
-		if (g_ep_pipes[i].ev.events & EPOLLONESHOT)
-			g_ep_pipes[i].disarmed = 1;
-		events[n].events = EPOLLIN;
-		events[n].data = g_ep_pipes[i].ev.data;
-		n++;
-	}
-	pthread_mutex_unlock(&g_ep_pipes_lock);
-	if (n > 0)
-		*out_synthesized = 1;
-	return n;
+	return rc;
 }
 
 typedef int (*epoll_pwait_fn)(int, struct epoll_event *, int, int,
 			      const sigset_t *);
 
-/* Wait with the repair slice ep_shim_clamp_timeout() dictates, but WITHOUT
- * leaking the slicing to the caller: an empty 250ms repair poll is answered
- * by re-waiting, never by returning 0, until the caller's own timeout
- * genuinely expires. A premature 0 violates the epoll_wait contract — for
- * timeout == -1 the kernel returns only with an event or a signal — and
- * crashed libuv (uv__io_poll: "assert(timeout != -1)" when nfds == 0;
- * pnpm --version died with SIGABRT). */
+/* Calls the real wait once with the caller's own timeout, unmodified --
+ * there is no periodic slicing to hide here, unlike the missed-wakeup
+ * repair this file used to also carry. If ep_shim_after_wait_ex() strips
+ * every event down to 0, that must not be handed back as a premature
+ * timeout (a genuine timeout == -1 wait may only return with an event or a
+ * signal — libuv's uv__io_poll asserts exactly that, and a leaked
+ * premature 0 crashed pnpm with SIGABRT), so this re-waits for the
+ * caller's remaining time instead, paced by *out_sleep_ns whenever the
+ * strip was a storm/ghost re-fire. timeout == 0 (non-blocking) is the one
+ * shape that returns whatever it gets immediately, stripped or not --
+ * the caller asked not to block, so a 0 here is a legitimate answer, not a
+ * leaked internal detail. */
 static int ep_shim_wait(int epfd, struct epoll_event *events, int maxevents,
 			int timeout, epoll_pwait_fn real,
 			const sigset_t *sigmask)
 {
-	int slice = ep_shim_clamp_timeout(epfd, timeout);
-	if (slice == timeout) {
-		if (timeout == 0) {
-			int syn;
-			long long sleep_ns;
-			return ep_shim_after_wait_ex(
-				real(epfd, events, maxevents, 0, sigmask),
-				epfd, events, maxevents, &syn, &sleep_ns);
-		}
-		/* A wait that didn't need slicing can still come back empty
-		 * HERE: ONESHOT enforcement may have stripped the kernel's
-		 * re-fired events after the real call returned instantly.
-		 * Returning that 0 early would leak a premature timeout --
-		 * the exact epoll_wait contract violation the sliced loop
-		 * below exists to prevent -- so re-wait for the caller's
-		 * remaining time. A genuine timeout still returns 0, after
-		 * at most one extra clock read. When the strip was storm
-		 * suppression (unknown key, possibly ghost-delivering even
-		 * after our one-shot CTL_DEL), pace the re-wait so a
-		 * re-firing kernel cannot turn this loop into the spin we
-		 * just removed from the caller. */
-		long long deadline = timeout > 0 ? ep_now_ms() + timeout : 0;
-		for (;;) {
-			int syn;
-			long long sleep_ns = 0;
-			int rc = ep_shim_after_wait_ex(
-				real(epfd, events, maxevents, timeout, sigmask),
-				epfd, events, maxevents, &syn, &sleep_ns);
-			if (rc != 0)
-				return rc;
-			if (sleep_ns > 0) {
-				struct timespec zzz = {
-					.tv_sec = 0,
-					.tv_nsec = sleep_ns,
-				};
-				nanosleep(&zzz, NULL);
-			}
-			if (timeout > 0) {
-				long long left = deadline - ep_now_ms();
-				if (left <= 0)
-					return 0;
-				timeout = left > INT_MAX ? INT_MAX : (int)left;
-			}
-		}
+	if (timeout == 0) {
+		long long sleep_ns;
+		return ep_shim_after_wait_ex(
+			real(epfd, events, maxevents, 0, sigmask),
+			epfd, events, maxevents, &sleep_ns);
 	}
 
-	long long deadline = 0;
-	if (timeout > 0)
-		deadline = ep_now_ms() + timeout;
-
+	long long deadline = timeout > 0 ? ep_now_ms() + timeout : 0;
 	for (;;) {
-		int synthesized = 0;
 		long long sleep_ns = 0;
-		int rc = ep_shim_after_wait_ex(real(epfd, events, maxevents,
-						    slice, sigmask),
-					       epfd, events, maxevents,
-					       &synthesized, &sleep_ns);
-		if (rc != 0) {
-			/* Only a synthesized event is evidence the defect
-			 * just fired -- a genuine unrelated kernel event
-			 * (synthesized==0 but rc>0) leaves the backoff state
-			 * untouched, same as returning here always did. */
-			if (synthesized) {
-				pthread_mutex_lock(&g_ep_pipes_lock);
-				ep_backoff_update_locked(epfd, 1);
-				pthread_mutex_unlock(&g_ep_pipes_lock);
-			}
-			return rc; /* real events, synthesized events, or -1/errno */
-		}
-
-		int next_interval;
-		pthread_mutex_lock(&g_ep_pipes_lock);
-		ep_backoff_update_locked(epfd, 0);
-		next_interval = ep_backoff_get_locked(epfd);
-		pthread_mutex_unlock(&g_ep_pipes_lock);
-
+		int rc = ep_shim_after_wait_ex(
+			real(epfd, events, maxevents, timeout, sigmask),
+			epfd, events, maxevents, &sleep_ns);
+		if (rc != 0)
+			return rc;
 		if (sleep_ns > 0) {
-			/* storm pacing: same rationale as the single-shot
-			 * loop above -- a ghost-delivering kernel must not
-			 * turn the slice loop into the spin */
-			struct timespec zzz = {
-				.tv_sec = 0,
-				.tv_nsec = sleep_ns,
-			};
+			struct timespec zzz = { .tv_sec = 0, .tv_nsec = sleep_ns };
 			nanosleep(&zzz, NULL);
 		}
-
 		if (timeout > 0) {
 			long long left = deadline - ep_now_ms();
 			if (left <= 0)
-				return 0; /* caller's own timeout really expired */
-			slice = (left < next_interval) ? (int)left : next_interval;
-		} else {
-			slice = next_interval;
+				return 0;
+			timeout = left > INT_MAX ? INT_MAX : (int)left;
 		}
 	}
 }
@@ -2632,181 +2155,6 @@ int epoll_pwait(int epfd, struct epoll_event *events, int maxevents,
 	return ep_shim_wait(epfd, events, maxevents, timeout, real, sigmask);
 }
 
-/* poll/ppoll: the real call already blocked for the full timeout, so most
- * of what is left is correcting the lie -- FIFO fds that asked for POLLIN,
- * reported nothing, yet have bytes pending. `scan` gates whether this call
- * actually does that work at all -- see poll()/ppoll() below for when it's
- * 0 (skip entirely) vs 1 (always) vs sampled. No timeout clamping here for
- * the ordinary (non-infinite) shapes; the infinite-wait shape is handled
- * separately by poll()/ppoll() themselves, below. */
-static int ep_shim_patch_pollfds(struct pollfd *fds, nfds_t nfds, int rc, int scan)
-{
-	nfds_t i;
-	if (rc < 0 || !ep_pipe_active() || !scan)
-		return rc;
-	for (i = 0; i < nfds; i++) {
-		int avail = 0;
-		if (fds[i].fd < 0 || !(fds[i].events & POLLIN) ||
-		    fds[i].revents != 0)
-			continue;
-		if (!splice_fd_is_fifo_cached(fds[i].fd))
-			continue;
-		if (ioctl(fds[i].fd, FIONREAD, &avail) == 0 && avail > 0) {
-			fds[i].revents = POLLIN;
-			rc++;	/* poll's rc counts fds with revents set */
-		}
-	}
-	return rc;
-}
-
-/* Global (not per-fd-set -- unlike epoll_pipe's registry, a poll()/ppoll()
- * call has no persistent handle to key per-caller state on) sample counter
- * for TIMEOUT==0 (busy-poll) callers. A busy-poll loop already re-checks
- * within microseconds on its own next iteration, so a missed FIONREAD catch
- * here self-corrects almost immediately and is not a hang risk the way an
- * infinite wait is (handled separately below, and always scanned). This is
- * what cut the measured N=128-idle-fd cost from +115.7us/call to
- * +3.7us/call in the 2026-08-18 validation pass's own fifo-ness cache fix;
- * sampling trims the remaining scan-loop overhead the cache alone doesn't
- * touch (the loop still runs the cache lookup itself every call -- this
- * skips the ioctl(FIONREAD) beyond it, on non-sampled calls). */
-#define POLL_SAMPLE_DEFAULT 64
-static int g_poll_sample_n = -1;
-static _Atomic unsigned g_poll_sample_ctr;
-
-static int poll_sample_n(void)
-{
-	if (g_poll_sample_n < 0) {
-		const char *s = getenv("OHOS_COMPAT_SHIM_POLL_SAMPLE");
-		long v = s ? strtol(s, NULL, 10) : 0;
-		g_poll_sample_n = (v > 0) ? (int)v : POLL_SAMPLE_DEFAULT;
-	}
-	return g_poll_sample_n;
-}
-
-static int poll_sample_due(void)
-{
-	unsigned n = (unsigned)poll_sample_n();
-	unsigned c = atomic_fetch_add_explicit(&g_poll_sample_ctr, 1, memory_order_relaxed);
-	return (c % n) == 0;
-}
-
-/* True iff any fd in the set is both a candidate for the repair (asks for
- * POLLIN) and already known-or-newly-confirmed to be a FIFO -- the cheap,
- * cached check, same one the scan loop itself uses. Gates whether an
- * infinite wait gets sliced at all: the overwhelming majority of poll()
- * callers have no pipes whatsoever and must pay nothing extra. */
-static int poll_set_has_candidate_fifo(struct pollfd *fds, nfds_t nfds)
-{
-	nfds_t i;
-	for (i = 0; i < nfds; i++)
-		if (fds[i].fd >= 0 && (fds[i].events & POLLIN) &&
-		    splice_fd_is_fifo_cached(fds[i].fd))
-			return 1;
-	return 0;
-}
-
-typedef int (*poll_fn)(struct pollfd *, nfds_t, int);
-typedef int (*ppoll_fn)(struct pollfd *, nfds_t, const struct timespec *,
-			const sigset_t *);
-
-int poll(struct pollfd *fds, nfds_t nfds, int timeout)
-{
-	static poll_fn real = NULL;
-	if (!real)
-		real = (poll_fn)dlsym(RTLD_NEXT, "poll");
-	if (!real) {
-		errno = ENOSYS;
-		return -1;
-	}
-
-	/* Infinite wait (timeout < 0) is the one shape ep_shim_patch_pollfds
-	 * could never actually protect before this fix: it only runs AFTER
-	 * the real call returns, but poll(fds, n, -1) had already blocked
-	 * forever by then if the kernel's pipe-readiness bug ate the wakeup
-	 * -- paying the O(N) scan tax on every RETURNING call while the one
-	 * shape most exposed to actually hanging went completely unpatched.
-	 * Sliced at the plain EP_PIPE_POLL_MS interval (not the adaptive
-	 * backoff table from the epoll_pipe section above -- that's keyed by
-	 * epfd, a persistent kernel handle; a poll() call has no analogous
-	 * stable identity across invocations to key backoff state on, so
-	 * this reuses 2a's starting interval value without its growth).
-	 * has_fifo is computed once (a cache-only scan, no ioctl) and reused
-	 * below for the should_scan decision too -- an infinite wait with NO
-	 * candidate fifo has nothing ep_shim_patch_pollfds could ever find,
-	 * so skipping its post-call scan entirely is strictly less work than
-	 * the old always-scan-after-return behavior, not just "no worse". */
-	int has_fifo = (timeout < 0 && ep_pipe_active())
-			       ? poll_set_has_candidate_fifo(fds, nfds)
-			       : 0;
-
-	if (timeout < 0 && has_fifo) {
-		for (;;) {
-			int rc = ep_shim_patch_pollfds(fds, nfds,
-						       real(fds, nfds, EP_PIPE_POLL_MS), 1);
-			if (rc != 0)
-				return rc; /* real events, synthesized events, or -1/errno */
-		}
-	}
-
-	int should_scan;
-	if (!ep_pipe_active())
-		should_scan = 0;
-	else if (timeout == 0)
-		should_scan = poll_sample_due();
-	else if (timeout < 0)
-		should_scan = has_fifo; /* infinite, no candidate: nothing to find, skip */
-	else
-		should_scan = 1; /* finite nonzero (blocking): scan every time */
-
-	return ep_shim_patch_pollfds(fds, nfds, real(fds, nfds, timeout), should_scan);
-}
-
-int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
-	  const sigset_t *sigmask)
-{
-	static ppoll_fn real = NULL;
-	if (!real)
-		real = (ppoll_fn)dlsym(RTLD_NEXT, "ppoll");
-	if (!real) {
-		errno = ENOSYS;
-		return -1;
-	}
-
-	/* NULL timeout is ppoll()'s infinite-wait spelling -- same fix, same
-	 * has_fifo-computed-once-and-reused reasoning, as poll() above. */
-	int has_fifo = (timeout == NULL && ep_pipe_active())
-			       ? poll_set_has_candidate_fifo(fds, nfds)
-			       : 0;
-
-	if (!timeout && has_fifo) {
-		struct timespec slice_ts = {
-			.tv_sec = EP_PIPE_POLL_MS / 1000,
-			.tv_nsec = (long)(EP_PIPE_POLL_MS % 1000) * 1000000L,
-		};
-		for (;;) {
-			int rc = ep_shim_patch_pollfds(fds, nfds,
-						       real(fds, nfds, &slice_ts, sigmask), 1);
-			if (rc != 0)
-				return rc;
-		}
-	}
-
-	int is_zero_timeout = timeout && timeout->tv_sec == 0 && timeout->tv_nsec == 0;
-	int should_scan;
-	if (!ep_pipe_active())
-		should_scan = 0;
-	else if (is_zero_timeout)
-		should_scan = poll_sample_due();
-	else if (!timeout)
-		should_scan = has_fifo; /* infinite, no candidate: nothing to find, skip */
-	else
-		should_scan = 1; /* finite nonzero: scan every time */
-
-	return ep_shim_patch_pollfds(fds, nfds,
-				     real(fds, nfds, timeout, sigmask), should_scan);
-}
-
 /*
  * Shared cleanup for every place an fd number can start meaning a
  * different file: the real close() below, dup2()/dup3() onto an
@@ -2833,11 +2181,6 @@ static void shim_forget_fd(int fd)
 	if (ep_pipe_active()) {
 		pthread_mutex_lock(&g_ep_pipes_lock);
 		ep_reg_forget_fd_locked(fd);
-		/* fd might have been an epfd, not just a tracked pipe --
-		 * drop its backoff state too so a reused fd number starts
-		 * fresh at EP_PIPE_POLL_MS rather than inheriting whatever
-		 * interval the previous epfd had backed off to. */
-		ep_backoff_forget_locked(fd);
 		pthread_mutex_unlock(&g_ep_pipes_lock);
 	}
 	fifo_cache_forget_fd(fd);
@@ -2909,7 +2252,7 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd,
 	int rc = real ? real(olddirfd, oldpath, newdirfd, newpath, flags) : -1;
 	if (rc == 0)
 		return 0;
-	if (shim_disabled("linkat"))
+	if (shim_disabled(SD_LINKAT))
 		return rc;
 	if (errno != EPERM && errno != EACCES)
 		return rc;
@@ -2938,94 +2281,6 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd,
 	return 0;
 }
 
-typedef int (*symlinkat_fn)(const char *, int, const char *);
-
-int symlinkat(const char *target, int newdirfd, const char *linkpath)
-{
-	static symlinkat_fn real = NULL;
-	if (!real)
-		real = (symlinkat_fn)dlsym(RTLD_NEXT, "symlinkat");
-
-	int rc = real ? real(target, newdirfd, linkpath) : -1;
-	if (rc == 0)
-		return 0;
-	if (shim_disabled("symlinkat"))
-		return rc;
-	if (errno != EPERM && errno != EACCES)
-		return rc;
-
-	/* Resolve `target` relative to the LINK's own directory, not the
-	 * process CWD (a package symlink's target is almost always relative
-	 * to the link's own dir, e.g. node_modules/.bin/cli -> ../pkg) and
-	 * NOT unconditionally `newdirfd` either: `linkpath` can itself carry
-	 * a directory component (e.g. "sub/link" with newdirfd naming
-	 * sub's parent), in which case the link's real parent directory is
-	 * newdirfd+dirname(linkpath), and POSIX symlink(2) defines a
-	 * relative target against THAT directory, not newdirfd. Resolving
-	 * against newdirfd directly only happened to be correct when
-	 * linkpath was a bare basename (the two ARE the same directory in
-	 * that case) and silently resolved wrong once linkpath had a
-	 * directory component -- this only handles the "target resolves to
-	 * a real file" case either way; a dangling/not-yet-extracted target
-	 * still fails as before. */
-	int dir_fd = newdirfd;
-	int opened_dir_fd = -1;
-	const char *slash = strrchr(linkpath, '/');
-	if (slash) {
-		size_t dlen = (size_t)(slash - linkpath);
-		char dirbuf[PATH_MAX];
-		if (dlen == 0) {
-			/* linkpath is e.g. "/link": its directory is root. */
-			dirbuf[0] = '/';
-			dirbuf[1] = '\0';
-		} else if (dlen < sizeof(dirbuf)) {
-			memcpy(dirbuf, linkpath, dlen);
-			dirbuf[dlen] = '\0';
-		} else {
-			errno = ENAMETOOLONG;
-			return -1;
-		}
-		opened_dir_fd = openat(newdirfd, dirbuf, O_RDONLY | O_DIRECTORY);
-		if (opened_dir_fd < 0) {
-			errno = EPERM;
-			return -1;
-		}
-		dir_fd = opened_dir_fd;
-	}
-
-	int src = openat(dir_fd, target, O_RDONLY);
-	if (src < 0) {
-		if (opened_dir_fd >= 0)
-			close(opened_dir_fd);
-		errno = EPERM;
-		return -1;
-	}
-
-	struct stat st;
-	if (fstat(src, &st) != 0) {
-		int e = errno;
-		close(src);
-		if (opened_dir_fd >= 0)
-			close(opened_dir_fd);
-		errno = e;
-		return -1;
-	}
-
-	/* The copy always lands at newdirfd+linkpath (that part was never
-	 * wrong -- only where we read `target` FROM needed the fix above). */
-	int copy_rc = copy_fd_to_path_atomic(src, newdirfd, linkpath,
-					     st.st_mode & 0777);
-	int e = errno;
-	close(src);
-	if (opened_dir_fd >= 0)
-		close(opened_dir_fd);
-	if (copy_rc != 0) {
-		errno = e;
-		return -1;
-	}
-	return 0;
-}
-
 typedef int (*link_fn)(const char *, const char *);
 
 /* link() — same sandbox EPERM/EACCES story as linkat, but musl's link()
@@ -3044,7 +2299,7 @@ int link(const char *oldpath, const char *newpath)
 	int rc = real ? real(oldpath, newpath) : -1;
 	if (rc == 0)
 		return 0;
-	if (shim_disabled("link"))
+	if (shim_disabled(SD_LINK))
 		return rc;
 	if (errno != EPERM && errno != EACCES)
 		return rc;
