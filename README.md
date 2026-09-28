@@ -21,7 +21,7 @@
 
 `pthread_cancel()` 在这个平台上是 musl 的空桩实现，刻意**不**做 shim ——一个 preload 库没办法给调用方注入它所需要的协作式取消点。
 
-`getcwd()`（hmdfs 祖先目录缺 `+x` 时 `EACCES`）与 `symlinkat()`（沙箱化目标目录 `EPERM`/`EACCES`）此前也在这张表里；真机重测均不再复现，已删除对应拦截代码——`ohos-shim check` 仍把这两项作为 B 组信息性探针保留，供其它 OHOS 版本回归时观察，但不再产出 `OHOS_COMPAT_SHIM_DISABLE` 建议。
+`getcwd()`、`symlinkat()`、`getaddrinfo()` 的 AI_ADDRCONFIG 补丁，以及 epoll 管道可读状态合成逻辑和定时切片，已根据真机/容器复测移除；对应探针与专属测试也已清理。历史判断和复测依据见[拦截点去留记录](logs/polyfill-audit/verdicts.md)。
 
 ## 前向兼容：优先自动尝试真实系统调用
 
@@ -32,13 +32,13 @@
 - `getaddrinfo`：本地进程启动后台起一个一次性探测线程（不阻塞调用方任何一次真实查询），用合成的非法字符主机名判断本机真实解析器是否已经本地快速拒绝；探测通过后，这个进程剩余生命周期里 `getaddrinfo()` 变成对真实符号的纯透传。
 - `splice()` 的 EOF 语义修正：每次都先调用真实 `splice()`，只在返回 `-1/EPIPE` 且经 `poll()` 判定源端确实是 EOF（而非目标端真损坏）时才改写返回值。
 
-**只有一簇是例外，从不尝试"探测通过就关闭"**：`epoll_ctl`/`epoll_wait`/`epoll_pwait` 的 EPOLLONESHOT 强制（含 FIFO 写端与 TTY/PTY 写端登记、未知 key 的纯 EPOLLOUT 高频连击识别），以及 `splice()` 写入管道从不唤醒轮询等待方这条修复——这两个症状都在真机上稳定 100% 复现，是真实、非负载相关的内核行为差异，不是"探测一次决定要不要修"的候选：只要 `OHOS_COMPAT_SHIM_DISABLE` 没有关闭对应开关就常驻生效。`splice` 写入管道的修复代价见[性能](#性能)一节 `splice_pipe_to_pipe_20mb` 基准，量化了放弃零拷贝的成本。
+**只有一簇是例外，从不尝试"探测通过就关闭"**：`epoll_ctl`/`epoll_wait`/`epoll_pwait` 的 EPOLLONESHOT 强制（含 FIFO 写端与 TTY/PTY 写端登记、未知 key 的纯 EPOLLOUT 高频连击识别），以及 `splice()` 写入管道从不唤醒轮询等待方这条修复——这两个症状都在真机上稳定 100% 复现，是真实、非负载相关的内核行为差异，不是"探测一次决定要不要修"的候选：只要 `OHOS_COMPAT_SHIM_DISABLE` 没有关闭对应开关就常驻生效。`splice` 写入管道的修复代价见[性能记录](logs/performance.md)中的 `splice_pipe_to_pipe_20mb` 基准，量化了放弃零拷贝的成本。
 
 `getpwuid_r` 的 fallback 用户名来源：优先调用 `OH_OsAccount_GetName()`（`libos_account_ndk.so`，运行时 dlopen、句柄缓存，编译期零 SDK 依赖）取当前系统账号名——但只在查询的 uid 等于进程自身 uid 时（账号 API 没有 uid 参数）；失败或非自身 uid 时回落 `$LOGNAME`/`$USER`，最后退化为 `u<uid>` 占位符。其余字段（`pw_dir`/`pw_shell`/`pw_uid`/`pw_gid`）逻辑不变，账号 API 无法提供。
 
-实际效果：一旦 HarmonyOS 修复了某个真实探测/尝试型症状（`close_range`/`getpwuid_r`/`tmpfile`/`linkat`/`link`/`fchmodat2`/`getaddrinfo` 中的任意一个），**所有新启动的进程都会自动享受到这个改进**——不需要重新编译 shim，不需要重新部署，这个仓库里也不需要改一行代码。`getcwd`/`symlinkat` 两个拦截点此前也遵循这个模式；真机重测已确认原生行为修好，对应代码已删除（见上表）。
+实际效果：一旦 HarmonyOS 修复某个仍保留的真实探测/尝试型症状，**所有新启动的进程都会自动享受到这个改进**——不需要重新编译 shim 或重新部署。
 
-但这**不代表**平台跟上之后开销就会归零。只要消费者仍然 `LD_PRELOAD` 这个库，每次调用依旧要付出进入拦截函数、以及做一次 `dlsym` 缓存过的真实调用尝试的代价（在[性能](#性能)一节中实测约为 10 ns/次的透传税，对已经成功的路径来说几乎可以忽略）。真正做到*完全*零开销的唯一办法，是消费者不再为该符号预加载这个库 ——这是**消费者自己的打包决策**，shim 本身做不到，因为它在编译期根本无法预知运行时某台设备的沙箱究竟允许什么。
+但这**不代表**平台跟上之后开销就会归零。只要消费者仍然 `LD_PRELOAD` 这个库，每次调用依旧要付出进入拦截函数、以及做一次 `dlsym` 缓存过的真实调用尝试的代价（在[性能记录](logs/performance.md)中实测约为 10 ns/次的透传税，对已经成功的路径来说几乎可以忽略）。真正做到*完全*零开销的唯一办法，是消费者不再为该符号预加载这个库 ——这是**消费者自己的打包决策**，shim 本身做不到，因为它在编译期根本无法预知运行时某台设备的沙箱究竟允许什么。
 
 ### 收口跟踪
 
@@ -55,9 +55,8 @@
 | `splice`（EOF 语义）| 功能测试 `splice_eof_is_zero`（baseline 段即为探针）| 内核修正 `splice()` 的 EOF 语义，源端耗尽时返回 `0` 而不是 `EPIPE` |
 | `splice`（poll 唤醒）| 功能测试 `splice_wakes_poll_waiter`（baseline 段即为探针）| 内核让写入管道的 splice 唤醒 poll/epoll 等待者。收口后应删掉 bounce buffer 路径，恢复零拷贝 |
 | `epoll_ctl`/`epoll_wait`/`epoll_pwait`（ONESHOT 强制）| 功能测试 `epoll_oneshot_tty_write_end` | 内核对 `EPOLLOUT\|EPOLLONESHOT` 注册正确执行自动缴械，FIFO 写端与 TTY/PTY 均不再重发 |
-| `getaddrinfo` | `ohos-shim check` 自带探针 `getaddrinfo`（`ohos_compat_check.c`）| 已在每个受影响进程里自动完成：一次性后台探测确认原生行为已修好后即转为透传，本行只是留作观测 |
+| `getaddrinfo` | `ohos-shim check` 自带探针 `getaddrinfo`（`ohos_compat_check.c`）| 已在每个受影响进程里自动完成：一次性后台探测确认原生行为已修好后即转为透传，自检探针只用于确认受影响设备的当前行为 |
 
-`getcwd`/`symlinkat` 曾在这张表里；真机重测已确认修好，对应代码已删除（`getcwd` 的收口理由本来就特殊——cwd 被 rmdir 后的 `ENOENT` 本身是标准 POSIX 行为，不是平台差异，早就不该套用这张表的"等平台修"逻辑，删除后这层混淆也一并消失）。
 
 **copy fallback（`linkat`/`link`）的原子性**：字节拷贝经同目录隐藏临时文件 + `renameat` 落位，目标路径要么完整出现、要么不出现。直接 `O_CREAT|O_EXCL` + 拷贝会让目标在 0 字节时即可见——一个消费进程解析失败 `quick_exit`、而另一线程还在刷缓存时，会留下永久性 0 字节缓存文件（下次加载报 "manifest is invalid" 一类的错误）。临时文件放在 `newpath` 同目录是硬性要求：`renameat` 不能跨文件系统，绝对路径的 `newpath` 配裸临时文件名会把临时文件落到进程 CWD（可能异 fs → `EXDEV`）。
 
@@ -183,7 +182,7 @@ export OHOS_COMPAT_SHIM_DISABLE=tmpfile,link
 ```sh
 ohos-shim check                          # 默认表格输出
 ohos-shim check --json                   # 机器可读
-ohos-shim check --rounds 50              # 加大 splice/epoll_pipe 间歇性缺陷的探测轮数
+ohos-shim check --rounds 50              # 加大 splice 写入唤醒缺陷的探测轮数
 ohos-shim check --with-shim              # 追加第二遍：预加载 shim 后重跑，验证 shim 修好了
 ```
 
@@ -191,7 +190,7 @@ ohos-shim check --with-shim              # 追加第二遍：预加载 shim 后�
 
 - **仍需要**——基线复现了 shim 所修的症状，别关。
 - **可关闭**——基线行为已经正常，可以安全地塞进 `OHOS_COMPAT_SHIM_DISABLE`。
-- **不确定**——`splice`/`epoll_pipe` 这两个是间歇性缺陷（复现率随内存压力上升），
+- **不确定**——`splice` 写入唤醒是间歇性缺陷（复现率随内存压力上升），
   `--rounds` 轮全部没复现也只判「不确定」而不是「可关闭」——**未复现不等于已修复**，
   想确认就加大 `--rounds` 或在真实负载下重跑。
 
@@ -199,7 +198,7 @@ ohos-shim check --with-shim              # 追加第二遍：预加载 shim 后�
 语义（丢硬链接身份），一旦判「可关闭」就应该尽快真的关掉，不要因为「反正能用」
 就留着。
 
-另外报一组信息性的周边平台能力（`openat2`/`epoll_pwait2`/`clone3` 等裸 syscall、
+另外报告一组周边平台能力（`openat2`/`epoll_pwait2`/`clone3` 等裸 syscall、
 `ptrace`、`prctl(PR_SET_PTRACER)`、musl 的 dlopen/`.dynsym` 限制……），只供参考，
 不产出关闭建议——这些不是这个 shim（或任何 `LD_PRELOAD` shim）能修的东西，完整
 90+ 项平台能力矩阵还是要靠 `ohos-preflight`。
@@ -233,10 +232,10 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 - **`linkat`/`link`**（5 项检查）：`EEXIST` 会原样透传（对照 LTP `linkat02.c`）；在 `$TMPDIR` 里真实复现出来的 `EACCES` 会触发 copy fallback 且内容正确（`linkat`/`link` 各一项）；`linkat` 经 `/proc/self/fd/<N>` 物化 `O_TMPFILE`、以及 dirfd 源+dirfd 目的两种照搬 Bun 真实调用形状的用例。
 - **`fchmodat2`**（3 项检查）：应用请求的 mode；对符号链接目标不跟随（`AT_SYMLINK_NOFOLLOW`）；照搬 Bun `lchmod` 唯一调用点的形状。
 - **`splice`**（3 项检查）：源端 EOF 返回 `0` 而非 `-1/EPIPE`；目标端真损坏时 `EPIPE` 仍然照常报出；写入管道后能唤醒一个已经先阻塞的 `poll()` 等待方。
-- **`epoll`**（3 项检查）：有限超时被诚实遵守，不提前返回；无限等待永不泄漏一个提前的 `0`（libuv 的 `uv__io_poll` 断言正是这个）；`EPOLLOUT|EPOLLONESHOT` 注册在 FIFO 与 TTY 写端上都恰好只投递一次（第二次等待不会重发）。
+- **`epoll`**：`EPOLLOUT|EPOLLONESHOT` 注册在 FIFO 与 TTY 写端上都恰好只投递一次（第二次等待不会重发）。
 - **透传检查**（2 项）：`getpid()` 对比 `syscall(SYS_getpid)`，以及一次管道读写往返——用来证明拦截全局 `syscall()` 符号来处理 `close_range` 不会干扰其它无关的系统调用。
 
-最近一次真机运行（显式用 `env -u LD_PRELOAD` / `env LD_PRELOAD=...`，而不是依赖 shell 环境状态）：**加了 shim 之后 33/33 项计分检查全部通过**。真正的基线（无 shim）下，`7/30` 项计分检查失败（`getpwuid_r` 的 `ERANGE`、3 处 `tmpfile`、`splice` 的 EOF 语义与写唤醒、`epoll` 的 ONESHOT 强制——都和文档记录的沙箱症状完全吻合），另外若干项报告 `INFO` 而不贡献通过/失败（`close_range`/`fchmodat2` 无 shim 时无条件 `SIGSYS`，相关检查没有 shim 的保护根本没法跑完——见「已知平台行为」），还有 3 项报告 `SKIP`（不预加载的话 `close_range()` 这个符号根本不存在）。每一项在基线下能有意义地跑起来的检查，要么通过（对应真实、可用的行为），要么精确地失败/报告文档里记录的那个症状——没有意外情况。
+最近一次真机运行（显式用 `env -u LD_PRELOAD` / `env LD_PRELOAD=...`，而不是依赖 shell 环境状态）：**加了 shim 之后 31/31 项计分检查全部通过**。真正的基线（无 shim）下，`7/28` 项计分检查失败（`getpwuid_r` 的 `ERANGE`、3 处 `tmpfile`、`splice` 的 EOF 语义与写唤醒、`epoll` 的 ONESHOT 强制——都和文档记录的沙箱症状完全吻合），另外若干项报告 `INFO` 而不贡献通过/失败（`close_range`/`fchmodat2` 无 shim 时无条件 `SIGSYS`，相关检查没有 shim 的保护根本没法跑完——见「已知平台行为」），还有 3 项报告 `SKIP`（不预加载的话 `close_range()` 这个符号根本不存在）。每一项在基线下能有意义地跑起来的检查，要么通过（对应真实、可用的行为），要么精确地失败/报告文档里记录的那个症状——没有意外情况。
 
 ### 双轨确认：OpenHarmony 容器
 
@@ -253,94 +252,7 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 
 ## 性能
 
-`test/bench.c`（`make bench`）测量单次调用的开销。下面的数字是在真实 HarmonyOS 硬件上跑 3 次取平均（基线 vs. `LD_PRELOAD` 加 shim，都显式用 `env -u LD_PRELOAD` / `env LD_PRELOAD=...`，而不是依赖 shell 状态 —— 原因见「已知平台行为」）。这台设备的数字本身单次运行间波动很大（单次运行之间能差 ±20-40%），所以这些数字只能当作数量级参考，不是精确值：
-
-| 测试项 | 基线 | 加 shim | 差值 |
-|---|---|---|---|
-| `syscall()` 透传（任意*其它*系统调用号） | 258.5 ns/次 | 327.1 ns/次 | **+68.6 ns（+27%）** |
-| `close_range` | **N/A —— 每次都崩溃，没有 shim 就没法 fallback** | 108 250 ns/次 | 只有加了 shim 才能跑完这个操作 |
-| `close_range` fallback 算法（单独测量） | 106 512 ns/次 | 113 715 ns/次 | 数量级相同（代码本身完全一样）|
-| `getpwuid_r` | 68 530 ns/次 | 72 128 ns/次 | **+3598 ns（+5.2%）** |
-| `tmpfile` | 3 011 710 ns/次 | 4 231 301 ns/次 | **+1 219 591 ns（+40%）** |
-| `epoll_wait`（空注册表）| ~316 ns/次 | ~616 ns/次 | ONESHOT 注册表锁+扫描的固定成本（单次运行，非三次平均，仅供数量级参考）|
-| `epoll_ctl` churn（ADD/MOD/DEL 循环）| ~1621 ns/次 | ~3339 ns/次 | 同上（单次运行） |
-| `splice`（管道到管道，20MB）| ~2610 MB/s（零拷贝）| ~1008 MB/s（用户态 bounce buffer）| 放弃零拷贝的实测代价（单次运行）|
-
-要点：
-
-- **`close_range` 没有「基线」数字**—— 真实系统调用在这台设备上无条件 `SIGSYS`（见「已知平台行为」），所以一个没加 shim 的进程一次都没法完成 这个操作。约 108–114 μs 的加 shim 开销完全来自 `/proc/self/fd` 枚举 （`cr_do_fallback()`），而且是这台设备上**每一次** `close_range` 调用 都要付出的代价，不是偶尔才发生的最坏情况 —— 目前没有更快的路径可用。 「close_range」和「close_range fallback 算法」两行落在同一个量级 （而不是其中一个可以忽略不计）正是「每次加了 shim 的调用都走了 fallback 路径」这个预期结论的印证。
-- 一旦预加载这个库，**每一次**原始 `syscall()` 调用都要付出的税——不只是 `close_range` 调用——在这里是真实存在的、两位数百分比的 相对开销（虽然绝对值仍在亚微秒级别）。对一个大量使用 `syscall()` 的消费者（比如 Bun 的 `c-bindings.cpp`，`close_range`、`pwritev2`、 `exit_group` 全都是走公开的 `syscall()` 符号）影响最大。
-- `tmpfile` 的相对差值是这几个 libc 级符号里最大的，但两个数字都被真实文件系统 I/O 主导（无论哪种情况都是 3-4+ 毫秒）；多出来的开销 来自先尝试真实调用（很快就会失败）、然后再 fallback 到 `mkstemp()`—— 这是「始终优先尝试真实实现」这个设计固有的代价。
-- `epoll_wait`/`epoll_ctl` 的开销来自 ONESHOT 强制的注册表锁+扫描，即使 epfd 上零条目也要付出；`splice` 放弃零拷贝换正确性，约 61% 吞吐下降，只在目标是 FIFO 时触发。
-
-### 容器对比：fallback 到底要花多少代价
-
-仅作参照 —— 容器不是部署目标（见上文），它是一个宽松的基线，用来单独衡量 fallback 路径在真机上到底要花多少代价。`test/bench.c`，同一个二进制，在 OpenHarmony 容器里运行（真实系统调用在那里能原生成功，跑 3 次，不需要 shim，因为基线本身走的就是真实路径）：
-
-| 测试项 | HM 真机（强制走 fallback） | OH 容器（原生） | 倍数 |
-|---|---|---|---|
-| `close_range` | 108 250 ns/次 | ~1867 ns/次 | **真机慢约 58 倍** |
-| `getpwuid_r` | 68 530 ns/次 | ~5080 ns/次 | **慢约 13 倍** |
-| `tmpfile` | 3 011 710 ns/次 | ~33 500 ns/次 | **慢约 90 倍** |
-
-这个差距不是 shim 本身的开销 —— 而是「真实系统调用/libc 调用直接就能用」和「每次调用都需要一个用户态的变通方案」（`close_range` 靠 `/proc/self/fd` 枚举、`tmpfile` 靠 `mkstemp()`、`getpwuid_r` 靠合成用户记录）之间真实存在的成本差异。这也是上面收口跟踪表为什么重要的最直接证据：HarmonyOS 补上的每一个缺口，对用了 shim 的消费者来说，都是一次实打实的、两位数倍数级别的性能提升，而不仅仅是修正确性。
-
-### 容器内部：加不加 shim
-
-和上面那张表问的是不同的问题：既然真实调用在容器里本来就都会成功，那单纯*加载了 shim*、但它从来不需要走 fallback 时，到底要花多少代价？
-
-最初跑的 5 轮基线接着 5 轮加 shim 的方案里，加 shim 的数字在每一项指标上都*一致地更低*——这在物理上是不可能的（shim 只能多做一次 `dlsym` 缓存过的真实调用尝试再加一次分支判断，不可能凭空省掉工作），是一个测量伪影的信号：先把 5 轮基线全跑完、再跑 5 轮加 shim，会让这段时间里任何正在「热身」的东西（页缓存、容器/会话级别的一次性开销）都渗进来，造成一种「加了 shim 反而更快」的假象。改成严格**交替**采样（基线/加 shim/基线/加 shim/……），按每一轮的配对差值取平均 —— 这样比拿两个独立的区块做对比，能更好地抵消随时间的漂移。6 轮和 20 轮都还是功效不足（95% 置信区间和点估计本身差不多宽，甚至更宽，`tmpfile` 在 n=6 时看起来的一点点倾向到了 n=20 直接反了个方向）。扩大到**100 轮交替**，每个进程都用 `env -i` 加一份显式的变量白名单启动（`PATH`/`TMPDIR`/`HOME`，`LD_PRELOAD` 只在加 shim 的那一半才加），而不是继承任何 shell 状态，得到一份功效足够的读数：
-
-| 测试项 | 基线均值 | 加 shim 均值 | 配对差值 | 95% 置信区间 | 是否显著 |
-|---|---|---|---|---|---|
-| `syscall()` 透传 | 168.9 ns | 182.3 ns | **+13.5 ns（+8.0%）** | **±6.8 ns** | **是（t=3.92）** |
-| `close_range` | 1814.4 ns | 1824.5 ns | +10.2 ns | ±82.4 ns | 否（t=0.24）|
-| `close_range` fallback 算法（独立测量） | 5575.6 ns | 5558.6 ns | -17.0 ns | ±184.3 ns | 否（t=-0.18）|
-| `getpwuid_r` | 4212.4 ns | 4216.8 ns | +4.4 ns | ±132.5 ns | 否（t=0.07）|
-| `tmpfile` | 19 726.9 ns | 19 329.6 ns | -397.3 ns | ±697.4 ns | 否（t=-1.13）|
-
-（配对 t 检验，df=99，临界 \|t\|=1.984。）
-
-**在 n=100 时，终于有一个真实效应从噪声里分离出来了：`syscall()` 透传。**+13.5 ns/次，95% 置信区间 [+6.7, +20.3] ns —— 完全在零以上。这正是进程里每一次非 `close_range` 的 `syscall()` 调用都无条件要经过的路径（shim 的 `syscall()` 覆盖实现里那次系统调用号判断+分支），所以这里出现一个小而真实、始终要付出的固定成本，正是设计所预期的。这和真机上同一测试项的发现（[性能](#性能)一节：+27%）互相印证——同一个底层机制，只是幅度不同（这个容器里基线调用本身就更便宜，而且真机上其它开销来源在这里都不适用），这本身也是一次合理性检验：一个真实的、有物理原因的效应，理应在两种环境下都表现为*某种*正的差值，而这里确实如此。
-
-**其余项即便到 n=100 依旧不显著**，不过现在置信区间已经窄到有意义了（比如 `close_range` 在约 1814 ns 基线上的 ±82.4 ns）—— 这已经不再是「探测不到效应」，而是「在这个精度下确实探测不到效应」。结合真机上的数字一起看（那边 shim 的 fallback 逻辑在大多数调用里是真的会介入的），这两组数据一致地表明：shim 真实世界里的开销几乎全都来自 fallback 路径本身的执行，而不是插桩这个动作本身，也不是任何超出那一个共用的 `syscall()` 入口点之外的、按符号区分的派发逻辑——每个进程都要为经过这个入口付出一份小而固定、现在已经量化出来的成本。
-
-### 真实实现 vs. fallback 实现，直接对比
-
-上面所有数字比较的都是「加了 shim」vs.「没加 shim」——但在容器里，真实调用总是成功，所以 shim 自己的 fallback 逻辑根本不会自然触发，也就没法被测量或者做行为对比。`test/real_vs_fallback.c` 直接、无条件地调用两种实现（fallback 是从 `ohos_compat_shim.c` 逐字复刻出来的，不经过 shim 的派发逻辑），用来回答一个不一样、更直接的问题：**当 fallback 真的在真机上介入时，它的输出和成本，跟它所替代的真实实现比起来怎么样？**
-
-**功能差异**（`--dump` 模式；这个容器没有设置 `LOGNAME`/`USER`，这也符合实际情况 —— 一个沙箱化的 HAP 通常也不会设置）：
-
-| 字段 | `getpwuid_r` 真实实现 | `getpwuid_r` fallback |
-|---|---|---|
-| `pw_name` | `root` | `u0`（容器里无账号服务/环境变量时的退化值；真机上 `uid==getuid()` 时优先返回 `OH_OsAccount_GetName` 的账号名，本机实测 `hyq`）|
-| `pw_passwd` | `x` | ``（空 —— 没有对应物）|
-| `pw_gecos` | `root` | `u0`（和 `pw_name` 保持一致，真机同上）|
-| `pw_dir` | `/root` | `/root`（一致 —— 两边都读的是 `$HOME`）|
-| `pw_shell` | `/bin/sh` | `/bin/false`（写死的 —— 没办法知道真实 shell 是什么）|
-| `pw_uid` / `pw_gid` | `0` / `0` | `0` / `0`（一致 —— 来自真实系统调用，不是环境变量）|
-
-所以 fallback 在数值型身份字段和 `pw_dir` 上是准确的（只要 `$HOME`设置了，实践中它基本总是设置的）。字符串型身份字段：真机上查询自身 uid 时 name/gecos 取的是真实账号名（`OH_OsAccount_GetName`，本机实测 `hyq`），只有账号服务不可用或查询别的 uid 时才退化为 env/`u<uid>` 占位符；`pw_shell` 依旧写死为 `/bin/false`（账号 API 无法提供）。`tmpfile` 的写入/读回往返在真实实现和 fallback 之间完全一致（在这个测试深度下没发现功能差异）。
-
-在 5 次重复的 `--dump` 运行之间做了交叉复核，两两互相比对：真实实现和 fallback 两边的输出每次都逐字节完全一致。这些是确定性的、结构性的差异（纯靠 `getenv()` 合成能填哪些字段、不能填哪些字段），不是抖动或者跟时间相关的输出。
-
-**性能**（6 轮，单进程对比 —— 这里的效应大小已经足够大，不像上面加 shim vs. 基线的数字那样需要重的统计处理才能相信）：
-
-| 符号 | 真实实现均值 | fallback 均值 | 倍数 |
-|---|---|---|---|
-| `getpwuid_r` | 5844.3 ns/次 | 322.6 ns/次 | **fallback 快约 18.1 倍** |
-| `tmpfile` | 33 893.3 ns/次 | 29 980.1 ns/次 | 约 1.13 倍（每次跑方向都会反转 —— 基本打平）|
-
-这和 `close_range` 正好是**相反**的方向 —— `close_range` 的 fallback（`/proc/self/fd` 枚举）比真实系统调用要慢 40-90 倍（见[容器对比](#容器对比fallback-到底要花多少代价)）。规律是：一个 fallback 到底比真实调用快还是慢，完全取决于真实调用做了多少 fallback 不需要重做的工作——`getpwuid_r` 的真实路径要做一次 NSS/`/etc/passwd` 查找，fallback 基本跳过（查询自身 uid 时多一次缓存后的账号服务 IPC，失败则纯 `getenv()`）；相比之下，`close_range` 的 fallback 得*主动去枚举并关闭*文件描述符，来近似内核本来会直接做的事情；`tmpfile` 的 fallback 依旧要做真实的文件系统 I/O（`mkstemp()`），所以它和真实调用处在同一个成本量级，而不是彻底跳过了工作。这里不存在一条「fallback 就是更慢」或者「fallback 就是更快」的通用规律——得按每个符号具体去核实。
-
-**同一个工具，在真实 HarmonyOS 设备上运行**（`make real-vs-fallback`，单次运行 —— 下面真机上的数字，方向上和 shim 自己在[性能](#性能)一节里 averaged 出的真机基准数据是一致的，这正是用来确认这些不是偶然波动的关键）：
-
-| 符号 | 真实实现（失败）均值 | fallback 均值 | 倍数 |
-|---|---|---|---|
-| `getpwuid_r` | 58 023.9 ns/次 | 673.1 ns/次 | fallback 快约 86 倍 |
-| `tmpfile` | 2 665 842.2 ns/次 | 107 955.5 ns/次 | fallback 快约 25 倍 |
-
-真机讲的是同一个故事更极端的版本，原因是容器展示不出来的：在真实硬件上，`getpwuid_r` 和 `tmpfile` 的「真实」调用不只是比 fallback 做了更多工作——它们会**直接失败**，而失败本身也是要花真实时间的（分别是 58 μs 和 2.7 ms，仅仅是为了走到 `ENOENT`/`EPERM` 然后放弃），这些时间发生在 shim 的派发逻辑真正开始尝试 fallback 之前。这份「尝试后失败」的成本，是这个 shim 在真机上每一次 `getpwuid_r`/`tmpfile` 调用都要背负的固定开销——这也是为什么这两项在[性能](#性能)一节的「加 shim vs. 基线」数字里显示出最大的相对开销，而且这不是 fallback 设计能够避免的：shim 始终优先尝试真实实现，依据的判断是「一次缓慢但保证结果新鲜的检查，好过一次快但可能出错的假设」（见[前向兼容](#前向兼容优先自动尝试真实系统调用)）。
+真机与 OpenHarmony 容器的基准数据、fallback 对比和测量方法属于历史参考，详见[性能记录](logs/performance.md)。这些数据用于说明开销数量级，不能代替目标设备上的复测。
 
 ## License
 

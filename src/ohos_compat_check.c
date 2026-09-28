@@ -24,17 +24,11 @@
  *       (close_range, getpwuid_r, tmpfile, fchmodat2, linkat, link, splice,
  *       epoll_pipe, getaddrinfo, std_streams). Each gets a NEEDED/DROPPABLE/
  *       INCONCLUSIVE verdict and feeds the DISABLE recommendation line;
- *       splice and epoll_pipe each cover two independent symptoms under
- *       one shim-side toggle, so their own sub-probes appear as separate
- *       rows for visibility but only the combined row carries the
- *       suggestion. std_streams gets an INCONCLUSIVE-only row since this
- *       binary can't trigger its condition (see probe_std_streams()).
- *   B — two kinds of row, neither eligible for the DISABLE line: (1)
- *       interceptors the shim used to carry but has since had removed
- *       once they stopped reproducing (getcwd, symlinkat,
- *       getaddrinfo_addrconfig, epoll_pipe_epollin) — kept here purely so
- *       a regression on some other OHOS version stays visible; (2)
- *       surrounding platform capabilities this workspace has documented
+ *       splice covers two independent symptoms under one shim-side toggle;
+ *       its sub-probes appear as separate rows, but only the combined row
+ *       carries the suggestion. std_streams gets an INCONCLUSIVE-only row
+ *       since this binary can't trigger its condition (see probe_std_streams()).
+ *   B — surrounding platform capabilities this workspace has documented
  *       workarounds for (raw syscalls Bun's rustix backend can't be
  *       LD_PRELOAD-shimmed for, ptrace, prctl(PR_SET_PTRACER), the musl
  *       dlopen/.dynsym limitation, ...) that no LD_PRELOAD shim can fix.
@@ -59,7 +53,6 @@
 #include <limits.h>
 #include <linux/openat2.h>
 #include <netdb.h>
-#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
@@ -358,10 +351,9 @@ static void run_guarded_timeout(child_fn fn, void *arg, child_result_t *out,
 }
 
 /* ==================================================================== */
-/*  Candidate path set — the four path-sensitive interceptors           */
-/*  (getcwd/tmpfile/linkat/symlinkat) depend on WHICH filesystem a path  */
-/*  lives on, not just the OS version, so every probe below runs once    */
-/*  per candidate directory rather than once globally.                   */
+/*  Candidate path set — linkat/link probes depend on the filesystem   */
+/*  path, so they run once per candidate directory rather than once    */
+/*  globally.                                                          */
 /* ==================================================================== */
 
 #define NUM_CANDIDATE_DIRS 5
@@ -619,59 +611,7 @@ static void probe_tmpfile(void)
 	}
 }
 
-/* -- getcwd -------------------------------------------------------------- */
-
-/* B-group (informational): the shim no longer intercepts getcwd() at all
- * (removed once this stopped reproducing -- see git history), so there is
- * no OHOS_COMPAT_SHIM_DISABLE token left to recommend toggling. Kept here
- * purely so a regression on some other OHOS version stays visible instead
- * of silently going untested. */
-static void probe_getcwd(void)
-{
-	report_row_t *r = add_row("getcwd", "B",
-		"hmdfs 祖先目录缺 +x 导致 getcwd() 用户态父目录遍历失败（拦截点已删除，仅存留观测）");
-
-	char orig[PATH_MAX];
-	if (!getcwd(orig, sizeof(orig)))
-		snprintf(orig, sizeof(orig), "/");
-
-	int any_needed = 0;
-	char detail[400] = "";
-	size_t off = 0;
-
-	/* getcwd() from each candidate dir -- catches hmdfs ancestor EACCES the
-	 * same way the shim's guard condition does. (A separately-tested,
-	 * intentionally NOT covered here: cwd rmdir'd out from under the
-	 * process. That returns ENOENT, standard POSIX behavior on every
-	 * platform, not an OHOS-specific gap -- probing for it here would
-	 * conflate "still needed" with "still POSIX-compliant".) */
-	for (int i = 0; i < NUM_CANDIDATE_DIRS; i++) {
-		char scratch[PATH_MAX];
-		const char *dir = candidate_dir(i, scratch, sizeof(scratch));
-		if (!dir)
-			continue;
-		struct stat st;
-		if (stat(dir, &st) != 0)
-			continue;
-		if (chdir(dir) != 0)
-			continue;
-		char cwdbuf[PATH_MAX];
-		errno = 0;
-		char *ok = getcwd(cwdbuf, sizeof(cwdbuf));
-		if (!ok && errno == EACCES) {
-			any_needed = 1;
-			off += (size_t)snprintf(detail + off, sizeof(detail) - off,
-				"[%s: errno=%d] ", dir, errno);
-		}
-		chdir(orig);
-	}
-
-	r->verdict = any_needed ? V_NEEDED : V_DROPPABLE;
-	snprintf(r->note, sizeof(r->note), "%s",
-		any_needed ? detail : "所有探测路径下真实 getcwd() 均成功");
-}
-
-/* -- linkat / symlinkat --------------------------------------------------- */
+/* -- linkat --------------------------------------------------------------- */
 
 static void probe_linkat(void)
 {
@@ -770,48 +710,6 @@ static void probe_link(void)
 		any_needed ? detail : "所有可写候选目录下真实 link() 均成功");
 }
 
-/* B-group (informational): the shim no longer intercepts symlinkat() at
- * all (removed once this stopped reproducing -- see git history), so
- * there is no OHOS_COMPAT_SHIM_DISABLE token left to recommend toggling.
- * Kept here purely so a regression on some other OHOS version stays
- * visible instead of silently going untested. */
-static void probe_symlinkat(void)
-{
-	report_row_t *r = add_row("symlinkat", "B",
-		"hmdfs/沙箱安装目标目录的符号链接（拦截点已删除，仅存留观测）");
-	int any_needed = 0, tested = 0;
-	char detail[400] = "";
-	size_t off = 0;
-
-	for (int i = 0; i < NUM_CANDIDATE_DIRS; i++) {
-		char scratch[PATH_MAX];
-		const char *dir = candidate_dir(i, scratch, sizeof(scratch));
-		if (!dir || access(dir, W_OK) != 0)
-			continue;
-		char dst[PATH_MAX];
-		snprintf(dst, sizeof(dst), "%s/ohos-check-symlink-dst-%d", dir, (int)getpid());
-		unlink(dst);
-		errno = 0;
-		int rc = symlinkat("target-does-not-need-to-exist", AT_FDCWD, dst);
-		tested = 1;
-		if (rc != 0 && (errno == EPERM || errno == EACCES)) {
-			any_needed = 1;
-			off += (size_t)snprintf(detail + off, sizeof(detail) - off,
-				"[%s: errno=%d] ", dir, errno);
-		}
-		unlink(dst);
-	}
-
-	if (!tested) {
-		r->verdict = V_INCONCLUSIVE;
-		snprintf(r->note, sizeof(r->note), "没有可写的候选目录，未能测试");
-		return;
-	}
-	r->verdict = any_needed ? V_NEEDED : V_DROPPABLE;
-	snprintf(r->note, sizeof(r->note), "%s",
-		any_needed ? detail : "所有可写候选目录下真实 symlinkat() 均成功");
-}
-
 /* -- epoll_pipe's ONESHOT-enforcement half ------------------------------ */
 /*
  * Registers EPOLLOUT|EPOLLONESHOT on an fd that is continuously write-ready
@@ -886,14 +784,11 @@ static void probe_epoll_oneshot(void)
 			(pty_refires > 0 ? "复现" : "未复现"));
 }
 
-/* -- splice / epoll_pipe: multi-round + memory-pressure stress ---------- */
+/* -- splice wakeup: repeated probes under memory-pressure stress ------- */
 /*
- * Both defects are load-dependent (the shim's own comments record the T50
- * epoll bug's repro rate tracking memory pressure). A single clean pass
- * proves nothing, so these two run --rounds times under a background
- * memcpy/sched_yield stress pool, and a full clean pass is reported
- * INCONCLUSIVE, never DROPPABLE — "didn't reproduce" is not "fixed" for an
- * intermittent bug.
+ * This defect is intermittent, so one clean pass proves nothing. Repeat
+ * under a background memcpy/sched_yield stress pool and report a clean run
+ * as INCONCLUSIVE, never DROPPABLE.
  */
 
 static int g_rounds = 20;
@@ -1028,9 +923,9 @@ static int splice_wake_defect_once(void)
 }
 
 /* Split into two independent rows -- EOF-on-source-as-EPIPE is deterministic
- * (one call either shows it or doesn't), the write-side wakeup defect is
- * load-dependent (needs --rounds under stress, and a clean pass only ever
- * proves INCONCLUSIVE, never DROPPABLE, same policy as epoll_pipe below).
+ * (one call either shows it or doesn't), while the write-side wakeup defect
+ * is load-dependent (needs --rounds under stress, and a clean pass only ever
+ * proves INCONCLUSIVE, never DROPPABLE).
  * The two can be fixed on different platform schedules, so combining them
  * into one row would hide which half of the shim's OHOS_COMPAT_SHIM_DISABLE=
  * splice toggle a device still needs -- the combining probe_splice() wrapper
@@ -1105,165 +1000,18 @@ static void probe_splice(void)
 	}
 }
 
-typedef struct {
-	int epfd;
-	int rc;
-} epoll_wait_arg_t;
-
-static void *epoll_waiter_thread(void *arg)
-{
-	epoll_wait_arg_t *a = arg;
-	struct epoll_event out[1];
-	a->rc = epoll_wait(a->epfd, out, 1, 2000);
-	return NULL;
-}
-
-/* Must test the actual missed-WAKEUP shape (a waiter already blocked in
- * epoll_wait() when data arrives), not "is data already there before the
- * wait is even issued" -- the latter is trivially satisfied by any epoll
- * implementation and previously made this probe read droppable
- * unconditionally, never having exercised the race it exists to catch. */
-static int epoll_pipe_defect_once(void)
-{
-	int p[2];
-	if (pipe(p) != 0)
-		return -1;
-	int epfd = epoll_create1(0);
-	if (epfd < 0) {
-		close(p[0]);
-		close(p[1]);
-		return -1;
-	}
-	struct epoll_event ev;
-	memset(&ev, 0, sizeof(ev));
-	ev.events = EPOLLIN;
-	ev.data.fd = p[0];
-	epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev);
-
-	epoll_wait_arg_t arg = { .epfd = epfd, .rc = -99 };
-	pthread_t th;
-	if (pthread_create(&th, NULL, epoll_waiter_thread, &arg) != 0) {
-		close(epfd);
-		close(p[0]);
-		close(p[1]);
-		return -1;
-	}
-	usleep(300 * 1000);
-	write(p[1], "x", 1);
-	pthread_join(th, NULL);
-
-	close(epfd);
-	close(p[0]);
-	close(p[1]);
-	return (arg.rc > 0) ? 0 : 1;
-}
-
-/* B-group (informational): the shim no longer synthesizes EPOLLIN at all
- * (removed once this stopped reproducing under a corrected already-
- * blocked-waiter probe -- see git history), so there is no
- * OHOS_COMPAT_SHIM_DISABLE token left to recommend toggling for it
- * specifically (epoll_pipe above, the ONESHOT-enforcement row, covers the
- * one symptom that remains under that name). Kept here purely so a
- * regression on some other OHOS version stays visible instead of
- * silently untested. */
-static void probe_epoll_pipe_epollin(void)
-{
-	report_row_t *r = add_row("epoll_pipe_epollin", "B",
-		"epoll/poll 丢失管道可读状态 -- 合成 EPOLLIN 是否仍需要（拦截点已删除，仅存留观测）");
-
-	start_stress();
-	int needed_rounds = 0, errors = 0;
-	for (int i = 0; i < g_rounds; i++) {
-		int res = epoll_pipe_defect_once();
-		if (res < 0)
-			errors++;
-		else if (res > 0)
-			needed_rounds++;
-	}
-	stop_stress();
-
-	if (needed_rounds > 0) {
-		r->verdict = V_NEEDED;
-		snprintf(r->note, sizeof(r->note), "在 %d/%d 轮复现（%d 轮建立失败）",
-			needed_rounds, g_rounds, errors);
-	} else {
-		r->verdict = V_INCONCLUSIVE;
-		snprintf(r->note, sizeof(r->note),
-			"%d 轮加压下未复现（%d 轮建立失败）——间歇性缺陷，未复现不等于"
-			"已修复，必要时用更大的 --rounds 重跑", g_rounds, errors);
-	}
-}
-
 /* -- getaddrinfo ---------------------------------------------------------
  *
- * Two independent symptoms, two rows: AI_ADDRCONFIG's loopback-family
- * filtering and the resolver's handling of syntactically invalid hostnames
- * can regress or get fixed on different schedules, so each gets its own
- * verdict rather than one row conflating both.
+ * The resolver's handling of syntactically invalid hostnames is probed
+ * separately because a slow failure can take several seconds.
  *
  * Calls the plain `getaddrinfo` symbol directly (same convention as
- * probe_tmpfile()/probe_getcwd() above) rather than dlsym(RTLD_NEXT, ...):
+ * probe_tmpfile() above) rather than dlsym(RTLD_NEXT, ...):
  * the baseline pass (no LD_PRELOAD) resolves this to real libc, and
  * `ohos-shim check --with-shim`'s second pass resolves it to the shim's own
  * interposed getaddrinfo() -- exactly the two conditions this check needs
  * to distinguish.
  */
-
-/* B-group (informational): the shim no longer merges in extra AF_INET
- * results for this symptom (removed once it stopped reproducing -- see
- * git history), so there is no OHOS_COMPAT_SHIM_DISABLE token left to
- * recommend toggling for it specifically (getaddrinfo_badchars below
- * covers the one symptom that remains). Kept here purely so a regression
- * on some other OHOS version stays visible instead of silently untested. */
-static void probe_getaddrinfo_addrconfig(void)
-{
-	report_row_t *r = add_row("getaddrinfo_addrconfig", "B",
-		"AI_ADDRCONFIG 查询 localhost 是否错误只返回 IPv6 loopback（拦截点已删除，仅存留观测）");
-
-	struct addrinfo hints = { 0 };
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_ADDRCONFIG;
-
-	struct addrinfo *res = NULL;
-	int rc = getaddrinfo("localhost", NULL, &hints, &res);
-	if (rc != 0) {
-		/* Can't evaluate the AI_ADDRCONFIG symptom without a
-		 * resolvable "localhost" -- not a verdict on the bug itself. */
-		r->verdict = V_INCONCLUSIVE;
-		snprintf(r->note, sizeof(r->note),
-			"getaddrinfo(\"localhost\", AI_ADDRCONFIG) 失败: %s -- 无法判定",
-			gai_strerror(rc));
-		return;
-	}
-
-	int n = 0, has_v4 = 0, all_v6_loopback = 1;
-	for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-		n++;
-		if (ai->ai_family == AF_INET) {
-			has_v4 = 1;
-			all_v6_loopback = 0;
-			continue;
-		}
-		if (ai->ai_family != AF_INET6 ||
-		    ai->ai_addrlen < sizeof(struct sockaddr_in6) ||
-		    !IN6_IS_ADDR_LOOPBACK(
-			    &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr))
-			all_v6_loopback = 0;
-	}
-	freeaddrinfo(res);
-
-	if (n > 0 && all_v6_loopback && !has_v4) {
-		r->verdict = V_NEEDED;
-		snprintf(r->note, sizeof(r->note),
-			"复现: AI_ADDRCONFIG 只返回 %d 条 IPv6 loopback，无 IPv4 -- "
-			"Happy-Eyeballs 调用方拿不到 IPv4 兜底地址", n);
-	} else {
-		r->verdict = V_DROPPABLE;
-		snprintf(r->note, sizeof(r->note),
-			"未复现: %d 条结果，has_v4=%d -- AI_ADDRCONFIG 行为正常", n, has_v4);
-	}
-}
 
 /* Real getaddrinfo() with a hostname carrying a character outside the
  * DNS/hostname alphabet (matching the shim's own hostname_has_invalid_chars()
@@ -1734,15 +1482,6 @@ static void probe_dlopen_dynsym(void)
 
 static void run_b_group_probes(void)
 {
-	/* Retired A-group interceptors: the shim no longer carries code for
-	 * these symptoms (deleted once they stopped reproducing), so they no
-	 * longer feed the DISABLE recommendation, but stay probed here so a
-	 * regression on some other OHOS version is still visible. */
-	probe_getcwd();
-	probe_symlinkat();
-	probe_getaddrinfo_addrconfig();
-	probe_epoll_pipe_epollin();
-
 	probe_b_generic("openat2", "openat2(RESOLVE_BENEATH)——bun rustix 走裸 syscall，"
 		"LD_PRELOAD 打不到，只能等平台放开或改源码", child_openat2);
 	probe_b_generic("epoll_pwait2", "bun 事件循环纳秒级超时——同上，裸 syscall",
@@ -1894,7 +1633,7 @@ static void print_usage(void)
 		"不产出 DISABLE 建议）。\n"
 		"\n"
 		"  --json         机器可读输出\n"
-		"  --rounds N     splice/epoll_pipe 等间歇性缺陷的重复探测轮数（默认 20）\n"
+		"  --rounds N     splice 写入管道唤醒缺陷的重复探测轮数（默认 20）\n"
 		"  --with-shim    追加第二遍：预加载 libohos_compat.so 后重跑一遍，验证 shim 修好了\n"
 		"\n"
 		"通常通过 `ohos-shim check` 调用（自动 env -u LD_PRELOAD）；也可以直接把\n"
