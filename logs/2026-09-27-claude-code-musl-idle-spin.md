@@ -1,58 +1,32 @@
-# Historical validation: epoll ONESHOT idle spin in musl Claude Code
+# 历史验证：musl Claude Code 的 epoll ONESHOT 闲时自旋
 
-This device-specific investigation records the evidence behind the FIFO
-`EPOLLOUT|EPOLLONESHOT` repair in `src/ohos_compat_shim.c`. It is not a
-performance guarantee for other devices or application versions.
+本文记录特定 HarmonyOS 设备上的调查结果，作为源码中 FIFO `EPOLLOUT|EPOLLONESHOT` 修复的依据。以下测量不代表其他设备或系统版本。
 
-## Finding
+## 结论
 
-On the tested HarmonyOS device, the kernel repeatedly delivered `EPOLLOUT`
-for an empty pipe writer registered with `EPOLLONESHOT`. An official
-Claude Code 2.1.283 musl binary produced about 22.8 million pure-`EPOLLOUT`
-events in 40 seconds. The registration remained present in
-`/proc/<pid>/fdinfo`, despite the application not re-arming it. The wait path
-used the interposable libc `epoll_pwait` symbol; this was not an inline raw
-syscall that `LD_PRELOAD` could not see.
+- 在受测设备上，空管道的写端注册 `EPOLLOUT|EPOLLONESHOT` 后，内核会反复报告 `EPOLLOUT`。
+- 官方 Claude Code 2.1.283 musl 二进制在 40 秒内产生约 2,280 万次纯 `EPOLLOUT` 事件；即使没有重新 arm，注册仍显示在 `/proc/<pid>/fdinfo` 中。
+- 等待路径经过可由 preload 拦截的 libc `epoll_pwait`，并非不可见的内联原始系统调用。
+- 初版 shim 修复还暴露了两个问题：抑制匹配事件时没有触发节流；重复的内核 `EPOLL_CTL_DEL` 返回 `ENOENT`，但 fdinfo 仍显示注册。20 秒观察到 860,561 次删除失败。修正实现将删除操作限制为每次 arm 一次，并对重复的幽灵事件退避。状态机回归覆盖见 `test/epoll_ghost.c`。
 
-The initial shim repair suppressed repeated events, but the first interactive
-TUI test exposed two issues in that repair: matched-event suppression did
-not request pacing, and repeated kernel-side `EPOLL_CTL_DEL` attempts returned
-`ENOENT` while the registration remained visible. A 20-second observation
-counted 860,561 failed deletes. The implementation was corrected to attempt
-delete at most once per arm and back off repeated ghost events. The deterministic
-state-machine regression cases are in `test/epoll_ghost.c`.
+## A/B 测量
 
-## Device A/B result
+使用同一官方二进制和相同屏幕，交替顺序测试三轮；跳过前 4 秒：
 
-The same official binary and idle TUI screen were run in alternating order,
-three times each. CPU usage excludes the first four seconds of startup.
-
-| Run | Before pacing fix | After pacing fix |
+| 轮次 | 修复前 CPU | 修复后 CPU |
 |---|---:|---:|
 | 1 | 100.45% | 1.24% |
 | 2 | 100.45% | 1.32% |
 | 3 | 100.69% | 1.06% |
 
-Interactive and non-interactive musl runs both stopped exhibiting the measured
-spin after the fix. These numbers describe this device and test setup only.
+交互与非交互模式下的 musl 版本都停止了这项已测得的自旋。结论仅适用于该设备和测试配置。
 
-## Follow-up: residual application CPU
+## 后续观察
 
-A later, longer sample measured roughly 0.8–1.2% steady-state CPU after the
-shim fix. The main thread remained blocked; periodic groups of 7–8 short-lived
-threads appeared about every 30 seconds and ran for roughly 10 seconds. The
-pattern points to periodic Claude Code or runtime activity, but the worker
-threads were not individually sampled and the same run was not compared with
-the tap Bun runtime. This follow-up therefore does not establish the source
-of that residual CPU and is not evidence of an epoll shim regression.
+修复后较长时间采样仍可见约 0.8–1.2% 的稳定 CPU 占用。主线程处于阻塞状态；线程组中约每 30 秒出现 7–8 个短生命周期线程，持续约 10 秒。模式可能与 CLI 或运行时的周期性活动有关，但没有逐个采样这些线程，也没有与 tap Bun 版本对照，因此尚未确认来源，不能作为 shim 回归的证据。
 
-## Method notes
+## 方法说明
 
-- The first poll/epoll probes closed the pipe writer before joining the waiter,
-  allowing `HUP` to create a false wakeup. Corrected probes kept the writer
-  open until after the waiter joined.
-- CPU measurements used per-thread `/proc/<pid>/task/*/stat` deltas. Event
-  masks were observed with a separate preload probe; `fdinfo` snapshots were
-  used to confirm the registrations remained present.
-- Earlier raw-syscall and “preload cannot fix the TUI” conclusions were
-  disproved by the later PC sample and are intentionally omitted here.
+- 早期探针曾在等待线程 join 前关闭写端，导致 `HUP` 造成假唤醒；修正后保持写端打开直至 join 完成。
+- 按线程读取 `/proc` stat 增量；事件掩码分别通过 preload 记录，并采集 fdinfo 快照。
+- 早期关于原始系统调用以及“preload 无法修复 TUI”的判断，后来被 PC 采样结果和遗漏的观测推翻，不再采用。
