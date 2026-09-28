@@ -11,32 +11,32 @@
 | `close_range()` / `syscall(SYS_close_range)` | `SIGSYS` —— 直接杀死进程 | 开启 |
 | `getpwuid_r()` | `rc=0, *result=NULL` —— Node 的 `os.userInfo()` 抛异常 | 开启 |
 | `tmpfile()` | 返回 `NULL`，`errno=EPERM` —— 沙箱内 `P_tmpdir` 不可写 | 开启 |
-| `getcwd()` | hmdfs/tmpfs 父目录缺 `+x` 时 `EACCES`，或 cwd 被 rmdir 后 `ENOENT`（常见于生命周期脚本、`bun run`） | 开启 |
-| `linkat()` / `symlinkat()` | 沙箱化的安装目标目录里报 `EPERM`/`EACCES` | 开启 |
+| `linkat()` | 沙箱化的安装目标目录里报 `EPERM`/`EACCES` | 开启 |
 | `link()` | 同上（hard link 被禁）；musl 的 `link()` 走内联 `syscall(SYS_linkat)` 绕过 `linkat` 动态符号，故 `linkat` 拦截够不着 Node `fs.link`/libuv 这类经 `link()` 符号调用的调用者——本拦截点补这条路径（同样的 copy fallback） | 开启 |
 | `syscall(SYS_fchmodat2)` | 真机 `SIGSYS`，OpenHarmony 容器里是 `ENOSYS` —— 两边都失败，但失败方式不同 | 开启 |
 | `splice()` | 两个独立缺陷：① 源端 EOF 时返回 `-1/EPIPE`，Linux 返回 `0` —— 所有 splice 拷贝循环在文件尾误报错误；② 写进管道的数据**不唤醒**任何已阻塞的 `poll()`/`epoll_wait()`，导致轮询型消费端的管道永久死锁 | 开启 |
-| `stdout`/`stderr`/`stdin` COPY-reloc 槽位 | 预编译 musl 可执行文件引用标准流时，链接器生成 `R_AARCH64_COPY` 重定位并在 dynsym 里**自定义**该符号；HarmonyOS 的 musl ld.so 按"可执行文件自身定义"解析这份拷贝——8 字节自拷贝，槽位停留在 .bss 初始值 `NULL`。第一次 stdio 调用（如 bun 启动的 `setvbuf(stdout, NULL, _IOLBF, 0)`）即触发加固 libc 断言 `setvbuf: parameter is null` abort（官方 claude-code linux-arm64-musl 二进制 2.1.229+ 的实际死因）。加载期扫描主程序 `.rela.dyn` 回填 libc 真实 `FILE*` | 开启 |
-| `getaddrinfo()` | `AI_ADDRCONFIG` 误判本机无全局 IPv4，查询 `localhost` 时只返回 `::1`（IPv6 loopback）—— Happy Eyeballs（`autoSelectFamily`）类调用方在 `::1` 拒绝连接时没有 IPv4 地址可退回 | 开启 |
+| `epoll_ctl`/`epoll_wait`/`epoll_pwait` | 对 FIFO 写端或 TTY/PTY 注册 `EPOLLOUT\|EPOLLONESHOT` 时，内核不遵守 ONESHOT 的自动缴械，每次等待都重发同一个事件——某些注册（Bun rustix 内联 syscall 发出的）连本拦截点的登记表都学不到，靠"同 key 纯 EPOLLOUT 高频连击"这一形状模式识别 | 开启 |
+| `stdout`/`stderr`/`stdin` COPY-reloc 槽位 | 预编译 musl 可执行文件引用标准流时，链接器生成 `R_AARCH64_COPY` 重定位并在 dynsym 里**自定义**该符号；HarmonyOS 的 musl ld.so 按"可执行文件自身定义"解析这份拷贝——8 字节自拷贝，槽位停留在 .bss 初始值 `NULL`。第一次 stdio 调用（如 bun 启动的 `setvbuf(stdout, NULL, _IOLBF, 0)`）即触发加固 libc 断言 `setvbuf: parameter is null` abort。加载期扫描主程序 `.rela.dyn` 回填 libc 真实 `FILE*`——但已确认这段补丁逻辑并非（或不是唯一）让官方 claude-code musl 二进制免于崩溃的原因，真正生效的机制与本 `.so` 完整的符号表/重定位图有关，具体哪一步生效未完全定位；崩溃本身与"用这个 `.so`" 修复本身都是 100% 可复现的确定结论，只是补丁代码与结果之间的因果链没有完全坐实 | 开启 |
+| `getaddrinfo()` | 含非法字符（DNS/hostname 字母表之外）的主机名被转发到网络等超时，而非本地立即拒绝；本地进程启动时后台起一个一次性探测线程，探测通过（本地已原生修好）后本拦截点对该进程剩余生命周期变成纯透传 | 开启 |
 
 `pthread_cancel()` 在这个平台上是 musl 的空桩实现，刻意**不**做 shim ——一个 preload 库没办法给调用方注入它所需要的协作式取消点。
 
+`getcwd()`（hmdfs 祖先目录缺 `+x` 时 `EACCES`）与 `symlinkat()`（沙箱化目标目录 `EPERM`/`EACCES`）此前也在这张表里；真机重测均不再复现，已删除对应拦截代码——`ohos-shim check` 仍把这两项作为 B 组信息性探针保留，供其它 OHOS 版本回归时观察，但不再产出 `OHOS_COMPAT_SHIM_DISABLE` 建议。
+
 ## 前向兼容：优先自动尝试真实系统调用
 
-**大多数**拦截点都会先通过 `dlsym(RTLD_NEXT, ...)` 解析出真实实现并尝试调用它，而不是先走 fallback 逻辑 —— 这不是一次性的系统版本判断，而是每个新进程都会重新做的实时探测（对 `close_range` 之外的符号来说，甚至是每一次调用都重新判断）。具体来说：
+**大多数**拦截点都会先通过 `dlsym(RTLD_NEXT, ...)` 解析出真实实现并尝试调用它，而不是先走 fallback 逻辑。具体来说：
 
-- `close_range`：`cr_probe_syscall()` 每个进程只跑一次；如果真实系统调用成功，该进程就会缓存 `WORKS` 状态，之后再也不会碰用户态 fallback。
-- `getpwuid_r` / `tmpfile` / `getcwd` / `linkat` / `symlinkat` / `link`：**每次**调用都会先调用真实函数；shim 自己的逻辑只在真实调用失败、且失败特征与上表记录的 HarmonyOS 沙箱症状完全吻合时才会介入。
-- `getaddrinfo`：也是每次都先用真实结果，只在结果形状命中 `AI_ADDRCONFIG` 误判症状（见下表）时才改写。
+- `close_range`：`cr_probe_syscall()` 每个进程只跑一次；如果真实系统调用成功，该进程就会缓存 `WORKS` 状态，之后再也不会碰用户态 fallback。同样的探测一次、缓存结果模式也用在 `fchmodat2`（`fc2_probe()`）。
+- `getpwuid_r` / `tmpfile` / `linkat` / `link`：**每次**调用都会先调用真实函数；shim 自己的逻辑只在真实调用失败、且失败特征与上表记录的 HarmonyOS 沙箱症状完全吻合时才会介入。
+- `getaddrinfo`：本地进程启动后台起一个一次性探测线程（不阻塞调用方任何一次真实查询），用合成的非法字符主机名判断本机真实解析器是否已经本地快速拒绝；探测通过后，这个进程剩余生命周期里 `getaddrinfo()` 变成对真实符号的纯透传。
+- `splice()` 的 EOF 语义修正：每次都先调用真实 `splice()`，只在返回 `-1/EPIPE` 且经 `poll()` 判定源端确实是 EOF（而非目标端真损坏）时才改写返回值。
 
-**但有两簇是例外，从不尝试真实路径**，因为这两个症状是负载相关的间歇性缺陷——空闲时探测大概率"通过"，压力上来时照样发作，一次性探测/尝试对这种缺陷不健全（同一原则也约束着[前向兼容](#前向兼容优先自动尝试真实系统调用)一节末尾"何时收口"的判断标准：单台设备/单次探测的"未复现"，永远只能产出该部署自行设置 `OHOS_COMPAT_SHIM_DISABLE` 的建议，不能作为改这里默认行为的依据）：
-
-- `splice()` 写入管道：目标是 FIFO 且 `off_out == NULL` 时直接走用户态 bounce buffer，从不调用真实 `splice()` —— 见[性能](#性能)一节 `splice_pipe_to_pipe_20mb` 基准，量化了放弃零拷贝的代价。
-- `epoll_pipe` 拦截簇（`poll`/`ppoll`/`epoll_ctl`/`epoll_wait`/`epoll_pwait`）：只要开关未被 `OHOS_COMPAT_SHIM_DISABLE=epoll_pipe` 关闭就常驻生效；`poll`/`ppoll` 每次返回后修正、`epoll_wait`/`epoll_pwait` 内部按自适应间隔切片轮询（2026-08-19 起：起始 250ms，连续空转 8 次后倍增、封顶 1000ms，一旦真合成出事件立即打回 250ms——细节见 `ep_backoff_*` 系列函数上方的注释块）。2026-09-27 起该簇新增第三个子修复：**EPOLLONESHOT 缴械强制**——本内核对以 `EPOLLONESHOT|EPOLLOUT` 注册的管道写端无视 ONESHOT 自动缴械、每次等待都重发 EPOLLOUT（官方 claude-code musl 单文件上实测 ~51 万次/秒立即返回、事件 100% 纯 EPOLLOUT，其事件循环闲时自旋 120% CPU + mimalloc scavenger 下游 ~50%；证据与修法实测见 `logs/2026-09-27-claude-code-musl-idle-spin.md`）。首个事件放行并缴械（合规内核的原生行为）；已缴械条目的重发被剥除，并**内核侧 CTL_DEL**（纯用户态剥除只会把自旋搬进 shim 内部）；调用方随后的重臂 `MOD` 由 shim 翻译回 `ADD`、`DEL` 的 `ENOENT` 被吞掉——调用方对强制过程完全无感。修复后同二进制闲时 120%+56% → 1%+0%。无符合条目时经原子计数快路径零开销；`EPOLLIN` 方向的登记与合成逻辑不受影响（`functional` 45/45 全绿）。2026-09-28 再加两层：**④TTY 写端覆盖**（交互 stdio 是 `/dev/pts`，`S_ISCHR` 不在原 `S_ISFIFO` 门内；以缓存的 `TCGETS` 判定扩展登记，PTY master/slave 皆中、`/dev/null`/eventfd/socket 不中；`EPOLLIN` 合成仍保持 FIFO-only）；**⑤未知 key 纯 EPOLLOUT 风暴抑制**（bun 经 rustix 内联 `svc` 发出的 `epoll_ctl` 对 LD_PRELOAD 不可见、注册表学不到——实测一个 `0x4000001c` 注册的 eventfd 每次 `epoll_pwait` 重发 `ev=0x4`；同 `(epfd,data)` ≤10ms 间隔连击 ≥20 判定风暴，`/proc/self/fdinfo` 反查 fd 做内核侧 CTL_DEL，幽灵投递（DEL 后仍投递，ohos-bun 408a29c0b4 实测记录）则剥除 + re-wait 循环 2ms 步进；>10ms 间隔的首事件恒放行）。2026-09-28 深夜追加**⑥交互 TUI 的 ONESHOT 强制自身有 bug，导致「已知极限」结论错误并已撤回**：前一版⑤只覆盖了「bun 经 rustix 内联 svc 注册、shim 从未见过」的未知 key 分支，遗漏了⑤之前就存在的**已知（matched）分支**——已缴械条目重发时，剥事件的代码路径完全没有告知调用方需要限速（`*out_suppressed` 从未在这条路径被置位），于是 `ep_shim_wait` 现有的 2ms 步进从未生效，退化回全速重等；叠加 DEL 在部分设备上对**仍在 fdinfo 里的合法 tfd** 也返回 `ENOENT`（另一条独立的内核 epoll 语义缺陷，同一 tfd 换多少次都一样，重试无意义）时，旧代码还会在每次重发上重新尝试这个必败的 DEL。两者合起来才是交互 TUI 闲时主线程常驻 R 态、100%+ 单核的真正根因——不是 `epoll_pwait2` 走裸 syscall 摸不到（真机 PC 采样证实等待仍在可拦截的 libc `epoll_ctl`/`epoll_pwait` 符号内，`mainprobe` 95.6% 采样命中就在这条 DEL 调用里）。修法：`del_tried` 把 DEL 尝试限制到每次重臂最多一次；已缴械条目的每次重发剥除都会请求限速，请求的 sleep 随连续重发指数增长（2ms 起步，`EP_GHOST_STREAK_CAP` 后封顶 32ms，收到 ADD/MOD 重臂即复位）——因为这个 ghost 对某些注册可能是**永久性**的（DEL 永远 ENOENT，内核侧从不真正安静），固定步进会为整段会话付费，指数退避把稳态成本压到最低。真机 A/B（同一官方 claude-code 2.1.283 musl 二进制、同一 TUI 空闲画面，新旧库交替跑 3 轮取配对差值）：修复前主线程闲时稳态 **100.5%**（单核打满），修复后 **1.2%**——与「换 tap 版 bun」路线的 ~1% 基线打平，详见 `logs/2026-09-27-claude-code-musl-idle-spin.md` 的 v4 更新。至此**musl 逃生通道对交互 TUI 与非交互形态（`-p`/`mcp serve`/管道）同样是完整修复**，不再需要为交互场景默认改回 tap bun。
+**只有一簇是例外，从不尝试"探测通过就关闭"**：`epoll_ctl`/`epoll_wait`/`epoll_pwait` 的 EPOLLONESHOT 强制（含 FIFO 写端与 TTY/PTY 写端登记、未知 key 的纯 EPOLLOUT 高频连击识别），以及 `splice()` 写入管道从不唤醒轮询等待方这条修复——这两个症状都在真机上稳定 100% 复现，是真实、非负载相关的内核行为差异，不是"探测一次决定要不要修"的候选：只要 `OHOS_COMPAT_SHIM_DISABLE` 没有关闭对应开关就常驻生效。`splice` 写入管道的修复代价见[性能](#性能)一节 `splice_pipe_to_pipe_20mb` 基准，量化了放弃零拷贝的成本。
 
 `getpwuid_r` 的 fallback 用户名来源：优先调用 `OH_OsAccount_GetName()`（`libos_account_ndk.so`，运行时 dlopen、句柄缓存，编译期零 SDK 依赖）取当前系统账号名——但只在查询的 uid 等于进程自身 uid 时（账号 API 没有 uid 参数）；失败或非自身 uid 时回落 `$LOGNAME`/`$USER`，最后退化为 `u<uid>` 占位符。其余字段（`pw_dir`/`pw_shell`/`pw_uid`/`pw_gid`）逻辑不变，账号 API 无法提供。
 
-实际效果：一旦 HarmonyOS 哪天把 `close_range` 加入白名单（ohos-preflight 报告里 441 号被标为 P0，诉求正是这个），或者修复了另外四个症状里的任何一个，**所有新启动的进程都会自动享受到这个改进**——不需要重新编译 shim，不需要重新部署，这个仓库里也不需要改一行代码。
+实际效果：一旦 HarmonyOS 修复了某个真实探测/尝试型症状（`close_range`/`getpwuid_r`/`tmpfile`/`linkat`/`link`/`fchmodat2`/`getaddrinfo` 中的任意一个），**所有新启动的进程都会自动享受到这个改进**——不需要重新编译 shim，不需要重新部署，这个仓库里也不需要改一行代码。`getcwd`/`symlinkat` 两个拦截点此前也遵循这个模式；真机重测已确认原生行为修好，对应代码已删除（见上表）。
 
 但这**不代表**平台跟上之后开销就会归零。只要消费者仍然 `LD_PRELOAD` 这个库，每次调用依旧要付出进入拦截函数、以及做一次 `dlsym` 缓存过的真实调用尝试的代价（在[性能](#性能)一节中实测约为 10 ns/次的透传税，对已经成功的路径来说几乎可以忽略）。真正做到*完全*零开销的唯一办法，是消费者不再为该符号预加载这个库 ——这是**消费者自己的打包决策**，shim 本身做不到，因为它在编译期根本无法预知运行时某台设备的沙箱究竟允许什么。
 
@@ -49,15 +49,17 @@
 | `close_range` | `ohos-preflight` 探针 `a10_close_range` | HarmonyOS 在所有消费者仍支持的系统版本上放行 436 号系统调用 |
 | `getpwuid_r` | 探针 `i9_getpwuid_r` | HarmonyOS 给 HAP 分配的 uid 能通过 `/etc/passwd` 解析，或提供了 `nss_ohos` |
 | `tmpfile` | 探针 `g1_tmpfile` | 应用沙箱内 `P_tmpdir` 变为可写 |
-| `getcwd` | 探针 `g7_getcwd_unlinked` | 平台层面无法修复（这是符合 POSIX 语义的 `ENOENT` 行为）—— 这一项会一直留着 |
-| `linkat`/`symlinkat` | 探针 `g5_linkat_eperm`/`g6_symlinkat_eperm` | 目标安装目录不再对硬链接/符号链接返回 `EPERM`/`EACCES` |
+| `linkat` | 探针 `g5_linkat_eperm` | 目标安装目录不再对硬链接返回 `EPERM`/`EACCES` |
 | `link` | 同 `linkat`（同源 hard-link 限制，同一 `g5_linkat_eperm` 探针即判定） | 同 `linkat` |
-
-> **copy fallback 的原子性**：字节拷贝经同目录隐藏临时文件 + `renameat` 落位，目标路径要么完整出现、要么不出现。此前直接 `O_CREAT|O_EXCL` + 拷贝的实现会让目标在 0 字节时即可见——bun install 因解析失败 `quick_exit`、而 worker 线程还在刷 npm manifest 缓存时，会留下永久性 0 字节 `.npm` 缓存（下次加载报 "manifest is invalid"，bun-install-registry 的 prereleases-* 用例就是踩在这里）。临时文件放在 `newpath` 同目录是硬性要求：`renameat` 不能跨文件系统，绝对路径的 `newpath` 配裸临时文件名会把临时文件落到进程 CWD（可能异 fs → `EXDEV`）。
 | `fchmodat2` | 探针 `c5_fchmodat2` | HarmonyOS 放行 452 号系统调用（目前是 `both_fail`：OpenHarmony 容器里也是 `ENOSYS`，所以这项收口不光需要 HarmonyOS 放行，容器那边的内核也得先实现这个系统调用）|
-| `splice` （EOF 语义）| 功能测试 `splice_eof_is_zero`（baseline 段即为探针）| 内核修正 `splice()` 的 EOF 语义，源端耗尽时返回 `0` 而不是 `EPIPE` |
-| `splice` （poll 唤醒）| 功能测试 `splice_wakes_poll_waiter`（baseline 段即为探针）| 内核让写入管道的 splice 唤醒 poll/epoll 等待者。收口后应删掉 bounce buffer 路径，恢复零拷贝 |
-| `getaddrinfo` | `ohos-shim check` 自带探针 `getaddrinfo`（`ohos_compat_check.c`，无对应 `ohos-preflight` 探针——这是纯 IPv4/IPv6 结果集判定，不是失败/成功二态，不适合套 preflight 的 pass/fail 约定）| `AI_ADDRCONFIG` 查询 `localhost` 不再只返回 IPv6 loopback |
+| `splice`（EOF 语义）| 功能测试 `splice_eof_is_zero`（baseline 段即为探针）| 内核修正 `splice()` 的 EOF 语义，源端耗尽时返回 `0` 而不是 `EPIPE` |
+| `splice`（poll 唤醒）| 功能测试 `splice_wakes_poll_waiter`（baseline 段即为探针）| 内核让写入管道的 splice 唤醒 poll/epoll 等待者。收口后应删掉 bounce buffer 路径，恢复零拷贝 |
+| `epoll_ctl`/`epoll_wait`/`epoll_pwait`（ONESHOT 强制）| 功能测试 `epoll_oneshot_tty_write_end` | 内核对 `EPOLLOUT\|EPOLLONESHOT` 注册正确执行自动缴械，FIFO 写端与 TTY/PTY 均不再重发 |
+| `getaddrinfo` | `ohos-shim check` 自带探针 `getaddrinfo`（`ohos_compat_check.c`）| 已在每个受影响进程里自动完成：一次性后台探测确认原生行为已修好后即转为透传，本行只是留作观测 |
+
+`getcwd`/`symlinkat` 曾在这张表里；真机重测已确认修好，对应代码已删除（`getcwd` 的收口理由本来就特殊——cwd 被 rmdir 后的 `ENOENT` 本身是标准 POSIX 行为，不是平台差异，早就不该套用这张表的"等平台修"逻辑，删除后这层混淆也一并消失）。
+
+**copy fallback（`linkat`/`link`）的原子性**：字节拷贝经同目录隐藏临时文件 + `renameat` 落位，目标路径要么完整出现、要么不出现。直接 `O_CREAT|O_EXCL` + 拷贝会让目标在 0 字节时即可见——一个消费进程解析失败 `quick_exit`、而另一线程还在刷缓存时，会留下永久性 0 字节缓存文件（下次加载报 "manifest is invalid" 一类的错误）。临时文件放在 `newpath` 同目录是硬性要求：`renameat` 不能跨文件系统，绝对路径的 `newpath` 配裸临时文件名会把临时文件落到进程 CWD（可能异 fs → `EXDEV`）。
 
 定期重跑 `ohos-preflight` 的双轨对比；一旦某个探针稳定地从 `needs_relax`变成 `same`，对应符号的拦截逻辑就可以在后续版本里默认关闭（或直接移除）——等消费者所支持的所有 HarmonyOS 版本都不再需要剩下的任何一个症状时，就应该停止预加载这个库。
 
@@ -112,7 +114,7 @@
 
 - 既然真实系统调用在这台设备上永远不会成功，shim 那套「探测一次、缓存结果」的设计（`cr_probe_syscall()`）在这台设备上永远只会走用户态 fallback 路径 —— 这里不存在「委托成功」这条路径可以退回，不过代码依旧保留了这条路径， 留给其它设备/系统版本上 `close_range` 有可能真的能用的情况 （对应 `ohos-preflight` 的 OH 容器那条轨道，这个探针在那边是通过的）。
 - `OHOS_COMPAT_SHIM_DISABLE=close_range` **不会**还原出「操作依旧能成功」意义上的真实无 shim 基线行为。它还原出的是「预加载了，但没有保护、没有探测」—— 真实调用每次都会 `SIGSYS`，和完全不加载 shim 时一模一样，也就是说进程会崩溃。 只有在你确实想验证这个崩溃行为本身时，才应该禁用 `close_range`。
-- 另外三个默认开启的符号（`getpwuid_r`、`tmpfile`、`getcwd`）完全不表现出这个特性——真实调用有时会成功（`getcwd` 在常见情况下总是成功），禁用它们中的任何一个都能 精确还原出真实、无 shim 时的调用结果，这一点已由 `test/functional.c` 验证。
+- 其它探测/尝试型符号（`getpwuid_r`、`tmpfile`、`linkat`、`link`、`fchmodat2`、`getaddrinfo`）完全不表现出这个特性——真实调用有时会成功，禁用它们中的任何一个都能精确还原出真实、无 shim 时的调用结果，这一点已由 `test/functional.c` 验证。
 
 ### close_range() 自己校验参数 —— 因为本机内核校验不了
 
@@ -162,10 +164,10 @@ spawn("/path/to/real-binary", process.argv.slice(2), {
 ### 运行时开关
 
 ```sh
-# 关闭某个默认开启的拦截点（逗号分隔）——16 个拦截点里除 std_streams
-# （无对应开关，加载期无条件生效）外全部默认开启，没有对应的
-# OHOS_COMPAT_SHIM_ENABLE：只有这一个开关
-export OHOS_COMPAT_SHIM_DISABLE=getcwd,tmpfile
+# 关闭某个默认开启的拦截点（逗号分隔）——close_range/getpwuid_r/tmpfile/
+# fchmodat2/linkat/link/splice/epoll_pipe/getaddrinfo/std_streams 十个
+# 全部默认开启，没有对应的 OHOS_COMPAT_SHIM_ENABLE：只有这一个开关
+export OHOS_COMPAT_SHIM_DISABLE=tmpfile,link
 ```
 
 关哪些合适，别靠猜——见下一节 `ohos-shim check`，它会在当前设备上逐项实测
@@ -193,11 +195,9 @@ ohos-shim check --with-shim              # 追加第二遍：预加载 shim 后�
   `--rounds` 轮全部没复现也只判「不确定」而不是「可关闭」——**未复现不等于已修复**，
   想确认就加大 `--rounds` 或在真实负载下重跑。
 
-两个例外，即使平台放开也不建议照单全收：
-
-- `getcwd` 的 cwd-被删兜底是主动防御，不是平台缺陷本身，判「可关闭」也建议留着。
-- `linkat`/`symlinkat` 的拷贝 fallback 是有损语义（丢硬链接/符号链接身份），一旦判
-  「可关闭」就应该尽快真的关掉，不要因为「反正能用」就留着。
+一个例外，即使平台放开也不建议留着不关：`linkat`/`link` 的拷贝 fallback 是有损
+语义（丢硬链接身份），一旦判「可关闭」就应该尽快真的关掉，不要因为「反正能用」
+就留着。
 
 另外报一组信息性的周边平台能力（`openat2`/`epoll_pwait2`/`clone3` 等裸 syscall、
 `ptrace`、`prctl(PR_SET_PTRACER)`、musl 的 dlopen/`.dynsym` 限制……），只供参考，
@@ -225,28 +225,27 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 
 ## 测试
 
-`test/functional.c`（`make functional`）覆盖的范围远不止 smoke.c 的 3 项基础检查。测试覆盖度是刻意对照这几个调用现有的参考测试套件来校准的 ——[Linux 内核自测套件](https://github.com/torvalds/linux/blob/master/tools/testing/selftests/core/close_range_test.c)和 [LTP](https://github.com/linux-test-project/ltp) 的 `close_range01/02.c`、`getcwd01-04.c`、`linkat01/02.c`、`symlinkat01.c` —— 而不是随手想到什么测什么。（musl 自己的 `libc-test` 套件和 glibc 的测试套件都没有覆盖 `close_range`/`getcwd`/`linkat`/`symlinkat`/`tmpfile` 的什么实质深度，所以 LTP —— 它测的是这些函数所包装的系统调用本身 —— 是最接近权威参考的东西。`getpwuid_r` 和 `tmpfile` 没有类似的官方参数矩阵可参照：前者是 LTP 系统调用测试范围之外的 NSS/passwd 数据库特性，后者根本不接受任何参数。）直接对照 LTP 在上线前就抓出了两个真实的 bug —— 见上面「已知平台行为」一节里 `close_range` 的 `EINVAL` 校验和 `CLOSE_RANGE_UNSHARE` 降级处理。
+`test/functional.c`（`make functional`）覆盖的范围远不止 smoke.c 的 3 项基础检查。测试覆盖度是刻意对照这几个调用现有的参考测试套件来校准的——[Linux 内核自测套件](https://github.com/torvalds/linux/blob/master/tools/testing/selftests/core/close_range_test.c)和 [LTP](https://github.com/linux-test-project/ltp) 的 `close_range01/02.c`、`linkat01/02.c`——而不是随手想到什么测什么。直接对照 LTP 在上线前就抓出了两个真实的 bug——见上面「已知平台行为」一节里 `close_range` 的 `EINVAL` 校验和 `CLOSE_RANGE_UNSHARE` 降级处理。
 
-- **`close_range`**（8 项检查）：多 fd 区间（关闭中间、两端不动）、一个*稀疏的宽区间*（`fd..fd+90`，对照 LTP 里 dup 到高位 fd 的用例）、 `CLOSE_RANGE_CLOEXEC`、`first > last` → `EINVAL`、乱填 flags → `EINVAL` （而不是崩溃）、通过一个真实的 pthread 触发 `CLOSE_RANGE_UNSHARE` （对照 LTP `close_range02.c` 用 clone(2) 的用例）、连续两次调用结果一致 （验证探测结果缓存的正确性）、以及 `close_range()` 这个 libc 风格包装函数 与原始 `syscall()` 路径结果一致。
-- **`getpwuid_r`**（2 项检查）：缓冲区太小时必须返回 `ERANGE`——这台设备上真实实现根本走不到那一步去检查（会先因为一个无关的 `EBADF` 怪癖提前失败），所以这一项只有*加了 shim*才能通过。另外还验证连续两次调用 必须返回逐字节一致的数据。
-- **`tmpfile`**（3 项检查）：完整的写入/读回往返、3 个同时存在的临时文件之间互不污染、以及连续 50 次打开+关闭循环全部不失败（对一个零参数函数来说， 这是最接近参数矩阵的东西）。
-- **`getcwd`**（5 项检查 + 1 项 info）：核心问题是「是不是真的无操作」——两种不同的调用方式（`getcwd(buf, size)` vs `getcwd(NULL, 0)`）在 cwd 没变的情况下必须返回逐字节一致的字符串。另外还有 `size=0` → `EINVAL`、 `size=1`（真实缓冲区）→ `ERANGE`、以及 `buf=NULL, size=1` 通过 musl 的 GNU 自动分配扩展成功（这三项都是对照这台设备*实际*的 libc 行为校准的，而不是 LTP 那种原始系统调用层面的预期，因为 shim 只拦截 libc 包装函数 —— 具体原因见代码注释）。还有一个不计分的 `INFO` 检查项，用来验证 cwd 被 rmdir 之后的 fallback 行为。
-- **`linkat`/`symlinkat`**（3 项检查）：此前**完全没有**覆盖 ——这是这轮排查里发现的最大缺口。`EEXIST` 会原样透传（对照 LTP `linkat02.c`）；在 `$TMPDIR` 里真实、当场复现出来的 `EACCES` （通过重跑 `ohos-preflight` 的 `g5_linkat_eperm` 探针、针对这个测试自己的 `$TMPDIR` 确认，不是模拟出来的条件）会触发 copy fallback，且内容正确； `symlinkat`（在这个 `$TMPDIR` 里不受限制）验证的是成功/无操作路径。
-- **bun 调用场景镜像**（8 项检查，跨 close_range/getcwd/linkat/symlinkat/fchmodat2 + symlink）：上面那些是按 LTP 通用语义校准的；这一组是对照 ohos-bun 源码里的**全部真实调用点**逐一补的——① `close_range(4, ~0U, CLOEXEC)` init 期 fd 泄漏防护（`bun_initialize_process`，跳过 stdio 0-2、对 ≥4 的 fd 设 `FD_CLOEXEC` 但保持打开）；② `close_range(3, ~0U, CLOEXEC)` spawn/reload 路径（`BunProcess.cpp` + `on_before_reload_process_linux`，fd 3 **也** CLOEXEC，与 init 的 first=4 区分）；③ `getcwd` 6 层深目录 `getcwd()==readlink("/proc/self/cwd")==构造路径"`；④ `linkat` 经 `/proc/self/fd/<N>` 物化 `O_TMPFILE`（npm `linkat_tmpfile` 无 CAP 回退路径）；⑤ `linkat(SRC_DIRFD, basename, DEST_DIRFD, path, 0)` dirfd 源+dirfd 目的（Hardlinker/PackageInstall hardlink 安装热路径，区别于 AT_FDCWD 绝对路径；基线确认此形状同样 EACCES，shim 的 openat(dirfd) 解析确实被触发）；⑥ `symlinkat` 相对 target 按 `newdirfd` 解析（验证 `open→openat(newdirfd)` 修复；本设备 symlinkat 不受 EPERM 限制，故测 fix 依赖的解析机制本身）；⑦ `symlink(target, link)` 2-arg（bun `--bun` 造假 node 可执行 `lib.rs:702`；**shim 不 hook symlink 这个符号**——测试确认它在 OHOS 上可用，故无需 hook，若受限则在此暴露缺口）；⑧ `fchmodat2` 经 `syscall()` 入口 + `AT_SYMLINK_NOFOLLOW`（bun `lchmod` 唯一调用点，shim 丢弃 flag 走 `fchmodat` 回退）。
-- **透传检查**（2 项）：`getpid()` 对比 `syscall(SYS_getpid)`，以及一次管道读写往返 —— 用来证明拦截全局 `syscall()` 符号来处理 `close_range` 不会干扰其它无关的系统调用。
+- **`close_range`**（12 项检查）：多 fd 区间（关闭中间、两端不动）、一个*稀疏的宽区间*（`fd..fd+90`，对照 LTP 里 dup 到高位 fd 的用例）、`CLOSE_RANGE_CLOEXEC`、`first > last` → `EINVAL`、乱填 flags → `EINVAL`（而不是崩溃）、通过一个真实的 pthread 触发 `CLOSE_RANGE_UNSHARE`（对照 LTP `close_range02.c` 用 clone(2) 的用例）、并发压力（8 线程 × 100 次 `CLOSE_RANGE_UNSHARE`）、fork 安全性（30 次 fork，另一线程同时churn `epoll_ctl`）、连续两次调用结果一致（验证探测结果缓存的正确性）、以及 `close_range()` 这个 libc 风格包装函数与原始 `syscall()` 路径结果一致，加上两个照搬 Bun 真实调用形状的用例（init 期与 spawn/reload 期的 fd 泄漏防护）。
+- **`getpwuid_r`**（2 项检查）：缓冲区太小时必须返回 `ERANGE`；连续两次调用必须返回逐字节一致的数据。
+- **`tmpfile`**（3 项检查）：完整的写入/读回往返、3 个同时存在的临时文件之间互不污染、以及连续 50 次打开+关闭循环全部不失败。
+- **`linkat`/`link`**（5 项检查）：`EEXIST` 会原样透传（对照 LTP `linkat02.c`）；在 `$TMPDIR` 里真实复现出来的 `EACCES` 会触发 copy fallback 且内容正确（`linkat`/`link` 各一项）；`linkat` 经 `/proc/self/fd/<N>` 物化 `O_TMPFILE`、以及 dirfd 源+dirfd 目的两种照搬 Bun 真实调用形状的用例。
+- **`fchmodat2`**（3 项检查）：应用请求的 mode；对符号链接目标不跟随（`AT_SYMLINK_NOFOLLOW`）；照搬 Bun `lchmod` 唯一调用点的形状。
+- **`splice`**（3 项检查）：源端 EOF 返回 `0` 而非 `-1/EPIPE`；目标端真损坏时 `EPIPE` 仍然照常报出；写入管道后能唤醒一个已经先阻塞的 `poll()` 等待方。
+- **`epoll`**（3 项检查）：有限超时被诚实遵守，不提前返回；无限等待永不泄漏一个提前的 `0`（libuv 的 `uv__io_poll` 断言正是这个）；`EPOLLOUT|EPOLLONESHOT` 注册在 FIFO 与 TTY 写端上都恰好只投递一次（第二次等待不会重发）。
+- **透传检查**（2 项）：`getpid()` 对比 `syscall(SYS_getpid)`，以及一次管道读写往返——用来证明拦截全局 `syscall()` 符号来处理 `close_range` 不会干扰其它无关的系统调用。
 
-最近一次真机运行（显式用 `env -u LD_PRELOAD` / `env LD_PRELOAD=...`，而不是依赖 shell 环境状态）：**加了 shim 之后 32/32 项计分检查全部通过**（`ALL PASS (0/32 checks failed)`）。真正的基线（无 shim）下，`4/30` 项计分检查失败（`getpwuid_r` 的 `ERANGE`、3 处 `tmpfile`——和文档记录的沙箱症状完全吻合），另外若干项报告 `INFO` 而不贡献通过/失败（`linkat_eacces_fallback`、`linkat_bun_tmpfile`、`linkat_bun_dirfd`——确认 linkat 的 `EACCES` 怪癖在 AT_FDCWD 绝对路径、`/proc/self/fd`、dirfd 三种形状下都会复现，没有东西可以拿来打分；`close_range`/`fchmodat2` 无 shim 时无条件 `SIGSYS`，所以 close_range 的 9 项检查（含 `close_range_bun_init`、`close_range_bun_spawn`）加上 `CLOSE_RANGE_UNSHARE` 和 `fchmodat2_applies_mode`、`fchmodat2_bun_lchmod`，一共 12 项都报告 `INFO`，因为它们没有 shim 的保护根本没法跑完——见「已知平台行为」）；还有一项（`close_range_libc_fn`）报告 `SKIP`，因为不预加载的话这个符号根本不存在。每一项在基线下能有意义地跑起来的检查，要么通过（对应真实、可用的行为），要么精确地失败/报告文档里记录的那个症状 —— 没有意外情况。
-
-**关于"PASS 是否等于真验证了 shim"的诚实说明**——把 8 个 bun 场景测试按"是否真的触发了 shim 的 fallback 路径"分两类：① **真验证**（6 项，设备上 EACCES/SIGSYS 真复现 → shim 回退被触发 → 断言验证结果）：`close_range_bun_init`/`spawn`（CLOEXEC 正确设置 + fd 保持打开 + stdio 不动）、`linkat_bun_tmpfile`/`dirfd`（拷贝内容正确；dirfd 形状若 shim 误用 CWD 会拷不到 → 测试会挂）、`fchmodat2_bun_lchmod`（mode 正确应用）、`getcwd_unlinked`（deleted-cwd → `/proc/self/cwd` → stat 守卫 → `$HOME`，**计分**——这是 getcwd 修复在设备上唯一可复现的分支）。② **过了但不触发 shim 回退**（3 项，已如实标注）：`getcwd_deep_nested`（tmpfs 里 getcwd 本就成功，shim 回退没被触发，只是深路径 + `/proc/self/cwd` 一致性健全性检查；getcwd 修复的 EACCES+真实 cwd 分支需 hmdfs DAC 拒绝，被测试进程权限绕过，**设备上不可复现**，只能靠代码审查 + 此一致性检查）、`symlinkat_rel_resolution`（直接测 `openat(dirfd,相对)` 解析机制，**不调 shim 的 symlinkat hook**；symlinkat 在本设备不受 EPERM 限制，hook 的 copy 回退路径不可复现，此测试守护 fix 依赖的解析机制）、`symlink_two_arg`（shim **不 hook** `symlink` 符号，测的是真 symlink 在 OHOS 可用——确认 bun 造假 node 不需要额外兜底）。
+最近一次真机运行（显式用 `env -u LD_PRELOAD` / `env LD_PRELOAD=...`，而不是依赖 shell 环境状态）：**加了 shim 之后 33/33 项计分检查全部通过**。真正的基线（无 shim）下，`7/30` 项计分检查失败（`getpwuid_r` 的 `ERANGE`、3 处 `tmpfile`、`splice` 的 EOF 语义与写唤醒、`epoll` 的 ONESHOT 强制——都和文档记录的沙箱症状完全吻合），另外若干项报告 `INFO` 而不贡献通过/失败（`close_range`/`fchmodat2` 无 shim 时无条件 `SIGSYS`，相关检查没有 shim 的保护根本没法跑完——见「已知平台行为」），还有 3 项报告 `SKIP`（不预加载的话 `close_range()` 这个符号根本不存在）。每一项在基线下能有意义地跑起来的检查，要么通过（对应真实、可用的行为），要么精确地失败/报告文档里记录的那个症状——没有意外情况。
 
 ### 双轨确认：OpenHarmony 容器
 
 **这一节是参照信息，不是部署目标。** 容器里完全没有应用沙箱，这个 shim 要修的每一个症状在那里根本就不存在 —— 容器里的任何检查都不需要这个 shim，也没法验证它在 HarmonyOS 真实、更严格的强制策略下是否真的有效。真正能说明问题、决定能不能上线的是上面的真机结果（**「最近一次真机运行」**）。在容器里跑能带来的价值是：提供一种独立的、机械化的方式，通过对照一个宽松的参照系来确认 shim 的 fallback 逻辑本身是不是正确的，并且在某项检查表现异常时，能把「shim 有 bug」和「平台本身就强制这个限制」这两种情况区分开（下面 `close_range_unshare` 测试 bug 的发现正是靠这个方式）。
 
-按本工作区标准的双轨方法论（OH 容器 = 一台原生 Linux 6.6 内核上的能力上限，没有应用沙箱；HM 真机 = 实际被强制执行的东西 —— 也是这个 shim 真正要应对的、更难的目标），把完全相同的 `test/functional.c` 在 `openharmony` 容器里编译并运行了一遍：
+按本工作区标准的双轨方法论（OH 容器 = 一台原生 Linux 6.6 内核上的能力上限，没有应用沙箱；HM 真机 = 实际被强制执行的东西 —— 也是这个 shim 真正要应对的、更难的目标），把完全相同的 `test/functional.c` 在 `openharmony` 容器里编译并运行：
 
-- **基线（无 shim）：22 项计分检查里通过 21 项**（2 项 `SKIP`——一项测试固件假设了一个只在真实 HarmonyOS 设备上存在的临时路径， 容器里没有；`close_range_libc_fn` 照例在不预加载的情况下跳过）。 `close_range` 的 `EINVAL`/`CLOSE_RANGE_UNSHARE` 检查在这里*不需要* shim 就能通过 —— 这个容器的内核正确实现了上游 Linux 的 close_range 语义， 和真机不一样。`getpwuid_r` 也能干净地解析：容器是以真正的 root 身份运行的（uid 0，且存在于 `/etc/passwd` 中），不像沙箱化 HAP 的 uid。 唯一真正的失败项：**`fchmodat2_applies_mode` 在基线下失败，报告一个 干净的 `ENOSYS`** —— 这和 `ohos-preflight` 对 `c5_fchmodat2` 的定性 完全一致（`both_fail`：容器内核确实完全没有实现这个系统调用， 失败方式和真机的 `SIGSYS` 不一样，但两边都是失败）。
-- **加了 shim：23/23 全部通过** —— 基线下就能通过的项目依旧逐字节一致地通过（这正是「真实平台已经能用时就是真无操作」这个设计目标，对每一个 真实调用在这里能成功的符号都成立），而 `fchmodat2_applies_mode`—— 唯一的基线失败项——现在也通过了，证明 shim 的 fallback 在容器里遇到 `ENOSYS` 时，和真机遇到 `SIGSYS` 时一样能正确介入：同一套派发逻辑， 两种不同的真实触发条件。
+- **基线（无 shim）**：`close_range` 的 `EINVAL`/`CLOSE_RANGE_UNSHARE` 检查在这里*不需要* shim 就能通过——这个容器的内核正确实现了上游 Linux 的 close_range 语义，和真机不一样。`getpwuid_r` 也能干净地解析：容器是以真正的 root 身份运行的（uid 0，且存在于 `/etc/passwd` 中），不像沙箱化 HAP 的 uid。`fchmodat2_applies_mode` 在基线下失败，报告一个干净的 `ENOSYS`——这和 `ohos-preflight` 对 `c5_fchmodat2` 的定性完全一致（`both_fail`：容器内核确实完全没有实现这个系统调用，失败方式和真机的 `SIGSYS` 不一样，但两边都是失败）；`splice`/`epoll` 的相关缺陷在容器里均不复现（不同内核，符合预期）。
+- **加了 shim**：基线下就能通过的项目依旧逐字节一致地通过（这正是「真实平台已经能用时就是真无操作」这个设计目标），`fchmodat2_applies_mode` 现在也通过，证明 shim 的 fallback 在容器里遇到 `ENOSYS` 时，和真机遇到 `SIGSYS` 时一样能正确介入：同一套派发逻辑，两种不同的真实触发条件。
 
 这和 `ohos-preflight` 自己对这几个探针的双轨定性（`a10_close_range`、`i9_getpwuid_r`、`g1_tmpfile`：OH 通过 / HM 失败）完全吻合 ——这是从另一个角度（对一整套探针跑 shim）对最初那轮探针调查结论的独立确认。
 
@@ -263,14 +262,16 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 | `close_range` fallback 算法（单独测量） | 106 512 ns/次 | 113 715 ns/次 | 数量级相同（代码本身完全一样）|
 | `getpwuid_r` | 68 530 ns/次 | 72 128 ns/次 | **+3598 ns（+5.2%）** |
 | `tmpfile` | 3 011 710 ns/次 | 4 231 301 ns/次 | **+1 219 591 ns（+40%）** |
-| `getcwd`（成功路径） | 1922.8 ns/次 | 1838.3 ns/次 | 在噪声范围内 |
+| `epoll_wait`（空注册表）| ~316 ns/次 | ~616 ns/次 | ONESHOT 注册表锁+扫描的固定成本（单次运行，非三次平均，仅供数量级参考）|
+| `epoll_ctl` churn（ADD/MOD/DEL 循环）| ~1621 ns/次 | ~3339 ns/次 | 同上（单次运行） |
+| `splice`（管道到管道，20MB）| ~2610 MB/s（零拷贝）| ~1008 MB/s（用户态 bounce buffer）| 放弃零拷贝的实测代价（单次运行）|
 
 要点：
 
 - **`close_range` 没有「基线」数字**—— 真实系统调用在这台设备上无条件 `SIGSYS`（见「已知平台行为」），所以一个没加 shim 的进程一次都没法完成 这个操作。约 108–114 μs 的加 shim 开销完全来自 `/proc/self/fd` 枚举 （`cr_do_fallback()`），而且是这台设备上**每一次** `close_range` 调用 都要付出的代价，不是偶尔才发生的最坏情况 —— 目前没有更快的路径可用。 「close_range」和「close_range fallback 算法」两行落在同一个量级 （而不是其中一个可以忽略不计）正是「每次加了 shim 的调用都走了 fallback 路径」这个预期结论的印证。
 - 一旦预加载这个库，**每一次**原始 `syscall()` 调用都要付出的税——不只是 `close_range` 调用——在这里是真实存在的、两位数百分比的 相对开销（虽然绝对值仍在亚微秒级别）。对一个大量使用 `syscall()` 的消费者（比如 Bun 的 `c-bindings.cpp`，`close_range`、`pwritev2`、 `exit_group` 全都是走公开的 `syscall()` 符号）影响最大。
-- `getcwd` 成功路径的差值在这台设备的运行间噪声范围内 ——与「真实调用已经能用时就是无操作」这个设计目标一致（但不算确凿证明）。
-- `tmpfile` 的相对差值是这四个 libc 级符号里最大的，但两个数字都被真实文件系统 I/O 主导（无论哪种情况都是 3-4+ 毫秒）；多出来的开销 来自先尝试真实调用（很快就会失败）、然后再 fallback 到 `mkstemp()`—— 这是「始终优先尝试真实实现」这个设计固有的代价。
+- `tmpfile` 的相对差值是这几个 libc 级符号里最大的，但两个数字都被真实文件系统 I/O 主导（无论哪种情况都是 3-4+ 毫秒）；多出来的开销 来自先尝试真实调用（很快就会失败）、然后再 fallback 到 `mkstemp()`—— 这是「始终优先尝试真实实现」这个设计固有的代价。
+- `epoll_wait`/`epoll_ctl` 的开销来自 ONESHOT 强制的注册表锁+扫描，即使 epfd 上零条目也要付出；`splice` 放弃零拷贝换正确性，约 61% 吞吐下降，只在目标是 FIFO 时触发。
 
 ### 容器对比：fallback 到底要花多少代价
 
@@ -281,7 +282,6 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 | `close_range` | 108 250 ns/次 | ~1867 ns/次 | **真机慢约 58 倍** |
 | `getpwuid_r` | 68 530 ns/次 | ~5080 ns/次 | **慢约 13 倍** |
 | `tmpfile` | 3 011 710 ns/次 | ~33 500 ns/次 | **慢约 90 倍** |
-| `getcwd` | 1922.8 ns/次 | ~272 ns/次 | **慢约 7 倍** |
 
 这个差距不是 shim 本身的开销 —— 而是「真实系统调用/libc 调用直接就能用」和「每次调用都需要一个用户态的变通方案」（`close_range` 靠 `/proc/self/fd` 枚举、`tmpfile` 靠 `mkstemp()`、`getpwuid_r` 靠合成用户记录）之间真实存在的成本差异。这也是上面收口跟踪表为什么重要的最直接证据：HarmonyOS 补上的每一个缺口，对用了 shim 的消费者来说，都是一次实打实的、两位数倍数级别的性能提升，而不仅仅是修正确性。
 
@@ -297,14 +297,13 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 | `close_range` | 1814.4 ns | 1824.5 ns | +10.2 ns | ±82.4 ns | 否（t=0.24）|
 | `close_range` fallback 算法（独立测量） | 5575.6 ns | 5558.6 ns | -17.0 ns | ±184.3 ns | 否（t=-0.18）|
 | `getpwuid_r` | 4212.4 ns | 4216.8 ns | +4.4 ns | ±132.5 ns | 否（t=0.07）|
-| `getcwd` | 240.5 ns | 249.8 ns | +9.3 ns | ±11.8 ns | 否（t=1.57，最接近阈值）|
 | `tmpfile` | 19 726.9 ns | 19 329.6 ns | -397.3 ns | ±697.4 ns | 否（t=-1.13）|
 
 （配对 t 检验，df=99，临界 \|t\|=1.984。）
 
 **在 n=100 时，终于有一个真实效应从噪声里分离出来了：`syscall()` 透传。**+13.5 ns/次，95% 置信区间 [+6.7, +20.3] ns —— 完全在零以上。这正是进程里每一次非 `close_range` 的 `syscall()` 调用都无条件要经过的路径（shim 的 `syscall()` 覆盖实现里那次系统调用号判断+分支），所以这里出现一个小而真实、始终要付出的固定成本，正是设计所预期的。这和真机上同一测试项的发现（[性能](#性能)一节：+27%）互相印证——同一个底层机制，只是幅度不同（这个容器里基线调用本身就更便宜，而且真机上其它开销来源在这里都不适用），这本身也是一次合理性检验：一个真实的、有物理原因的效应，理应在两种环境下都表现为*某种*正的差值，而这里确实如此。
 
-**其余五项即便到 n=100 依旧不显著**，不过现在置信区间已经窄到有意义了（比如 `getcwd` 在约 240 ns 基线上的 ±11.8 ns，`close_range` 在约 1814 ns 基线上的 ±82.4 ns）—— 这已经不再是「探测不到效应」，而是「在这个精度下确实探测不到效应」。结合真机上的数字一起看（那边 shim 的 fallback 逻辑在大多数调用里是真的会介入的），这两组数据一致地表明：shim 真实世界里的开销几乎全都来自 fallback 路径本身的执行，而不是插桩这个动作本身，也不是任何超出那一个共用的 `syscall()` 入口点之外的、按符号区分的派发逻辑——每个进程都要为经过这个入口付出一份小而固定、现在已经量化出来的成本。
+**其余项即便到 n=100 依旧不显著**，不过现在置信区间已经窄到有意义了（比如 `close_range` 在约 1814 ns 基线上的 ±82.4 ns）—— 这已经不再是「探测不到效应」，而是「在这个精度下确实探测不到效应」。结合真机上的数字一起看（那边 shim 的 fallback 逻辑在大多数调用里是真的会介入的），这两组数据一致地表明：shim 真实世界里的开销几乎全都来自 fallback 路径本身的执行，而不是插桩这个动作本身，也不是任何超出那一个共用的 `syscall()` 入口点之外的、按符号区分的派发逻辑——每个进程都要为经过这个入口付出一份小而固定、现在已经量化出来的成本。
 
 ### 真实实现 vs. fallback 实现，直接对比
 
@@ -321,7 +320,7 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 | `pw_shell` | `/bin/sh` | `/bin/false`（写死的 —— 没办法知道真实 shell 是什么）|
 | `pw_uid` / `pw_gid` | `0` / `0` | `0` / `0`（一致 —— 来自真实系统调用，不是环境变量）|
 
-所以 fallback 在数值型身份字段和 `pw_dir` 上是准确的（只要 `$HOME`设置了，实践中它基本总是设置的）。字符串型身份字段：真机上查询自身 uid 时 name/gecos 取的是真实账号名（`OH_OsAccount_GetName`，本机实测 `hyq`），只有账号服务不可用或查询别的 uid 时才退化为 env/`u<uid>` 占位符；`pw_shell` 依旧写死为 `/bin/false`（账号 API 无法提供）。这本来就是已经写明的权衡，只是现在有了逐字段的确认，而不是靠假设。`tmpfile` 的写入/读回往返在真实实现和 fallback 之间完全一致（在这个测试深度下没发现功能差异）。`getcwd` 的 fallback 现在优先 `readlink("/proc/self/cwd")` 返回**真实 cwd**（内核 `d_path()` 不受用户态 `+x` 限制，正是 `getcwd()` 父目录遍历失败而它能成功的原因），用 `stat()` 校验路径仍存在；只有当路径确已消失（rmdir 后 `stat` 返回 `ENOENT`）才回落 `$HOME`。所以对 hmdfs `EACCES` 这类「cwd 有效但 `getcwd()` 走不通」的场景，fallback 给的是正确路径而非 `$HOME` 猜测——这正是让 bun 能撤掉 `ohos_set_pwd`/`cd-prefix` 的关键。
+所以 fallback 在数值型身份字段和 `pw_dir` 上是准确的（只要 `$HOME`设置了，实践中它基本总是设置的）。字符串型身份字段：真机上查询自身 uid 时 name/gecos 取的是真实账号名（`OH_OsAccount_GetName`，本机实测 `hyq`），只有账号服务不可用或查询别的 uid 时才退化为 env/`u<uid>` 占位符；`pw_shell` 依旧写死为 `/bin/false`（账号 API 无法提供）。`tmpfile` 的写入/读回往返在真实实现和 fallback 之间完全一致（在这个测试深度下没发现功能差异）。
 
 在 5 次重复的 `--dump` 运行之间做了交叉复核，两两互相比对：真实实现和 fallback 两边的输出每次都逐字节完全一致。这些是确定性的、结构性的差异（纯靠 `getenv()` 合成能填哪些字段、不能填哪些字段），不是抖动或者跟时间相关的输出。
 
@@ -330,10 +329,9 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 | 符号 | 真实实现均值 | fallback 均值 | 倍数 |
 |---|---|---|---|
 | `getpwuid_r` | 5844.3 ns/次 | 322.6 ns/次 | **fallback 快约 18.1 倍** |
-| `getcwd` | 253.6 ns/次 | 14.1 ns/次 | **fallback 快约 17.9 倍** |
 | `tmpfile` | 33 893.3 ns/次 | 29 980.1 ns/次 | 约 1.13 倍（每次跑方向都会反转 —— 基本打平）|
 
-这和 `close_range` 正好是**相反**的方向 —— `close_range` 的 fallback（`/proc/self/fd` 枚举）比真实系统调用要慢 40-90 倍（见[容器对比](#容器对比fallback-到底要花多少代价)）。规律是：一个 fallback 到底比真实调用快还是慢，完全取决于真实调用做了多少 fallback 不需要重做的工作——`getpwuid_r` 的真实路径要做一次 NSS/`/etc/passwd` 查找，`getcwd` 的真实路径要做一次真实的内核路径解析系统调用，这两者 fallback 都基本跳过（`getpwuid_r` 在查询自身 uid 时多一次缓存后的账号服务 IPC，失败则纯 `getenv()`）；相比之下，`close_range` 的 fallback 得*主动去枚举并关闭*文件描述符，来近似内核本来会直接做的事情；`tmpfile` 的 fallback 依旧要做真实的文件系统 I/O（`mkstemp()`），所以它和真实调用处在同一个成本量级，而不是彻底跳过了工作。这里不存在一条「fallback 就是更慢」或者「fallback 就是更快」的通用规律——得按每个符号具体去核实。
+这和 `close_range` 正好是**相反**的方向 —— `close_range` 的 fallback（`/proc/self/fd` 枚举）比真实系统调用要慢 40-90 倍（见[容器对比](#容器对比fallback-到底要花多少代价)）。规律是：一个 fallback 到底比真实调用快还是慢，完全取决于真实调用做了多少 fallback 不需要重做的工作——`getpwuid_r` 的真实路径要做一次 NSS/`/etc/passwd` 查找，fallback 基本跳过（查询自身 uid 时多一次缓存后的账号服务 IPC，失败则纯 `getenv()`）；相比之下，`close_range` 的 fallback 得*主动去枚举并关闭*文件描述符，来近似内核本来会直接做的事情；`tmpfile` 的 fallback 依旧要做真实的文件系统 I/O（`mkstemp()`），所以它和真实调用处在同一个成本量级，而不是彻底跳过了工作。这里不存在一条「fallback 就是更慢」或者「fallback 就是更快」的通用规律——得按每个符号具体去核实。
 
 **同一个工具，在真实 HarmonyOS 设备上运行**（`make real-vs-fallback`，单次运行 —— 下面真机上的数字，方向上和 shim 自己在[性能](#性能)一节里 averaged 出的真机基准数据是一致的，这正是用来确认这些不是偶然波动的关键）：
 
@@ -341,9 +339,8 @@ npm 发布的产物由 `.github/workflows/release.yml` 在云端 `ubuntu-latest`
 |---|---|---|---|
 | `getpwuid_r` | 58 023.9 ns/次 | 673.1 ns/次 | fallback 快约 86 倍 |
 | `tmpfile` | 2 665 842.2 ns/次 | 107 955.5 ns/次 | fallback 快约 25 倍 |
-| `getcwd` | 1750.6 ns/次（真实调用在这里*成功*了 —— cwd 存在） | 50.8 ns/次 | fallback 快约 34 倍 |
 
-真机讲的是同一个故事更极端的版本，原因是容器展示不出来的：在真实硬件上，`getpwuid_r` 和 `tmpfile` 的「真实」调用不只是比 fallback 做了更多工作——它们会**直接失败**，而失败本身也是要花真实时间的（分别是 58 μs 和 2.7 ms，仅仅是为了走到 `ENOENT`/`EPERM` 然后放弃），这些时间发生在 shim 的派发逻辑真正开始尝试 fallback 之前。这份「尝试后失败」的成本，是这个 shim 在真机上每一次 `getpwuid_r`/`tmpfile` 调用都要背负的固定开销——这也是为什么这两项在[性能](#性能)一节的「加 shim vs. 基线」数字里显示出最大的相对开销，而且这不是 fallback 设计能够避免的：shim 始终优先尝试真实实现，依据的判断是「一次缓慢但保证结果新鲜的检查，好过一次快但可能出错的假设」（见[前向兼容](#前向兼容优先自动尝试真实系统调用)）。这里 `getcwd` 展示的是*成功*的场景（这次运行时这台真机的 cwd 是存在的），所以它比另外两项便宜，尽管依旧是 fallback 成本的约 34 倍——真实的内核路径解析终归比读一个缓存的环境变量要贵得多。
+真机讲的是同一个故事更极端的版本，原因是容器展示不出来的：在真实硬件上，`getpwuid_r` 和 `tmpfile` 的「真实」调用不只是比 fallback 做了更多工作——它们会**直接失败**，而失败本身也是要花真实时间的（分别是 58 μs 和 2.7 ms，仅仅是为了走到 `ENOENT`/`EPERM` 然后放弃），这些时间发生在 shim 的派发逻辑真正开始尝试 fallback 之前。这份「尝试后失败」的成本，是这个 shim 在真机上每一次 `getpwuid_r`/`tmpfile` 调用都要背负的固定开销——这也是为什么这两项在[性能](#性能)一节的「加 shim vs. 基线」数字里显示出最大的相对开销，而且这不是 fallback 设计能够避免的：shim 始终优先尝试真实实现，依据的判断是「一次缓慢但保证结果新鲜的检查，好过一次快但可能出错的假设」（见[前向兼容](#前向兼容优先自动尝试真实系统调用)）。
 
 ## License
 

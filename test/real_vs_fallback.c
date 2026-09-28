@@ -1,11 +1,11 @@
 /*
  * real_vs_fallback.c — directly compares the REAL libc implementation vs
- * this shim's own FALLBACK (substitute) implementation for getpwuid_r,
- * tmpfile, and getcwd — both performance AND functional output — by
- * re-implementing the exact fallback logic from ohos_compat_shim.c
- * standalone, so it runs unconditionally regardless of whether the real
- * call would naturally fail on this platform (it doesn't, in the
- * OpenHarmony container, which is exactly why this needs to be forced).
+ * this shim's own FALLBACK (substitute) implementation for getpwuid_r and
+ * tmpfile — both performance AND functional output — by re-implementing
+ * the exact fallback logic from ohos_compat_shim.c standalone, so it runs
+ * unconditionally regardless of whether the real call would naturally
+ * fail on this platform (it doesn't, in the OpenHarmony container, which
+ * is exactly why this needs to be forced).
  *
  * This does NOT link against or exercise ohos_compat_shim.c's actual
  * dispatch logic — the three fallback_*() functions below are hand-copied
@@ -258,75 +258,14 @@ static void dump_tmpfile(void)
 	}
 }
 
-/* ==================================================================== */
-/* getcwd: real vs fallback (ENOENT->HOME, verbatim from shim)           */
-/* ==================================================================== */
-
-static char *fallback_getcwd(char *buf, size_t size)
-{
-	const char *home = getenv("HOME");
-	if (!home)
-		home = "/data/storage/el2/base";
-	size_t need = strlen(home) + 1;
-
-	if (buf) {
-		if (size < need) {
-			errno = ERANGE;
-			return NULL;
-		}
-		memcpy(buf, home, need);
-		return buf;
-	}
-	size_t alloc_size = size ? size : need;
-	if (alloc_size < need) {
-		errno = ERANGE;
-		return NULL;
-	}
-	char *out = malloc(alloc_size);
-	if (!out)
-		return NULL;
-	memcpy(out, home, need);
-	return out;
-}
-
-static void bench_getcwd(void)
-{
-	long iters = 5000;
-	char buf[4096];
-
-	double t0 = now_ms();
-	for (long i = 0; i < iters; i++)
-		getcwd(buf, sizeof(buf));
-	report("getcwd REAL", iters, now_ms() - t0);
-
-	t0 = now_ms();
-	for (long i = 0; i < iters; i++)
-		fallback_getcwd(buf, sizeof(buf));
-	report("getcwd FALLBACK", iters, now_ms() - t0);
-}
-
-static void dump_getcwd(void)
-{
-	char buf[4096];
-	printf("\n--- getcwd REAL ---\n");
-	char *r = getcwd(buf, sizeof(buf));
-	printf("result=%s\n", r ? r : "(NULL)");
-
-	printf("--- getcwd FALLBACK ---\n");
-	r = fallback_getcwd(buf, sizeof(buf));
-	printf("result=%s\n", r ? r : "(NULL)");
-}
-
 int main(int argc, char **argv)
 {
 	if (argc > 1 && strcmp(argv[1], "--dump") == 0) {
 		dump_getpwuid_r();
 		dump_tmpfile();
-		dump_getcwd();
 		return 0;
 	}
 	bench_getpwuid_r();
 	bench_tmpfile();
-	bench_getcwd();
 	return 0;
 }

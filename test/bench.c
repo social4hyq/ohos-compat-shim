@@ -24,9 +24,8 @@
  *     with an honest "N/A" instead of a misleading number (or, on a device
  *     where it doesn't crash, proceeds unguarded for accurate timing).
  *
- *   getpwuid_r / tmpfile / getcwd — baseline always takes the real
- *     (failing, for the first two) codepath; shimmed measures real-call
- *     attempt + fallback synthesis.
+ *   getpwuid_r / tmpfile — baseline always takes the real (failing)
+ *     codepath; shimmed measures real-call attempt + fallback synthesis.
  */
 
 #define _GNU_SOURCE
@@ -185,120 +184,14 @@ static void bench_tmpfile(void)
 	report("tmpfile", iters, now_ms() - t0);
 }
 
-static void bench_getcwd(void)
-{
-	long iters = 5000;
-	char buf[4096];
-	double t0 = now_ms();
-	for (long i = 0; i < iters; i++)
-		getcwd(buf, sizeof(buf));
-	report("getcwd", iters, now_ms() - t0);
-}
-
 /*
- * bench_poll_patch_* / bench_epoll_wait_no_pipe / bench_epoll_ctl_churn —
- * added for the 2026-08-18 shim performance/stability validation pass
- * (epoll_pipe interceptor had zero benchmark coverage before this).
- *
- * poll_patch_idle_fds / poll_patch_pipe_fds isolate ep_shim_patch_pollfds()
- * (ohos_compat_shim.c): whenever the epoll_pipe interceptor is enabled at
- * all -- gated only by the global shim_disabled("epoll_pipe") check, NOT by
- * whether any pipe was ever actually registered -- every poll()/ppoll()
- * return runs an uncached fstat() (splice_fd_is_fifo()) on every fd that
- * asked for POLLIN and came back with revents==0. That is an O(N) tax on
- * the caller's *entire idle fd set*, paid on every call, process-wide, for
- * every LD_PRELOAD consumer. N is swept via argv so the O(N) shape shows up
- * directly in the ns/call trend rather than needing algebra on one number.
- *
- * epoll_wait_no_pipe isolates the global-mutex-plus-O(64)-scan cost
- * (g_ep_pipes_lock, ep_reg_any_locked) an epoll_wait/epoll_pwait call pays
- * even when the epfd has zero registered pipes.
- *
- * epoll_ctl_churn isolates the same lock+scan cost under repeated
- * ADD/MOD/DEL on an fd that *does* register (a real pipe), which is the
- * shape a churning connection pool would produce.
+ * bench_epoll_wait_no_pipe / bench_epoll_ctl_churn isolate the global-
+ * mutex-plus-registry-scan cost (g_ep_pipes_lock) that epoll_ctl/
+ * epoll_wait/epoll_pwait pay for ONESHOT-enforcement bookkeeping: the
+ * former with zero registered entries, the latter under repeated
+ * ADD/MOD/DEL on an fd that *does* register (a real pipe), the shape a
+ * churning connection pool would produce.
  */
-
-static void bench_poll_patch_idle_fds(int n)
-{
-	char name[32];
-	snprintf(name, sizeof(name), "poll_patch_idle_n%d", n);
-
-	int *fds = calloc((size_t)n, sizeof(int));
-	struct pollfd *pfds = calloc((size_t)n, sizeof(struct pollfd));
-	if (!fds || !pfds) {
-		printf("%-22s calloc failed\n", name);
-		free(fds);
-		free(pfds);
-		return;
-	}
-	for (int i = 0; i < n; i++) {
-		fds[i] = eventfd(0, EFD_NONBLOCK);
-		pfds[i].fd = fds[i];
-		pfds[i].events = POLLIN;
-	}
-
-	long iters = 5000;
-	double t0 = now_ms();
-	for (long i = 0; i < iters; i++) {
-		for (int j = 0; j < n; j++)
-			pfds[j].revents = 0;
-		poll(pfds, (nfds_t)n, 0);
-	}
-	report(name, iters, now_ms() - t0);
-
-	for (int i = 0; i < n; i++)
-		if (fds[i] >= 0)
-			close(fds[i]);
-	free(fds);
-	free(pfds);
-}
-
-static void bench_poll_patch_pipe_fds(int n)
-{
-	char name[32];
-	snprintf(name, sizeof(name), "poll_patch_pipe_n%d", n);
-
-	int (*fds)[2] = calloc((size_t)n, sizeof(int[2]));
-	struct pollfd *pfds = calloc((size_t)n, sizeof(struct pollfd));
-	if (!fds || !pfds) {
-		printf("%-22s calloc failed\n", name);
-		free(fds);
-		free(pfds);
-		return;
-	}
-	for (int i = 0; i < n; i++) {
-		if (pipe(fds[i]) != 0) {
-			printf("%-22s pipe() failed\n", name);
-			for (int k = 0; k < i; k++) {
-				close(fds[k][0]);
-				close(fds[k][1]);
-			}
-			free(fds);
-			free(pfds);
-			return;
-		}
-		fcntl(fds[i][0], F_SETFL, O_NONBLOCK);
-		pfds[i].fd = fds[i][0];
-		pfds[i].events = POLLIN;
-	}
-
-	long iters = 5000;
-	double t0 = now_ms();
-	for (long i = 0; i < iters; i++) {
-		for (int j = 0; j < n; j++)
-			pfds[j].revents = 0;
-		poll(pfds, (nfds_t)n, 0);
-	}
-	report(name, iters, now_ms() - t0);
-
-	for (int i = 0; i < n; i++) {
-		close(fds[i][0]);
-		close(fds[i][1]);
-	}
-	free(fds);
-	free(pfds);
-}
 
 static void bench_epoll_wait_no_pipe(void)
 {
@@ -357,22 +250,6 @@ static void bench_epoll_ctl_churn(void)
 	close(pfd[0]);
 	close(pfd[1]);
 }
-
-/* NOTE on the epoll_pipe adaptive backoff (2a): deliberately NOT
- * benchmarked here by calling epoll_wait(-1) directly. A pipe registered
- * but never fed data means every slice is empty, so ep_shim_wait's
- * infinite-wait loop (by design -- an infinite wait must only ever return
- * with a real event or a signal, never a premature 0, see the 8daab67
- * SIGABRT history above ep_shim_wait) never returns at all: there is no
- * bounded way to observe "N calls completing" from outside. A FINITE
- * outer timeout does return, but its own deadline caps total elapsed time
- * regardless of how the interval grew internally, which masks growth
- * rather than revealing it -- any wall-clock measurement attempted here
- * either hangs or measures the wrong thing. Backoff growth is instead
- * verified functionally (test/functional.c's bounded-deadline regression
- * test) and by code inspection (the comment block above g_ep_backoff's
- * declaration in src/ohos_compat_shim.c).
- */
 
 /* Replaces the README's historical prose throughput number ("100MB through
  * two-hop pipes: 101ms -> 129ms, 28% slower") with a reproducible bench
@@ -458,45 +335,6 @@ static void bench_splice_pipe_to_pipe(void)
  * behavior. fds[0] is pre-signaled so every iteration returns immediately
  * instead of actually blocking -- this measures shim call overhead, not
  * real wait time. */
-static void bench_poll_infinite_no_fifo(int n)
-{
-	char name[40];
-	snprintf(name, sizeof(name), "poll_infinite_no_fifo_n%d", n);
-
-	int *fds = calloc((size_t)n, sizeof(int));
-	struct pollfd *pfds = calloc((size_t)n, sizeof(struct pollfd));
-	if (!fds || !pfds) {
-		printf("%-26s calloc failed\n", name);
-		free(fds);
-		free(pfds);
-		return;
-	}
-	for (int i = 0; i < n; i++) {
-		fds[i] = eventfd(0, EFD_NONBLOCK);
-		pfds[i].fd = fds[i];
-		pfds[i].events = POLLIN;
-	}
-	uint64_t one = 1;
-	if (write(fds[0], &one, sizeof(one)) < 0) {
-		printf("%-26s eventfd write failed\n", name);
-	}
-
-	long iters = 5000;
-	double t0 = now_ms();
-	for (long i = 0; i < iters; i++) {
-		for (int j = 0; j < n; j++)
-			pfds[j].revents = 0;
-		poll(pfds, (nfds_t)n, -1); /* infinite, but fds[0] is always ready */
-	}
-	report(name, iters, now_ms() - t0);
-
-	for (int i = 0; i < n; i++)
-		if (fds[i] >= 0)
-			close(fds[i]);
-	free(fds);
-	free(pfds);
-}
-
 int main(void)
 {
 	bench_syscall_passthrough();
@@ -504,19 +342,8 @@ int main(void)
 	bench_close_range_fallback_path();
 	bench_getpwuid_r();
 	bench_tmpfile();
-	bench_getcwd();
-	bench_poll_patch_idle_fds(1);
-	bench_poll_patch_idle_fds(8);
-	bench_poll_patch_idle_fds(32);
-	bench_poll_patch_idle_fds(128);
-	bench_poll_patch_pipe_fds(1);
-	bench_poll_patch_pipe_fds(8);
-	bench_poll_patch_pipe_fds(32);
-	bench_poll_patch_pipe_fds(128);
 	bench_epoll_wait_no_pipe();
 	bench_epoll_ctl_churn();
-	bench_poll_infinite_no_fifo(1);
-	bench_poll_infinite_no_fifo(128);
 	bench_splice_pipe_to_pipe();
 	return 0;
 }
