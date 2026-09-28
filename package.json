@@ -13,7 +13,7 @@
 	"bugs": {
 		"url": "https://github.com/social4hyq/ohos-compat-shim/issues"
 	},
-	"license": "MIT",
+	"license": "0BSD",
 	"keywords": [
 		"harmonyos",
 		"openharmony",
