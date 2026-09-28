@@ -24,17 +24,11 @@
  *       (close_range, getpwuid_r, tmpfile, fchmodat2, linkat, link, splice,
  *       epoll_pipe, getaddrinfo, std_streams). Each gets a NEEDED/DROPPABLE/
  *       INCONCLUSIVE verdict and feeds the DISABLE recommendation line;
- *       splice and epoll_pipe each cover two independent symptoms under
- *       one shim-side toggle, so their own sub-probes appear as separate
- *       rows for visibility but only the combined row carries the
- *       suggestion. std_streams gets an INCONCLUSIVE-only row since this
- *       binary can't trigger its condition (see probe_std_streams()).
- *   B — two kinds of row, neither eligible for the DISABLE line: (1)
- *       interceptors the shim used to carry but has since had removed
- *       once they stopped reproducing (getcwd, symlinkat,
- *       getaddrinfo_addrconfig, epoll_pipe_epollin) — kept here purely so
- *       a regression on some other OHOS version stays visible; (2)
- *       surrounding platform capabilities this workspace has documented
+ *       splice covers two independent symptoms under one shim-side toggle;
+ *       its sub-probes appear as separate rows, but only the combined row
+ *       carries the suggestion. std_streams gets an INCONCLUSIVE-only row
+ *       since this binary can't trigger its condition (see probe_std_streams()).
+ *   B — surrounding platform capabilities this workspace has documented
  *       workarounds for (raw syscalls Bun's rustix backend can't be
  *       LD_PRELOAD-shimmed for, ptrace, prctl(PR_SET_PTRACER), the musl
  *       dlopen/.dynsym limitation, ...) that no LD_PRELOAD shim can fix.
@@ -59,7 +53,6 @@
 #include <limits.h>
 #include <linux/openat2.h>
 #include <netdb.h>
-#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
@@ -168,10 +161,10 @@ static report_row_t *add_row(const char *id, const char *group, const char *desc
 static const char *verdict_str(verdict_t v)
 {
 	switch (v) {
-	case V_NEEDED: return "仍需要";
-	case V_DROPPABLE: return "可关闭";
-	case V_INCONCLUSIVE: return "不确定";
-	case V_INFO: default: return "信息";
+	case V_NEEDED: return "NEEDED";
+	case V_DROPPABLE: return "DROPPABLE";
+	case V_INCONCLUSIVE: return "INCONCLUSIVE";
+	case V_INFO: default: return "INFO";
 	}
 }
 
@@ -358,10 +351,9 @@ static void run_guarded_timeout(child_fn fn, void *arg, child_result_t *out,
 }
 
 /* ==================================================================== */
-/*  Candidate path set — the four path-sensitive interceptors           */
-/*  (getcwd/tmpfile/linkat/symlinkat) depend on WHICH filesystem a path  */
-/*  lives on, not just the OS version, so every probe below runs once    */
-/*  per candidate directory rather than once globally.                   */
+/*  Candidate path set — linkat/link probes depend on the filesystem   */
+/*  path, so they run once per candidate directory rather than once    */
+/*  globally.                                                          */
 /* ==================================================================== */
 
 #define NUM_CANDIDATE_DIRS 5
@@ -454,7 +446,7 @@ static void child_close_range_unshare_flag(void *arg, child_result_t *out)
 static void probe_close_range(void)
 {
 	report_row_t *r = add_row("close_range", "A",
-		"close_range()/syscall(SYS_close_range) 批量关 fd");
+		"Bulk close of file descriptors via close_range()/syscall(SYS_close_range)");
 	r->has_disable_flag = 1;
 	child_result_t res;
 	char note[512];
@@ -465,29 +457,29 @@ static void probe_close_range(void)
 	if (res.crashed) {
 		needed = 1;
 		off += (size_t)snprintf(note + off, sizeof(note) - off,
-			"基本调用被信号杀死(sig=%d)；", res.term_sig);
+			"Basic call terminated by signal (sig=%d); ", res.term_sig);
 	} else if (res.rc == 0) {
 		off += (size_t)snprintf(note + off, sizeof(note) - off,
-			"基本调用成功且真的关闭了 fd；");
+			"Basic call succeeded and closed the fd; ");
 	} else {
 		needed = 1;
 		off += (size_t)snprintf(note + off, sizeof(note) - off,
-			"基本调用失败 rc=%d errno=%d(%s)；", res.rc, res.err,
+			"Basic call failed: rc=%d errno=%d(%s); ", res.rc, res.err,
 			strerror(res.err));
 	}
 
 	run_guarded(child_close_range_einval, NULL, &res);
 	if (res.crashed) {
 		off += (size_t)snprintf(note + off, sizeof(note) - off,
-			"first>last 参数校验：内核对非法参数也 SIGSYS（更糟，"
-			"shim 的前置校验仍必要）；");
+			"first>last validation: kernel raises SIGSYS even for invalid arguments; "
+			"the shim's early validation is still needed; ");
 	} else if (res.rc != 0 && res.err == EINVAL) {
 		off += (size_t)snprintf(note + off, sizeof(note) - off,
-			"first>last 参数校验：内核已按上游语义返回 EINVAL；");
+			"first>last validation: kernel returned EINVAL as specified; ");
 	} else {
 		off += (size_t)snprintf(note + off, sizeof(note) - off,
-			"first>last 参数校验：内核未按上游语义处理(rc=%d errno=%d)"
-			"——关闭 shim 会丢失这层保护；", res.rc, res.err);
+			"first>last validation: kernel did not return EINVAL as specified (rc=%d errno=%d); "
+			"disabling the shim removes this protection; ", res.rc, res.err);
 	}
 
 	int unshare_needed = 0;
@@ -495,14 +487,14 @@ static void probe_close_range(void)
 	if (res.crashed) {
 		unshare_needed = 1;
 		off += (size_t)snprintf(note + off, sizeof(note) - off,
-			"unshare(CLONE_FILES) 被信号杀死(sig=%d)；", res.term_sig);
+			"unshare(CLONE_FILES) terminated by signal (sig=%d); ", res.term_sig);
 	} else if (res.rc == 0 || res.err == EINVAL) {
 		off += (size_t)snprintf(note + off, sizeof(note) - off,
-			"unshare(CLONE_FILES) 可用；");
+			"unshare(CLONE_FILES) is available; ");
 	} else {
 		unshare_needed = 1;
 		off += (size_t)snprintf(note + off, sizeof(note) - off,
-			"unshare(CLONE_FILES) 失败 errno=%d(%s)；", res.err,
+			"unshare(CLONE_FILES) failed: errno=%d(%s); ", res.err,
 			strerror(res.err));
 	}
 
@@ -510,14 +502,14 @@ static void probe_close_range(void)
 	if (res.crashed) {
 		unshare_needed = 1;
 		snprintf(note + off, sizeof(note) - off,
-			"CLOSE_RANGE_UNSHARE 标志被信号杀死(sig=%d)", res.term_sig);
+			"CLOSE_RANGE_UNSHARE terminated by signal (sig=%d)", res.term_sig);
 	} else if (res.rc == 0) {
 		snprintf(note + off, sizeof(note) - off,
-			"CLOSE_RANGE_UNSHARE 标志可用");
+			"CLOSE_RANGE_UNSHARE is available");
 	} else {
 		unshare_needed = 1;
 		snprintf(note + off, sizeof(note) - off,
-			"CLOSE_RANGE_UNSHARE 标志失败 errno=%d(%s)", res.err,
+			"CLOSE_RANGE_UNSHARE failed: errno=%d(%s)", res.err,
 			strerror(res.err));
 	}
 
@@ -553,21 +545,21 @@ static void child_fchmodat2(void *arg, child_result_t *out)
 static void probe_fchmodat2(void)
 {
 	report_row_t *r = add_row("fchmodat2", "A",
-		"syscall(SYS_fchmodat2) chmod 的 AT_* flags 变体");
+		"chmod variant with AT_* flags via syscall(SYS_fchmodat2)");
 	r->has_disable_flag = 1;
 	child_result_t res;
 	run_guarded(child_fchmodat2, NULL, &res);
 	if (res.crashed) {
 		r->verdict = V_NEEDED;
-		snprintf(r->note, sizeof(r->note), "被信号杀死(sig=%d)，真机典型症状",
+		snprintf(r->note, sizeof(r->note), "Terminated by signal (sig=%d), typical on device",
 			res.term_sig);
 	} else if (res.rc == 0) {
 		r->verdict = V_DROPPABLE;
-		snprintf(r->note, sizeof(r->note), "真实系统调用成功");
+		snprintf(r->note, sizeof(r->note), "Native syscall succeeded");
 	} else {
 		r->verdict = V_NEEDED;
 		snprintf(r->note, sizeof(r->note),
-			"返回错误 errno=%d(%s)（容器典型是干净的 ENOSYS）", res.err,
+			"Failed: errno=%d(%s) (typically clean ENOSYS in containers)", res.err,
 			strerror(res.err));
 	}
 }
@@ -577,7 +569,7 @@ static void probe_fchmodat2(void)
 static void probe_getpwuid_r(void)
 {
 	report_row_t *r = add_row("getpwuid_r", "A",
-		"os.userInfo() 依赖的 uid→用户名解析");
+		"UID-to-name lookup used by os.userInfo()");
 	r->has_disable_flag = 1;
 	struct passwd pwd, *result = NULL;
 	char buf[1024];
@@ -586,16 +578,16 @@ static void probe_getpwuid_r(void)
 	int rc = getpwuid_r(geteuid(), &pwd, buf, sizeof(buf), &result);
 	if (rc == 0 && result != NULL) {
 		r->verdict = V_DROPPABLE;
-		snprintf(r->note, sizeof(r->note), "真实调用成功，pw_name=%s", pwd.pw_name);
+		snprintf(r->note, sizeof(r->note), "Native call succeeded, pw_name=%s", pwd.pw_name);
 	} else {
 		r->verdict = V_NEEDED;
 		if (rc == 0)
 			snprintf(r->note, sizeof(r->note),
-				"真实调用返回成功(rc=0)但 *result=NULL——HAP uid 仍未命中 "
-				"/etc/passwd 记录（shim README 记录的确切症状）");
+				"Native call returned success (rc=0) but *result=NULL; HAP UID is not "
+				"present in /etc/passwd (the symptom handled by the shim)");
 		else
 			snprintf(r->note, sizeof(r->note),
-				"真实调用失败 rc=%d(%s)，HAP uid 仍不在 /etc/passwd", rc,
+				"Native call failed: rc=%d(%s); HAP UID is not in /etc/passwd", rc,
 				strerror(rc));
 	}
 }
@@ -604,78 +596,26 @@ static void probe_getpwuid_r(void)
 
 static void probe_tmpfile(void)
 {
-	report_row_t *r = add_row("tmpfile", "A", "P_tmpdir 可写性 (tmpfile())");
+	report_row_t *r = add_row("tmpfile", "A", "P_tmpdir writability (tmpfile())");
 	r->has_disable_flag = 1;
 	errno = 0;
 	FILE *f = tmpfile();
 	if (f) {
 		fclose(f);
 		r->verdict = V_DROPPABLE;
-		snprintf(r->note, sizeof(r->note), "真实 tmpfile() 成功");
+		snprintf(r->note, sizeof(r->note), "Native tmpfile() succeeded");
 	} else {
 		r->verdict = V_NEEDED;
-		snprintf(r->note, sizeof(r->note), "真实 tmpfile() 失败 errno=%d(%s)",
+		snprintf(r->note, sizeof(r->note), "Native tmpfile() failed: errno=%d(%s)",
 			errno, strerror(errno));
 	}
 }
 
-/* -- getcwd -------------------------------------------------------------- */
-
-/* B-group (informational): the shim no longer intercepts getcwd() at all
- * (removed once this stopped reproducing -- see git history), so there is
- * no OHOS_COMPAT_SHIM_DISABLE token left to recommend toggling. Kept here
- * purely so a regression on some other OHOS version stays visible instead
- * of silently going untested. */
-static void probe_getcwd(void)
-{
-	report_row_t *r = add_row("getcwd", "B",
-		"hmdfs 祖先目录缺 +x 导致 getcwd() 用户态父目录遍历失败（拦截点已删除，仅存留观测）");
-
-	char orig[PATH_MAX];
-	if (!getcwd(orig, sizeof(orig)))
-		snprintf(orig, sizeof(orig), "/");
-
-	int any_needed = 0;
-	char detail[400] = "";
-	size_t off = 0;
-
-	/* getcwd() from each candidate dir -- catches hmdfs ancestor EACCES the
-	 * same way the shim's guard condition does. (A separately-tested,
-	 * intentionally NOT covered here: cwd rmdir'd out from under the
-	 * process. That returns ENOENT, standard POSIX behavior on every
-	 * platform, not an OHOS-specific gap -- probing for it here would
-	 * conflate "still needed" with "still POSIX-compliant".) */
-	for (int i = 0; i < NUM_CANDIDATE_DIRS; i++) {
-		char scratch[PATH_MAX];
-		const char *dir = candidate_dir(i, scratch, sizeof(scratch));
-		if (!dir)
-			continue;
-		struct stat st;
-		if (stat(dir, &st) != 0)
-			continue;
-		if (chdir(dir) != 0)
-			continue;
-		char cwdbuf[PATH_MAX];
-		errno = 0;
-		char *ok = getcwd(cwdbuf, sizeof(cwdbuf));
-		if (!ok && errno == EACCES) {
-			any_needed = 1;
-			off += (size_t)snprintf(detail + off, sizeof(detail) - off,
-				"[%s: errno=%d] ", dir, errno);
-		}
-		chdir(orig);
-	}
-
-	r->verdict = any_needed ? V_NEEDED : V_DROPPABLE;
-	snprintf(r->note, sizeof(r->note), "%s",
-		any_needed ? detail : "所有探测路径下真实 getcwd() 均成功");
-}
-
-/* -- linkat / symlinkat --------------------------------------------------- */
+/* -- linkat --------------------------------------------------------------- */
 
 static void probe_linkat(void)
 {
-	report_row_t *r = add_row("linkat", "A", "hmdfs/沙箱安装目标目录的硬链接");
+	report_row_t *r = add_row("linkat", "A", "Hard links in hmdfs/sandboxed install directories");
 	r->has_disable_flag = 1;
 	int any_needed = 0, tested = 0;
 	char detail[400] = "";
@@ -708,13 +648,13 @@ static void probe_linkat(void)
 
 	if (!tested) {
 		r->verdict = V_INCONCLUSIVE;
-		snprintf(r->note, sizeof(r->note), "没有可写的候选目录，未能测试");
+		snprintf(r->note, sizeof(r->note), "No writable candidate directory; not tested");
 		return;
 	}
 	r->verdict = any_needed ? V_NEEDED : V_DROPPABLE;
 	snprintf(r->note, sizeof(r->note),
-		"%s（有损语义 fallback：一旦可关闭就应尽快关闭，别图省事留着）",
-		any_needed ? detail : "所有可写候选目录下真实 linkat() 均成功");
+		"%s (lossy copy fallback: disable it once safe to do so)",
+		any_needed ? detail : "Native linkat() succeeded in all writable candidate directories");
 }
 
 /*
@@ -728,7 +668,7 @@ static void probe_linkat(void)
  */
 static void probe_link(void)
 {
-	report_row_t *r = add_row("link", "A", "musl link() 走裸 SYS_linkat，不经过 linkat() 符号，需要独立拦截");
+	report_row_t *r = add_row("link", "A", "musl link() uses raw SYS_linkat, bypassing the linkat() symbol");
 	r->has_disable_flag = 1;
 	int any_needed = 0, tested = 0;
 	char detail[400] = "";
@@ -761,55 +701,13 @@ static void probe_link(void)
 
 	if (!tested) {
 		r->verdict = V_INCONCLUSIVE;
-		snprintf(r->note, sizeof(r->note), "没有可写的候选目录，未能测试");
+		snprintf(r->note, sizeof(r->note), "No writable candidate directory; not tested");
 		return;
 	}
 	r->verdict = any_needed ? V_NEEDED : V_DROPPABLE;
 	snprintf(r->note, sizeof(r->note),
-		"%s（有损语义 fallback：一旦可关闭就应尽快关闭，别图省事留着）",
-		any_needed ? detail : "所有可写候选目录下真实 link() 均成功");
-}
-
-/* B-group (informational): the shim no longer intercepts symlinkat() at
- * all (removed once this stopped reproducing -- see git history), so
- * there is no OHOS_COMPAT_SHIM_DISABLE token left to recommend toggling.
- * Kept here purely so a regression on some other OHOS version stays
- * visible instead of silently going untested. */
-static void probe_symlinkat(void)
-{
-	report_row_t *r = add_row("symlinkat", "B",
-		"hmdfs/沙箱安装目标目录的符号链接（拦截点已删除，仅存留观测）");
-	int any_needed = 0, tested = 0;
-	char detail[400] = "";
-	size_t off = 0;
-
-	for (int i = 0; i < NUM_CANDIDATE_DIRS; i++) {
-		char scratch[PATH_MAX];
-		const char *dir = candidate_dir(i, scratch, sizeof(scratch));
-		if (!dir || access(dir, W_OK) != 0)
-			continue;
-		char dst[PATH_MAX];
-		snprintf(dst, sizeof(dst), "%s/ohos-check-symlink-dst-%d", dir, (int)getpid());
-		unlink(dst);
-		errno = 0;
-		int rc = symlinkat("target-does-not-need-to-exist", AT_FDCWD, dst);
-		tested = 1;
-		if (rc != 0 && (errno == EPERM || errno == EACCES)) {
-			any_needed = 1;
-			off += (size_t)snprintf(detail + off, sizeof(detail) - off,
-				"[%s: errno=%d] ", dir, errno);
-		}
-		unlink(dst);
-	}
-
-	if (!tested) {
-		r->verdict = V_INCONCLUSIVE;
-		snprintf(r->note, sizeof(r->note), "没有可写的候选目录，未能测试");
-		return;
-	}
-	r->verdict = any_needed ? V_NEEDED : V_DROPPABLE;
-	snprintf(r->note, sizeof(r->note), "%s",
-		any_needed ? detail : "所有可写候选目录下真实 symlinkat() 均成功");
+		"%s (lossy copy fallback: disable it once safe to do so)",
+		any_needed ? detail : "Native link() succeeded in all writable candidate directories");
 }
 
 /* -- epoll_pipe's ONESHOT-enforcement half ------------------------------ */
@@ -852,7 +750,7 @@ static int epoll_oneshot_refire_count(int fd, int rounds)
 static void probe_epoll_oneshot(void)
 {
 	report_row_t *r = add_row("epoll_pipe", "A",
-		"EPOLLONESHOT 是否对 EPOLLOUT 注册（FIFO 写端/PTY）正确自动缴械");
+		"Whether EPOLLONESHOT disarms EPOLLOUT registrations on FIFO/PTY writers");
 	r->has_disable_flag = 1;
 
 	int p[2];
@@ -872,28 +770,25 @@ static void probe_epoll_oneshot(void)
 
 	if (fifo_refires < 0 && pty_refires < 0) {
 		r->verdict = V_INCONCLUSIVE;
-		snprintf(r->note, sizeof(r->note), "FIFO 与 PTY 均未能建立，未能测试");
+		snprintf(r->note, sizeof(r->note), "Could not create FIFO or PTY; not tested");
 		return;
 	}
 
 	int needed = (fifo_refires > 0) || (pty_refires > 0);
 	r->verdict = needed ? V_NEEDED : V_DROPPABLE;
 	snprintf(r->note, sizeof(r->note),
-		"FIFO 写端重发 %s；PTY 写端重发 %s",
-		fifo_refires < 0 ? "未测试" :
-			(fifo_refires > 0 ? "复现" : "未复现"),
-		pty_refires < 0 ? "未测试" :
-			(pty_refires > 0 ? "复现" : "未复现"));
+		"FIFO writer refired: %s; PTY writer refired: %s",
+		fifo_refires < 0 ? "not tested" :
+			(fifo_refires > 0 ? "yes" : "no"),
+		pty_refires < 0 ? "not tested" :
+			(pty_refires > 0 ? "yes" : "no"));
 }
 
-/* -- splice / epoll_pipe: multi-round + memory-pressure stress ---------- */
+/* -- splice wakeup: repeated probes under memory-pressure stress ------- */
 /*
- * Both defects are load-dependent (the shim's own comments record the T50
- * epoll bug's repro rate tracking memory pressure). A single clean pass
- * proves nothing, so these two run --rounds times under a background
- * memcpy/sched_yield stress pool, and a full clean pass is reported
- * INCONCLUSIVE, never DROPPABLE — "didn't reproduce" is not "fixed" for an
- * intermittent bug.
+ * This defect is intermittent, so one clean pass proves nothing. Repeat
+ * under a background memcpy/sched_yield stress pool and report a clean run
+ * as INCONCLUSIVE, never DROPPABLE.
  */
 
 static int g_rounds = 20;
@@ -1028,9 +923,9 @@ static int splice_wake_defect_once(void)
 }
 
 /* Split into two independent rows -- EOF-on-source-as-EPIPE is deterministic
- * (one call either shows it or doesn't), the write-side wakeup defect is
- * load-dependent (needs --rounds under stress, and a clean pass only ever
- * proves INCONCLUSIVE, never DROPPABLE, same policy as epoll_pipe below).
+ * (one call either shows it or doesn't), while the write-side wakeup defect
+ * is load-dependent (needs --rounds under stress, and a clean pass only ever
+ * proves INCONCLUSIVE, never DROPPABLE).
  * The two can be fixed on different platform schedules, so combining them
  * into one row would hide which half of the shim's OHOS_COMPAT_SHIM_DISABLE=
  * splice toggle a device still needs -- the combining probe_splice() wrapper
@@ -1038,18 +933,18 @@ static int splice_wake_defect_once(void)
 static verdict_t probe_splice_eof(void)
 {
 	report_row_t *r = add_row("splice_eof", "A",
-		"splice() 源端 EOF 是否误报为 -1/EPIPE 而非返回 0");
+		"Whether splice() reports source EOF as -1/EPIPE instead of 0");
 
 	int broken = splice_eof_is_broken();
 	if (broken < 0) {
 		r->verdict = V_INCONCLUSIVE;
-		snprintf(r->note, sizeof(r->note), "管道创建失败，未能测试");
+		snprintf(r->note, sizeof(r->note), "Could not create pipes; not tested");
 	} else if (broken > 0) {
 		r->verdict = V_NEEDED;
-		snprintf(r->note, sizeof(r->note), "复现: 源端 EOF 报告为 -1/EPIPE");
+		snprintf(r->note, sizeof(r->note), "Reproduced: source EOF reported as -1/EPIPE");
 	} else {
 		r->verdict = V_DROPPABLE;
-		snprintf(r->note, sizeof(r->note), "未复现: 源端 EOF 正确返回 0");
+		snprintf(r->note, sizeof(r->note), "Not reproduced: source EOF correctly returned 0");
 	}
 	return r->verdict;
 }
@@ -1057,7 +952,7 @@ static verdict_t probe_splice_eof(void)
 static verdict_t probe_splice_wakeup(void)
 {
 	report_row_t *r = add_row("splice_wakeup", "A",
-		"splice() 写入管道是否唤醒阻塞在该管道上的 poll/epoll");
+		"Whether splice() to a pipe wakes poll/epoll waiters");
 
 	start_stress();
 	int needed_rounds = 0;
@@ -1069,13 +964,15 @@ static verdict_t probe_splice_wakeup(void)
 
 	if (needed_rounds > 0) {
 		r->verdict = V_NEEDED;
-		snprintf(r->note, sizeof(r->note), "在 %d/%d 轮复现", needed_rounds,
+		snprintf(r->note, sizeof(r->note), "Reproduced in %d/%d rounds",
+			needed_rounds,
 			g_rounds);
 	} else {
 		r->verdict = V_INCONCLUSIVE;
 		snprintf(r->note, sizeof(r->note),
-			"%d 轮加压下未复现——间歇性缺陷，未复现不等于已修复，必要时用"
-			"更大的 --rounds 重跑", g_rounds);
+			"Not reproduced in %d stressed rounds. The defect is intermittent; "
+			"absence of reproduction does not prove it is fixed. Retry with a larger --rounds value if needed.",
+			g_rounds);
 	}
 	return r->verdict;
 }
@@ -1092,178 +989,31 @@ static void probe_splice(void)
 	verdict_t v_wake = probe_splice_wakeup();
 
 	report_row_t *r = add_row("splice", "A",
-		"以上两项的汇总 -- OHOS_COMPAT_SHIM_DISABLE=splice 关闭的是整个拦截点");
+		"Summary of the checks above; OHOS_COMPAT_SHIM_DISABLE=splice disables both");
 	r->has_disable_flag = 1;
 	if (v_eof == V_NEEDED || v_wake == V_NEEDED) {
 		r->verdict = V_NEEDED;
-		snprintf(r->note, sizeof(r->note), "至少一项症状仍复现，见上两行");
+		snprintf(r->note, sizeof(r->note), "At least one symptom reproduced; see rows above");
 	} else {
 		r->verdict = V_INCONCLUSIVE;
 		snprintf(r->note, sizeof(r->note),
-			"两项症状本次均未复现，见上两行；间歇性缺陷不因单次未复现"
-			"产出关闭建议");
-	}
-}
-
-typedef struct {
-	int epfd;
-	int rc;
-} epoll_wait_arg_t;
-
-static void *epoll_waiter_thread(void *arg)
-{
-	epoll_wait_arg_t *a = arg;
-	struct epoll_event out[1];
-	a->rc = epoll_wait(a->epfd, out, 1, 2000);
-	return NULL;
-}
-
-/* Must test the actual missed-WAKEUP shape (a waiter already blocked in
- * epoll_wait() when data arrives), not "is data already there before the
- * wait is even issued" -- the latter is trivially satisfied by any epoll
- * implementation and previously made this probe read droppable
- * unconditionally, never having exercised the race it exists to catch. */
-static int epoll_pipe_defect_once(void)
-{
-	int p[2];
-	if (pipe(p) != 0)
-		return -1;
-	int epfd = epoll_create1(0);
-	if (epfd < 0) {
-		close(p[0]);
-		close(p[1]);
-		return -1;
-	}
-	struct epoll_event ev;
-	memset(&ev, 0, sizeof(ev));
-	ev.events = EPOLLIN;
-	ev.data.fd = p[0];
-	epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev);
-
-	epoll_wait_arg_t arg = { .epfd = epfd, .rc = -99 };
-	pthread_t th;
-	if (pthread_create(&th, NULL, epoll_waiter_thread, &arg) != 0) {
-		close(epfd);
-		close(p[0]);
-		close(p[1]);
-		return -1;
-	}
-	usleep(300 * 1000);
-	write(p[1], "x", 1);
-	pthread_join(th, NULL);
-
-	close(epfd);
-	close(p[0]);
-	close(p[1]);
-	return (arg.rc > 0) ? 0 : 1;
-}
-
-/* B-group (informational): the shim no longer synthesizes EPOLLIN at all
- * (removed once this stopped reproducing under a corrected already-
- * blocked-waiter probe -- see git history), so there is no
- * OHOS_COMPAT_SHIM_DISABLE token left to recommend toggling for it
- * specifically (epoll_pipe above, the ONESHOT-enforcement row, covers the
- * one symptom that remains under that name). Kept here purely so a
- * regression on some other OHOS version stays visible instead of
- * silently untested. */
-static void probe_epoll_pipe_epollin(void)
-{
-	report_row_t *r = add_row("epoll_pipe_epollin", "B",
-		"epoll/poll 丢失管道可读状态 -- 合成 EPOLLIN 是否仍需要（拦截点已删除，仅存留观测）");
-
-	start_stress();
-	int needed_rounds = 0, errors = 0;
-	for (int i = 0; i < g_rounds; i++) {
-		int res = epoll_pipe_defect_once();
-		if (res < 0)
-			errors++;
-		else if (res > 0)
-			needed_rounds++;
-	}
-	stop_stress();
-
-	if (needed_rounds > 0) {
-		r->verdict = V_NEEDED;
-		snprintf(r->note, sizeof(r->note), "在 %d/%d 轮复现（%d 轮建立失败）",
-			needed_rounds, g_rounds, errors);
-	} else {
-		r->verdict = V_INCONCLUSIVE;
-		snprintf(r->note, sizeof(r->note),
-			"%d 轮加压下未复现（%d 轮建立失败）——间歇性缺陷，未复现不等于"
-			"已修复，必要时用更大的 --rounds 重跑", g_rounds, errors);
+			"Neither symptom reproduced in this run; see rows above. A single clean run "
+			"does not produce a disable recommendation for the intermittent defect.");
 	}
 }
 
 /* -- getaddrinfo ---------------------------------------------------------
  *
- * Two independent symptoms, two rows: AI_ADDRCONFIG's loopback-family
- * filtering and the resolver's handling of syntactically invalid hostnames
- * can regress or get fixed on different schedules, so each gets its own
- * verdict rather than one row conflating both.
+ * The resolver's handling of syntactically invalid hostnames is probed
+ * separately because a slow failure can take several seconds.
  *
  * Calls the plain `getaddrinfo` symbol directly (same convention as
- * probe_tmpfile()/probe_getcwd() above) rather than dlsym(RTLD_NEXT, ...):
+ * probe_tmpfile() above) rather than dlsym(RTLD_NEXT, ...):
  * the baseline pass (no LD_PRELOAD) resolves this to real libc, and
  * `ohos-shim check --with-shim`'s second pass resolves it to the shim's own
  * interposed getaddrinfo() -- exactly the two conditions this check needs
  * to distinguish.
  */
-
-/* B-group (informational): the shim no longer merges in extra AF_INET
- * results for this symptom (removed once it stopped reproducing -- see
- * git history), so there is no OHOS_COMPAT_SHIM_DISABLE token left to
- * recommend toggling for it specifically (getaddrinfo_badchars below
- * covers the one symptom that remains). Kept here purely so a regression
- * on some other OHOS version stays visible instead of silently untested. */
-static void probe_getaddrinfo_addrconfig(void)
-{
-	report_row_t *r = add_row("getaddrinfo_addrconfig", "B",
-		"AI_ADDRCONFIG 查询 localhost 是否错误只返回 IPv6 loopback（拦截点已删除，仅存留观测）");
-
-	struct addrinfo hints = { 0 };
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_ADDRCONFIG;
-
-	struct addrinfo *res = NULL;
-	int rc = getaddrinfo("localhost", NULL, &hints, &res);
-	if (rc != 0) {
-		/* Can't evaluate the AI_ADDRCONFIG symptom without a
-		 * resolvable "localhost" -- not a verdict on the bug itself. */
-		r->verdict = V_INCONCLUSIVE;
-		snprintf(r->note, sizeof(r->note),
-			"getaddrinfo(\"localhost\", AI_ADDRCONFIG) 失败: %s -- 无法判定",
-			gai_strerror(rc));
-		return;
-	}
-
-	int n = 0, has_v4 = 0, all_v6_loopback = 1;
-	for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-		n++;
-		if (ai->ai_family == AF_INET) {
-			has_v4 = 1;
-			all_v6_loopback = 0;
-			continue;
-		}
-		if (ai->ai_family != AF_INET6 ||
-		    ai->ai_addrlen < sizeof(struct sockaddr_in6) ||
-		    !IN6_IS_ADDR_LOOPBACK(
-			    &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr))
-			all_v6_loopback = 0;
-	}
-	freeaddrinfo(res);
-
-	if (n > 0 && all_v6_loopback && !has_v4) {
-		r->verdict = V_NEEDED;
-		snprintf(r->note, sizeof(r->note),
-			"复现: AI_ADDRCONFIG 只返回 %d 条 IPv6 loopback，无 IPv4 -- "
-			"Happy-Eyeballs 调用方拿不到 IPv4 兜底地址", n);
-	} else {
-		r->verdict = V_DROPPABLE;
-		snprintf(r->note, sizeof(r->note),
-			"未复现: %d 条结果，has_v4=%d -- AI_ADDRCONFIG 行为正常", n, has_v4);
-	}
-}
 
 /* Real getaddrinfo() with a hostname carrying a character outside the
  * DNS/hostname alphabet (matching the shim's own hostname_has_invalid_chars()
@@ -1291,7 +1041,7 @@ static void child_getaddrinfo_badchars(void *arg, child_result_t *out)
 static void probe_getaddrinfo_badchars(void)
 {
 	report_row_t *r = add_row("getaddrinfo", "A",
-		"含非法字符的主机名是否在本地快速拒绝，而非转发到网络等超时");
+		"Whether hostnames with invalid characters are rejected locally instead of timing out on the network");
 	r->has_disable_flag = 1;
 
 	child_result_t res;
@@ -1302,20 +1052,20 @@ static void probe_getaddrinfo_badchars(void)
 	if (res.timed_out) {
 		r->verdict = V_NEEDED;
 		snprintf(r->note, sizeof(r->note),
-			"%dms 内未返回（已终止探测子进程）-- 转发到网络等待超时，"
-			"无本地快速拒绝", GAI_BADCHARS_TIMEOUT_MS);
+			"Did not return within %d ms (probe child terminated); likely waited for a network timeout",
+			GAI_BADCHARS_TIMEOUT_MS);
 	} else if (res.crashed) {
 		r->verdict = V_INCONCLUSIVE;
-		snprintf(r->note, sizeof(r->note), "探测子进程异常退出，无法判定");
+		snprintf(r->note, sizeof(r->note), "Probe child exited unexpectedly; inconclusive");
 	} else if (res.rc != 0 && elapsed_ms < GAI_BADCHARS_SLOW_MS) {
 		r->verdict = V_DROPPABLE;
 		snprintf(r->note, sizeof(r->note),
-			"%dms 内本地拒绝(%s) -- 行为已与 glibc 一致",
+			"Rejected locally in %d ms (%s), consistent with glibc",
 			elapsed_ms, gai_strerror(res.rc));
 	} else {
 		r->verdict = V_NEEDED;
 		snprintf(r->note, sizeof(r->note),
-			"%dms 后才返回(rc=%d) -- 疑似转发到网络而非本地快速拒绝",
+			"Returned after %d ms (rc=%d); likely forwarded to the network instead of rejecting locally",
 			elapsed_ms, res.rc);
 	}
 }
@@ -1327,7 +1077,8 @@ static void probe_getaddrinfo_badchars(void)
  * has no such relocation (it's not linking a copy-relocated libc FILE* the
  * way an official prebuilt claude-code binary does), so it structurally
  * cannot reproduce the trigger condition. A real verdict requires the
- * manual A/B in the shim's README (`修复了什么` table's std_streams row):
+ * manual A/B in the shim's README (the std_streams row in the supported
+ * interceptors table):
  * run an official (non-recompiled) claude-code binary with and without
  * this shim preloaded and compare startup behavior. Reporting a verdict
  * this probe can't actually test would be worse than admitting the gap.
@@ -1342,13 +1093,13 @@ static void probe_getaddrinfo_badchars(void)
 static void probe_std_streams(void)
 {
 	report_row_t *r = add_row("std_streams", "A",
-		"官方预编译二进制的 stdout/stderr R_AARCH64_COPY 重定位解析错误 (setvbuf 断言 abort)");
+		"stdout/stderr R_AARCH64_COPY relocation issue in official prebuilt binaries (setvbuf assertion abort)");
 	r->has_disable_flag = 0;
 	r->verdict = V_INCONCLUSIVE;
 	snprintf(r->note, sizeof(r->note),
-		"探针二进制自身没有触发条件所需的 R_AARCH64_COPY 重定位，"
-		"无法在这里判定 -- 需要对官方预编译 claude-code 二进制手工 A/B "
-		"(README std_streams 一节)");
+		"This probe binary has no R_AARCH64_COPY relocation to trigger the issue. "
+		"Cannot determine here; manually A/B test the official prebuilt claude-code binary "
+		"(see the std_streams section in README).");
 }
 
 static void run_a_group_probes(void)
@@ -1554,12 +1305,12 @@ static void probe_b_generic(const char *id, const char *desc, child_fn fn)
 	run_guarded(fn, NULL, &res);
 	r->verdict = V_INFO;
 	if (res.crashed) {
-		snprintf(r->note, sizeof(r->note), "被信号杀死(sig=%d)——仍被拦截",
+		snprintf(r->note, sizeof(r->note), "Terminated by signal (sig=%d); still blocked",
 			res.term_sig);
 	} else if (res.rc >= 0) {
-		snprintf(r->note, sizeof(r->note), "可用（rc=%d）", res.rc);
+		snprintf(r->note, sizeof(r->note), "Available (rc=%d)", res.rc);
 	} else {
-		snprintf(r->note, sizeof(r->note), "受限：errno=%d(%s)", res.err,
+		snprintf(r->note, sizeof(r->note), "Restricted: errno=%d(%s)", res.err,
 			strerror(res.err));
 	}
 }
@@ -1612,22 +1363,22 @@ static void child_ptrace(void *arg, child_result_t *out)
 static void probe_ptrace(void)
 {
 	report_row_t *r = add_row("ptrace", "B",
-		"调试器 attach 基础能力（PTRACE_TRACEME）——决定 strace 能不能用");
+		"Basic debugger attach capability (PTRACE_TRACEME), required by strace");
 	child_result_t res;
 	run_guarded(child_ptrace, NULL, &res);
 	r->verdict = V_INFO;
 	if (res.crashed) {
-		snprintf(r->note, sizeof(r->note), "探测进程本身被信号杀死(sig=%d)",
+		snprintf(r->note, sizeof(r->note), "Probe process terminated by signal (sig=%d)",
 			res.term_sig);
 	} else if (res.rc == 0) {
 		snprintf(r->note, sizeof(r->note),
-			"PTRACE_TRACEME/DETACH 均成功——真 ptrace 可用，ohos-trace-shim/"
-			"qemu -strace 变通理论上可以退回真 ptrace");
+			"PTRACE_TRACEME/DETACH both succeeded; ptrace is available, so "
+			"ohos-trace-shim/qemu -strace workarounds may be replaced with ptrace");
 	} else if (res.rc == -2) {
 		snprintf(r->note, sizeof(r->note),
-			"tracee 被信号杀死(sig=%d)——沙箱仍拦截 ptrace", res.aux);
+			"Tracee terminated by signal (sig=%d); ptrace is still blocked by the sandbox", res.aux);
 	} else {
-		snprintf(r->note, sizeof(r->note), "失败 rc=%d errno=%d(%s)", res.rc,
+		snprintf(r->note, sizeof(r->note), "Failed: rc=%d errno=%d(%s)", res.rc,
 			res.err, strerror(res.err));
 	}
 }
@@ -1643,23 +1394,23 @@ static void child_prctl_ptracer(void *arg, child_result_t *out)
 static void probe_prctl_ptracer(void)
 {
 	report_row_t *r = add_row("prctl_ptracer", "B",
-		"prctl(PR_SET_PTRACER)——OfficeCLI(.NET) 被 SIGSYS 杀死的根因");
+		"prctl(PR_SET_PTRACER), the cause of OfficeCLI (.NET) SIGSYS termination");
 	child_result_t res;
 	run_guarded(child_prctl_ptracer, NULL, &res);
 	r->verdict = V_INFO;
 	if (res.crashed) {
 		snprintf(r->note, sizeof(r->note),
-			"被信号杀死(sig=%d)——和已知 OfficeCLI 根因一致，仍受限",
+			"Terminated by signal (sig=%d), consistent with the known OfficeCLI failure; still restricted",
 			res.term_sig);
 	} else if (res.rc == 0) {
-		snprintf(r->note, sizeof(r->note), "调用成功——这条限制已放开");
+		snprintf(r->note, sizeof(r->note), "Call succeeded; this restriction is lifted");
 	} else {
-		snprintf(r->note, sizeof(r->note), "调用失败 errno=%d(%s)", res.err,
+		snprintf(r->note, sizeof(r->note), "Call failed: errno=%d(%s)", res.err,
 			strerror(res.err));
 	}
 }
 
-/* -- dlopen 是否已能解析主二进制 .dynsym（见 checkdep.c） -------------- */
+/* -- Whether dlopen can resolve the main executable's .dynsym (see checkdep.c) -- */
 
 static int resolve_sibling_lib(const char *filename, char *out, size_t outsz)
 {
@@ -1699,25 +1450,25 @@ static int resolve_sibling_lib(const char *filename, char *out, size_t outsz)
 static void probe_dlopen_dynsym(void)
 {
 	report_row_t *r = add_row("dlopen_dynsym", "B",
-		"musl dlopen 是否已能解析主二进制 .dynsym（决定 zsh 等还要不要 "
-		"--disable-dynamic 静态内建）");
+		"Whether musl dlopen can resolve the main executable's .dynsym (determines "
+		"whether zsh and similar tools need --disable-dynamic)");
 	r->verdict = V_INFO;
 
 	char path[PATH_MAX];
 	if (!resolve_sibling_lib("libohos_compat_checkdep.so", path, sizeof(path))) {
 		snprintf(r->note, sizeof(r->note),
-			"未找到 libohos_compat_checkdep.so，跳过（需要配套探测库同装）");
+			"libohos_compat_checkdep.so not found; skipped (install the companion probe library)");
 		return;
 	}
 	void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 	if (!h) {
-		snprintf(r->note, sizeof(r->note), "dlopen(%s) 失败：%s", path, dlerror());
+		snprintf(r->note, sizeof(r->note), "dlopen(%s) failed: %s", path, dlerror());
 		return;
 	}
 	typedef int (*probe_fn)(void);
 	probe_fn fn = (probe_fn)dlsym(h, "ohos_checkdep_probe");
 	if (!fn) {
-		snprintf(r->note, sizeof(r->note), "checkdep.so 里找不到探测符号，跳过");
+		snprintf(r->note, sizeof(r->note), "Probe symbol not found in checkdep.so; skipped");
 		dlclose(h);
 		return;
 	}
@@ -1725,37 +1476,28 @@ static void probe_dlopen_dynsym(void)
 	dlclose(h);
 	if (resolved)
 		snprintf(r->note, sizeof(r->note),
-			"已能解析——限制已放开，静态内建变通理论上可以退回动态版");
+			"Resolution works; the restriction is lifted, so static workarounds may be replaced with dynamic linking");
 	else
 		snprintf(r->note, sizeof(r->note),
-			"仍不能解析——dlopen 依赖此符号解析的软件仍需静态内建（如 brew "
-			"zsh --disable-dynamic）");
+			"Resolution still fails; software depending on this lookup needs static linking "
+			"(for example, brew zsh --disable-dynamic)");
 }
 
 static void run_b_group_probes(void)
 {
-	/* Retired A-group interceptors: the shim no longer carries code for
-	 * these symptoms (deleted once they stopped reproducing), so they no
-	 * longer feed the DISABLE recommendation, but stay probed here so a
-	 * regression on some other OHOS version is still visible. */
-	probe_getcwd();
-	probe_symlinkat();
-	probe_getaddrinfo_addrconfig();
-	probe_epoll_pipe_epollin();
-
-	probe_b_generic("openat2", "openat2(RESOLVE_BENEATH)——bun rustix 走裸 syscall，"
-		"LD_PRELOAD 打不到，只能等平台放开或改源码", child_openat2);
-	probe_b_generic("epoll_pwait2", "bun 事件循环纳秒级超时——同上，裸 syscall",
+	probe_b_generic("openat2", "openat2(RESOLVE_BENEATH); Bun rustix uses a raw syscall, "
+		"which LD_PRELOAD cannot intercept; requires a platform fix or source changes", child_openat2);
+	probe_b_generic("epoll_pwait2", "Nanosecond timeout in Bun's event loop; raw syscall",
 		child_epoll_pwait2);
-	probe_b_generic("clone3", "glibc/部分工具链创建进程的首选接口", child_clone3);
-	probe_b_generic("statx", "扩展 stat", child_statx);
-	probe_b_generic("renameat2", "原子重命名/RENAME_NOREPLACE", child_renameat2);
-	probe_b_generic("copy_file_range", "内核态零拷贝文件复制", child_copy_file_range);
-	probe_b_generic("sendfile", "内核态零拷贝 fd→fd", child_sendfile);
+	probe_b_generic("clone3", "Preferred process creation interface in glibc and some toolchains", child_clone3);
+	probe_b_generic("statx", "Extended stat information", child_statx);
+	probe_b_generic("renameat2", "Atomic rename / RENAME_NOREPLACE", child_renameat2);
+	probe_b_generic("copy_file_range", "In-kernel file copy", child_copy_file_range);
+	probe_b_generic("sendfile", "In-kernel fd-to-fd transfer", child_sendfile);
 	probe_ptrace();
 	probe_prctl_ptracer();
-	probe_b_generic("memfd_create", "匿名内存文件", child_memfd_create);
-	probe_b_generic("pidfd_open", "进程句柄 fd 化", child_pidfd_open);
+	probe_b_generic("memfd_create", "Anonymous memory-backed file", child_memfd_create);
+	probe_b_generic("pidfd_open", "Open a process handle as a file descriptor", child_pidfd_open);
 	probe_dlopen_dynsym();
 }
 
@@ -1787,20 +1529,20 @@ static void capture_header_facts(const char *orig_ld_preload)
  * --json mode is a single parseable document with no stray text prefix. */
 static void print_header(int is_pass2)
 {
-	printf("=== ohos-compat-shim 平台能力自检%s ===\n",
-		is_pass2 ? "（第二遍：带 shim）" : "");
+	printf("=== ohos-compat-shim platform compatibility check%s ===\n",
+		is_pass2 ? " (second pass: with shim)" : "");
 	printf("uname: %s %s %s\n", g_uname.sysname, g_uname.release, g_uname.machine);
 	if (g_api_level >= 0)
 		printf("OHOS API level: %d (target_sdk=%d)\n", g_api_level, g_target_sdk);
 	printf("uid=%d gid=%d euid=%d\n", (int)getuid(), (int)getgid(), (int)geteuid());
-	printf("原 LD_PRELOAD: %s\n", *g_orig_ld_preload ? g_orig_ld_preload : "(未设置)");
+	printf("Original LD_PRELOAD: %s\n", *g_orig_ld_preload ? g_orig_ld_preload : "(unset)");
 	printf("\n");
 }
 
 static void print_table(int is_pass2)
 {
-	printf("%-16s %-4s %-8s %s\n", "拦截点/能力", "组", "结论", "说明");
-	printf("%-16s %-4s %-8s %s\n", "----------------", "----", "--------",
+	printf("%-16s %-4s %-14s %s\n", "Probe/capability", "Group", "Verdict", "Details");
+	printf("%-16s %-4s %-14s %s\n", "----------------", "----", "--------------",
 		"----------------------------------------------------------");
 	for (int i = 0; i < g_nrows; i++) {
 		report_row_t *r = &g_rows[i];
@@ -1810,7 +1552,7 @@ static void print_table(int is_pass2)
 	if (is_pass2)
 		return;
 
-	printf("\n建议：export OHOS_COMPAT_SHIM_DISABLE=");
+	printf("\nRecommendation: export OHOS_COMPAT_SHIM_DISABLE=");
 	int first = 1;
 	for (int i = 0; i < g_nrows; i++) {
 		report_row_t *r = &g_rows[i];
@@ -1820,10 +1562,11 @@ static void print_table(int is_pass2)
 		}
 	}
 	if (first)
-		printf("（无——当前没有可安全关闭的拦截点）");
+		printf("(none; no interceptor is currently safe to disable)");
 	printf("\n");
-	printf("注：仍需要/不确定的拦截点不建议关闭；B 组是信息性的周边平台能力，"
-		"不产出关闭建议；完整 90+ 项平台能力矩阵见 ohos-preflight。\n");
+	printf("Note: do not disable NEEDED or INCONCLUSIVE interceptors. Group B reports "
+		"related platform capabilities and does not generate disable recommendations. "
+		"See ohos-preflight for the full platform capability matrix.\n");
 }
 
 static void json_escaped(const char *s)
@@ -1888,18 +1631,17 @@ static void print_usage(void)
 	printf(
 		"usage: ohos-compat-check [--json] [--rounds N] [--with-shim] [--help]\n"
 		"\n"
-		"对当前设备逐项探测 ohos-compat-shim 的每个拦截点在真实内核/沙箱上是否\n"
-		"还会复现所修的症状，帮助判断哪些可以通过 OHOS_COMPAT_SHIM_DISABLE 关闭。\n"
-		"同时汇报若干与本工作区已知 workaround 挂钩的周边平台限制（仅供参考，\n"
-		"不产出 DISABLE 建议）。\n"
+		"Probe each ohos-compat-shim interceptor against the current device's kernel and sandbox\n"
+		"to determine whether the symptom still occurs and which interceptors may be disabled\n"
+		"with OHOS_COMPAT_SHIM_DISABLE. Also report related platform restrictions for reference;\n"
+		"these do not produce disable recommendations.\n"
 		"\n"
-		"  --json         机器可读输出\n"
-		"  --rounds N     splice/epoll_pipe 等间歇性缺陷的重复探测轮数（默认 20）\n"
-		"  --with-shim    追加第二遍：预加载 libohos_compat.so 后重跑一遍，验证 shim 修好了\n"
+		"  --json         Emit machine-readable JSON\n"
+		"  --rounds N     Number of repeated splice pipe-wakeup probes (default: 20)\n"
+		"  --with-shim    Run a second pass with libohos_compat.so preloaded\n"
 		"\n"
-		"通常通过 `ohos-shim check` 调用（自动 env -u LD_PRELOAD）；也可以直接把\n"
-		"这份源码 scp 去别的机器用 ohos-sdk clang 单独编译，见项目 Makefile 的\n"
-		"`check` target 与同目录 checkdep.c。\n");
+		"Normally invoked with `ohos-shim check`, which clears LD_PRELOAD for the baseline.\n"
+		"For standalone builds, see the Makefile's `check` target and the companion checkdep.c.\n");
 }
 
 int main(int argc, char **argv)
@@ -1920,7 +1662,7 @@ int main(int argc, char **argv)
 			print_usage();
 			return 0;
 		} else {
-			fprintf(stderr, "ohos-compat-check: 未知参数 %s（--help 看用法）\n",
+			fprintf(stderr, "ohos-compat-check: unknown option %s (use --help for usage)\n",
 				argv[i]);
 			return 64;
 		}
@@ -1960,19 +1702,19 @@ int main(int argc, char **argv)
 			 * not one combined document) so a consumer can still parse
 			 * each with a per-line/per-object JSON reader. */
 			if (!json)
-				printf("\n=== 二次运行：带 shim（%s）===\n\n", shim_path);
+				printf("\n=== Second pass with shim (%s) ===\n\n", shim_path);
 			else
 				printf("\n");
 			fflush(stdout);
 			setenv("LD_PRELOAD", shim_path, 1);
 			setenv("_OHOS_COMPAT_CHECK_PASS2", "1", 1);
 			execv("/proc/self/exe", argv);
-			fprintf(stderr, "ohos-compat-check: 无法重新执行自身验证 --with-shim: %s\n",
+			fprintf(stderr, "ohos-compat-check: failed to re-exec for --with-shim: %s\n",
 				strerror(errno));
 			return 1;
 		}
 		if (!json)
-			printf("\n(--with-shim: 未找到 libohos_compat.so，跳过二次验证)\n");
+			printf("\n(--with-shim: libohos_compat.so not found; skipping second pass)\n");
 	}
 
 	return 0;
