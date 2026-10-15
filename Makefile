@@ -20,6 +20,10 @@ CFLAGS ?= -O2 -g -Wall -Wextra
 LDFLAGS ?= -ldl
 
 LIB := libohos_compat.so
+# glibc variant: same source, built against Harmonybrew's glibc for processes
+# whose interpreter is ld-linux-aarch64.so.1 (a musl preload cannot load there).
+GLIBC_PREFIX ?= $(HOME)/.harmonybrew/opt/glibc
+GLIBC_LIB := libohos_compat_glibc.so
 CHECKDEP := libohos_compat_checkdep.so
 SMOKE := test/smoke
 FUNCTIONAL := test/functional
@@ -30,7 +34,7 @@ CHECK := ohos-compat-check
 ARTIFACTS := $(LIB) $(SMOKE) $(FUNCTIONAL) $(BENCH) $(RVF) $(CHECK) $(CHECKDEP) $(GHOST)
 
 .DEFAULT_GOAL := $(LIB)
-.PHONY: all sign smoke functional bench real-vs-fallback check ghost clean
+.PHONY: glibc all sign smoke functional bench real-vs-fallback check ghost clean
 
 # `make` builds the runtime library; `make all` also builds every test and
 # diagnostic executable. Compilation never signs or runs the outputs.
@@ -122,4 +126,26 @@ ghost: $(GHOST)
 	@env -u LD_PRELOAD ./$(GHOST)
 
 clean:
-	rm -f $(ARTIFACTS)
+	rm -f $(ARTIFACTS) $(GLIBC_LIB)
+	rm -rf build
+
+# Kernel UAPI headers (linux/, asm/, asm-generic/) are not part of glibc's
+# include tree; borrow them from the OHOS NDK sysroot.
+build/kh/linux:
+	@mkdir -p build/kh
+	@for d in linux asm asm-generic; do \
+		p=$(OHOS_SYSROOT)/usr/include/$$d; \
+		[ -e $$p ] || p=$(OHOS_SYSROOT)/usr/include/aarch64-linux-ohos/$$d; \
+		ln -sfn $$p build/kh/$$d; \
+	done
+
+GLIBC_CC = $(OHOS_CC) --target=aarch64-linux-gnu --sysroot=$(GLIBC_PREFIX) -nostdinc \
+	-isystem $(shell $(OHOS_CC) --print-resource-dir)/include \
+	-isystem $(GLIBC_PREFIX)/include -isystem $(CURDIR)/build/kh
+
+$(GLIBC_LIB): src/ohos_compat_shim.c build/kh/linux
+	$(GLIBC_CC) $(CFLAGS) -shared -fPIC -fuse-ld=lld -nostdlib $< -o $@
+
+# Build and self-sign the glibc preload.
+glibc: $(GLIBC_LIB)
+	$(call sign_files,$^)
