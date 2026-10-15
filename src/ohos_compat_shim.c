@@ -79,6 +79,15 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __GLIBC__
+/* Under _GNU_SOURCE the glibc 2.39 headers bind sscanf to __isoc23_sscanf,
+ * which Harmonybrew's glibc runtime does not export; bind to the C99 entry
+ * point it does. */
+extern int ohos_shim_sscanf(const char *, const char *, ...)
+	__asm__("__isoc99_sscanf");
+#define sscanf ohos_shim_sscanf
+#endif
+
 #if !defined(__aarch64__)
 #error "ohos_compat_shim.c: only supports aarch64 (HarmonyOS/OHOS target)"
 #endif
@@ -149,7 +158,17 @@ static void parse_toggle_masks(void)
 	if (g_disable_mask >= 0)
 		return;
 
+#ifdef __GLIBC__
+	/* The glibc build only carries the fixes validated against a glibc
+	 * process (epoll ONESHOT enforcement, splice, close_range/fchmodat2
+	 * via syscall). The musl-specific ones (COPY-reloc stdio backfill,
+	 * freeaddrinfo layout, tmpfile/link/getpwuid_r behavior) are
+	 * compiled in but default to passthrough. */
+	int d = SD_STD_STREAMS | SD_GETADDRINFO | SD_TMPFILE | SD_LINKAT |
+		SD_LINK | SD_GETPWUID_R;
+#else
 	int d = 0;
+#endif
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "close_range"))
 		d |= SD_CLOSE_RANGE;
 	if (env_list_has("OHOS_COMPAT_SHIM_DISABLE", "getpwuid_r"))
@@ -684,8 +703,17 @@ static int cr_dispatch(unsigned int first, unsigned int last, unsigned int flags
 	return cr_do_fallback(first, last, flags);
 }
 
-int close_range(unsigned int first, unsigned int last, unsigned int flags)
+/* glibc >= 2.34 declares `int flags` here, musl `unsigned int flags`; the
+ * definition must match whichever header the build sees. */
+#ifdef __GLIBC__
+typedef int cr_flags_t;
+#else
+typedef unsigned int cr_flags_t;
+#endif
+
+int close_range(unsigned int first, unsigned int last, cr_flags_t flags_arg)
 {
+	unsigned int flags = (unsigned int)flags_arg;
 	/* Disabled means "don't intercept" — defer entirely to the real
 	 * syscall, same as if this shim weren't loaded at all, including
 	 * skipping our own EINVAL validation above. No probe, no fallback
@@ -1804,7 +1832,17 @@ static void cr_atfork_child(void)
 __attribute__((constructor))
 static void cr_atfork_register(void)
 {
+#ifdef __GLIBC__
+	/* glibc >= 2.34 ships pthread_atfork only in libc_nonshared.a, so a
+	 * -nostdlib shared object cannot resolve it; use the exported
+	 * __register_atfork it wraps. */
+	extern int __register_atfork(void (*)(void), void (*)(void),
+				     void (*)(void), void *);
+	extern void *__dso_handle;
+	__register_atfork(NULL, NULL, cr_atfork_child, __dso_handle);
+#else
 	pthread_atfork(NULL, NULL, cr_atfork_child);
+#endif
 }
 
 static int ep_pipe_active(void)
