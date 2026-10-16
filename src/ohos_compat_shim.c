@@ -1674,10 +1674,12 @@ static long long ep_now_ms(void)
  * for a storm that never ends measured ~5.5% steady-state CPU on an
  * interactive claude-code (musl) TUI session; growing the pace while it
  * stays uninterrupted (reset on the next real ADD/MOD arm) brought that
- * down further without adding perceptible input latency (32ms is well
- * under normal human-perceived keystroke-to-echo budgets). */
-#define EP_GHOST_SLEEP_MAX_NS 32000000LL
-#define EP_GHOST_STREAK_CAP 4 /* 2ms << 4 == 32ms == the cap above */
+ * down further. The CPU saving comes from not waking ~65k times/s, not
+ * from a long sleep, so the cap is kept low: every sleep is added to the
+ * keystroke-to-echo latency while a storm is active (a 32ms cap added
+ * ~20ms on a glibc claude-code TUI, 8ms keeps idle CPU just as low). */
+#define EP_GHOST_SLEEP_MAX_NS 8000000LL
+#define EP_GHOST_STREAK_CAP 2 /* 2ms << 2 == 8ms == the cap above */
 
 typedef struct {
 	int used;
