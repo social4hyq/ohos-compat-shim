@@ -69,3 +69,14 @@
 `make functional`：基线 7/28 FAIL（均为平台缺陷的复现，预期），加载 shim 后 31/31 全绿。`test/functional` 此前是 09-28 的过期二进制，曾含已删除的 `getcwd_*`/`symlinkat_*` 用例并在加载 shim 时报 1 项失败；源码本身已无这些用例，重新构建即消除。
 
 结论：本机没有可以再关闭的拦截点。后续可评估的是 `link`/`linkat` 复制回退的真实调用方。
+
+### 补测：ghost 休眠上限 8ms（PR #16，commit a97e620）
+
+PR #16 把 `EP_GHOST_SLEEP_MAX_NS` 从 32ms 降到 8ms 后，用本仓库重新构建的 `libohos_compat.so`（非已安装的旧版）重测同一场景：claude-code 2.1.306 空闲 TUI，pty，12s 预热后统计 20s 的 utime+stime，各测两次。
+
+| 配置 | 第 1 次 | 第 2 次 |
+|---|---|---|
+| 开 shim（上限 8ms） | 1.8% | 1.7% |
+| 仅关 `epoll_pipe` | 100.6% | 100.1% |
+
+对照上文 32ms 的数据（开 shim 2.4%/1.6%，关 `epoll_pipe` 100.2%/100.2%）：空闲 CPU 无可见差别，均在测量噪声内；`epoll_pipe` 依然必须保留。本次只覆盖空闲场景，未测交互输入延迟。
