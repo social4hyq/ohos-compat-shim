@@ -1,0 +1,12 @@
+round=1 mode=only-stdio
+timeout: the monitored command dumped core
+bash: line 1:  7338 Bad system call            (core dumped) env LD_PRELOAD="$HOME/.harmonybrew/opt/ohos-compat-shim/lib/libohos_compat.so" OHOS_COMPAT_SHIM_DISABLE=close_range,getpwuid_r,tmpfile,fchmodat2,linkat,link,splice,epoll_pipe,getaddrinfo timeout 15 "$HOME/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" --version
+exit=159
+round=2 mode=only-stdio
+timeout: the monitored command dumped core
+bash: line 1:  7353 Bad system call            (core dumped) env LD_PRELOAD="$HOME/.harmonybrew/opt/ohos-compat-shim/lib/libohos_compat.so" OHOS_COMPAT_SHIM_DISABLE=close_range,getpwuid_r,tmpfile,fchmodat2,linkat,link,splice,epoll_pipe,getaddrinfo timeout 15 "$HOME/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" --version
+exit=159
+round=3 mode=only-stdio
+timeout: the monitored command dumped core
+bash: line 1:  7368 Bad system call            (core dumped) env LD_PRELOAD="$HOME/.harmonybrew/opt/ohos-compat-shim/lib/libohos_compat.so" OHOS_COMPAT_SHIM_DISABLE=close_range,getpwuid_r,tmpfile,fchmodat2,linkat,link,splice,epoll_pipe,getaddrinfo timeout 15 "$HOME/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" --version
+exit=159

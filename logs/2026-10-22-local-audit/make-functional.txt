@@ -1,0 +1,75 @@
+/storage/Users/currentUser/.harmonybrew/Cellar/ohos-sdk/26.0.0.18_3/native/llvm/bin/clang --target=aarch64-linux-ohos --sysroot=/storage/Users/currentUser/.harmonybrew/Cellar/ohos-sdk/26.0.0.18_3/native/sysroot -O2 -g -Wall -Wextra -shared -fPIC src/ohos_compat_shim.c -o libohos_compat.so -ldl
+/storage/Users/currentUser/.harmonybrew/Cellar/ohos-sdk/26.0.0.18_3/native/llvm/bin/clang --target=aarch64-linux-ohos --sysroot=/storage/Users/currentUser/.harmonybrew/Cellar/ohos-sdk/26.0.0.18_3/native/sysroot -O2 -g -Wall -Wextra -pthread test/functional.c -o test/functional -ldl
+sign libohos_compat.so
+10-22 09:06:40.587 INFO  - add codesign section success
+10-22 09:06:40.593 INFO  - write code sign data success
+sign test/functional
+10-22 09:06:40.668 INFO  - add codesign section success
+10-22 09:06:40.675 INFO  - write code sign data success
+=== baseline (no shim) ===
+INFO  close_range_multi            would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_cloexec          would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_bun_init         would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_bun_spawn        would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_einval_range     would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_einval_flags     would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_wide_sparse      would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_unshare          CLOSE_RANGE_UNSHARE raised SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+SKIP  sigsys_guard_stress          close_range() symbol not present (expected without preload)
+SKIP  fork_safety_no_deadlock      close_range() symbol not present (expected without preload)
+INFO  close_range_repeated         would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+SKIP  close_range_libc_fn          close_range() symbol not present (expected without preload)
+FAIL  getpwuid_r_erange            1-byte buffer correctly rejected (errno=0 No error information)
+PASS  getpwuid_r_idempotent        two calls return consistent data
+FAIL  tmpfile_roundtrip            tmpfile() returned NULL (errno=13 Permission denied)
+FAIL  tmpfile_concurrent           3 simultaneous tmpfiles stay isolated (errno=13 Permission denied)
+FAIL  tmpfile_repeated             50 sequential tmpfile()+fclose() cycles, no failure (errno=13 Permission denied)
+PASS  linkat_eexist                dst already exists -> EEXIST untouched
+INFO  linkat_eacces_fallback       linkat failed rc=-1 errno=13 (Permission denied) — confirms the TMPDIR EACCES quirk reproduces at baseline (no shim to fall back)
+INFO  link_eacces_fallback         link failed rc=-1 errno=13 (Permission denied) — confirms the TMPDIR EACCES quirk reproduces at baseline via the link() symbol
+INFO  linkat_bun_tmpfile           baseline linkat rc=-1 errno=13 (Permission denied) — no shim to fall back
+INFO  linkat_bun_dirfd             baseline linkat(dirfd,dirfd) rc=-1 errno=13 (Permission denied) — no shim to fall back
+INFO  fchmodat2_applies_mode       would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  fchmodat2_bun_lchmod         would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  fchmodat2_symlink_not_followed would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+PASS  passthrough_getpid           getpid() == syscall(SYS_getpid)
+PASS  passthrough_read_write       pipe write/read unaffected
+FAIL  splice_eof_is_zero           moved=3 drained=3 eof_call=-1 errno=Broken pipe (want 3/3/0) (errno=32 Broken pipe)
+PASS  splice_real_epipe_preserved  rc=-1 Broken pipe (want -1/EPIPE, never 0)
+FAIL  splice_wakes_poll_waiter     moved=3 poll=0 (timed out, never woken) drained=-1 (want 3/>0/3) (errno=32 Broken pipe)
+FAIL  epoll_oneshot_tty            first=1 refire=1 (want first=1, refire=0 -- exactly one delivery per arm) (errno=32 Broken pipe)
+SOME FAILED (7/28 checks failed)
+
+=== with LD_PRELOAD=libohos_compat.so ===
+PASS  close_range_multi            middle range closed, edges untouched
+PASS  close_range_cloexec          fd stays open, gains FD_CLOEXEC (not closed)
+PASS  close_range_bun_init         CLOEXEC on fds>=4 (kept open), below untouched
+PASS  close_range_bun_spawn        CLOEXEC on fds>=3 (kept open), below untouched
+PASS  close_range_einval_range     first>last -> EINVAL, fd untouched
+PASS  close_range_einval_flags     garbage flags -> EINVAL (not a SIGSYS crash), fd untouched
+PASS  close_range_wide_sparse      sparse range (fd..fd+90) closes both ends cleanly
+PASS  close_range_unshare          worker rc=-1 errno=38, main-thread fd still open
+PASS  sigsys_guard_stress          8 threads x 100 concurrent CLOSE_RANGE_UNSHARE calls, process survives
+PASS  fork_safety_no_deadlock      30 forks while another thread churns epoll_ctl, no child hangs/deadlocks
+PASS  close_range_repeated         two calls in a row agree
+PASS  close_range_libc_fn          close_range() wrapper matches syscall() path
+PASS  getpwuid_r_erange            1-byte buffer correctly rejected
+PASS  getpwuid_r_idempotent        two calls return consistent data
+PASS  tmpfile_roundtrip            write then read-back matches exactly
+PASS  tmpfile_concurrent           3 simultaneous tmpfiles stay isolated
+PASS  tmpfile_repeated             50 sequential tmpfile()+fclose() cycles, no failure
+PASS  linkat_eexist                dst already exists -> EEXIST untouched
+PASS  linkat_eacces_fallback       linkat succeeded (real or fallback), content matches
+PASS  link_eacces_fallback         link succeeded (real or fallback), content matches
+PASS  linkat_bun_tmpfile           linkat(/proc/self/fd) succeeded (real or copy), dst content matches
+PASS  linkat_bun_dirfd             linkat(dirfd,dirfd) succeeded, dst content matches
+PASS  fchmodat2_applies_mode       ret=0 errno=0, mode after call=600
+PASS  fchmodat2_bun_lchmod         ret=0 mode=640 (want 0640)
+PASS  fchmodat2_symlink_not_followed ret=-1 errno=95, target mode=600 (want 0600 untouched)
+PASS  passthrough_getpid           getpid() == syscall(SYS_getpid)
+PASS  passthrough_read_write       pipe write/read unaffected
+PASS  splice_eof_is_zero           moved=3 drained=3 eof_call=0 (want 3/3/0)
+PASS  splice_real_epipe_preserved  rc=-1 Broken pipe (want -1/EPIPE, never 0)
+PASS  splice_wakes_poll_waiter     moved=3 poll=1 drained=3 (want 3/>0/3)
+PASS  epoll_oneshot_tty            first=1 refire=0 (want first=1, refire=0 -- exactly one delivery per arm)
+ALL PASS (0/31 checks failed)

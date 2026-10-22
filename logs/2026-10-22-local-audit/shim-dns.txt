@@ -1,0 +1,6 @@
+0 bad host! gaierror(-2, 'Name does not resolve') 4 ms
+0 example.com OK 4 3 ms
+1 bad host! gaierror(-2, 'Name does not resolve') 0 ms
+1 example.com OK 4 0 ms
+2 bad host! gaierror(-2, 'Name does not resolve') 0 ms
+2 example.com OK 4 0 ms

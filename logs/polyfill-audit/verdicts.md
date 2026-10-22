@@ -25,6 +25,8 @@
 | `close_range`/`fchmodat2`/`getpwuid_r`/`tmpfile`/`linkat`/`link` | 仍需要 | 容器全部可关闭（预期） | — | 保留，无变化 |
 | `std_streams` | 见下方专项 A/B | 未测（探针二进制无触发条件） | 官方 claude-code 2.1.283 musl 二进制手工 A/B | **保留**，说明的确定性已按实测修正（见下） |
 
+> **⚠️ 2026-10-22 更正**：下表与下方结论是 2.1.283 的结果，对当前的 claude-code 2.1.306（Bun 1.4.4）已不成立。新二进制上 `std_streams` 拦截点就是修复本身，见文末「2026-10-22 本机复测」。
+
 ## `std_streams` 专项 A/B（官方 claude-code 2.1.283 musl 二进制，`--version`）
 
 | 场景 | 结果 |
@@ -51,3 +53,19 @@
 - `smoke`/`epoll_ghost`：全绿。
 - `ohos-compat-check --with-shim`：与真机结论完全吻合，并验证了 `getaddrinfo` 原生优先重构两个方向都工作正常——baseline 轮该容器解析器仍慢（5011ms，判"仍需要"，与之前容器数据一致）；**加 shim 那一遍，shim 自己后台探测线程判定本容器解析器慢，本地拦截照常生效（1ms 本地拒绝，判"可关闭"——这里"可关闭"是 shim 自身保护正常工作的意思，不代表这台设备该设 `OHOS_COMPAT_SHIM_DISABLE=getaddrinfo`）**。同一份代码，真机侧探测到原生已修好就纯透传，容器侧探测到没修好就继续保护，不需要手工按设备区分。
 - `bench`/`real_vs_fallback`：跑通，数字仅供参考——容器里 `getpwuid_r` fallback 比真机慢得多（容器没有 `libos_account_ndk.so`，`OH_OsAccount_GetName` 的 dlopen 每次调用都重新尝试且失败），这是探测逻辑本身"失败不缓存 handle"的既有特征，早于本轮改动存在，不在本次整改范围内。
+
+## 2026-10-22 本机复测（HongMeng 1.13.0，commit d6c3237，claude-code 2.1.306）
+
+方法：`ohos-shim check --rounds 50`；`std_streams` 直接对 `var/claude-code.latest/2.1.306_3/claude` 做 A/B（注意 `bin/claude` 是 wrapper，本身已预加载 shim，不能当「裸跑」）；`epoll_pipe` 用 pty 起 claude 空闲 TUI，12s 预热后统计 20s 的 utime+stime；`make clean && make functional` 重建后跑全套。
+
+| 拦截点 | 结果 | 结论 |
+|---|---|---|
+| `close_range`/`fchmodat2`/`getpwuid_r`/`tmpfile`/`linkat`/`link` | 全部 NEEDED | 保留 |
+| `splice`（EOF、写管道唤醒） | EOF 复现；唤醒 50/50 轮复现 | 保留 |
+| `getaddrinfo` | NEEDED（非法主机名约 2–3s 才返回，rc=-3）；09-28 本机曾判可关闭，现已反转 | 保留（探测优先原生的实现会自动适应） |
+| `epoll_pipe` | 空闲 TUI CPU：开 shim 约 2%（2.4%/1.6%），仅关 `epoll_pipe` 约 100%（100.2%/100.2%，各两次） | 保留，且是收益最大的一项 |
+| `std_streams` | 裸跑崩溃；完整 shim 正常；`DISABLE=std_streams` 崩溃；全部拦截点关闭崩溃；只加载 `libohos_compat_checkdep.so` 崩溃（各 3 次） | **保留，且更正旧结论**：2.1.306 上显式 COPY 重定位补丁就是修复本身，不再是「机制未定位」 |
+
+`make functional`：基线 7/28 FAIL（均为平台缺陷的复现，预期），加载 shim 后 31/31 全绿。`test/functional` 此前是 09-28 的过期二进制，曾含已删除的 `getcwd_*`/`symlinkat_*` 用例并在加载 shim 时报 1 项失败；源码本身已无这些用例，重新构建即消除。
+
+结论：本机没有可以再关闭的拦截点。后续可评估的是 `link`/`linkat` 复制回退的真实调用方。

@@ -1,0 +1,4 @@
+INFO  close_range   would SIGSYS without the shim (expected at baseline on this device)
+FAIL  getpwuid_r   rc=0 result=NULL (errno=0 No error information)
+FAIL  tmpfile      tmpfile() returned NULL (errno=13 Permission denied)
+SOME FAILED (2 failures)

@@ -1,0 +1,47 @@
+INFO  close_range_multi            would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_cloexec          would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_bun_init         would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_bun_spawn        would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_einval_range     would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_einval_flags     would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_wide_sparse      would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  close_range_unshare          CLOSE_RANGE_UNSHARE raised SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+SKIP  sigsys_guard_stress          close_range() symbol not present (expected without preload)
+SKIP  fork_safety_no_deadlock      close_range() symbol not present (expected without preload)
+INFO  close_range_repeated         would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+SKIP  close_range_libc_fn          close_range() symbol not present (expected without preload)
+FAIL  getpwuid_r_erange            1-byte buffer correctly rejected (errno=0 No error information)
+PASS  getpwuid_r_idempotent        two calls return consistent data
+FAIL  tmpfile_roundtrip            tmpfile() returned NULL (errno=13 Permission denied)
+FAIL  tmpfile_concurrent           3 simultaneous tmpfiles stay isolated (errno=13 Permission denied)
+FAIL  tmpfile_repeated             50 sequential tmpfile()+fclose() cycles, no failure (errno=13 Permission denied)
+PASS  getcwd_success_noop          /storage/Users/currentUser/HarmonyPC/Software/ohos-compat-shim
+PASS  getcwd_einval_size0          size=0 -> EINVAL
+PASS  getcwd_erange_size1          size=1 -> ERANGE
+PASS  getcwd_null_autoalloc        /storage/Users/currentUser/HarmonyPC/Software/ohos-compat-shim
+PASS  getcwd_deep_nested           getcwd == /proc/self/cwd == built path in 6-level tree
+PASS  getcwd_unlinked              baseline NULL errno=2 — no fallback
+PASS  linkat_eexist                dst already exists -> EEXIST untouched
+INFO  linkat_eacces_fallback       linkat failed rc=-1 errno=13 (Permission denied) — confirms the TMPDIR EACCES quirk reproduces at baseline (no shim to fall back)
+INFO  link_eacces_fallback         link failed rc=-1 errno=13 (Permission denied) — confirms the TMPDIR EACCES quirk reproduces at baseline via the link() symbol
+INFO  linkat_bun_tmpfile           baseline linkat rc=-1 errno=13 (Permission denied) — no shim to fall back
+INFO  linkat_bun_dirfd             baseline linkat(dirfd,dirfd) rc=-1 errno=13 (Permission denied) — no shim to fall back
+PASS  symlinkat_success_noop       symlinkat succeeded, lstat confirms a symlink
+PASS  symlinkat_rel_resolution     openat(dirfd, relative) resolves; open() vs CWD misses (the old bug)
+PASS  symlinkat_dircomp            dirname(linkpath) resolution hits; newdirfd-direct (pre-fix) resolution misses
+PASS  symlink_two_arg              symlink(target,link) ok, lstat confirms symlink (no shim hook needed)
+INFO  fchmodat2_applies_mode       would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  fchmodat2_bun_lchmod         would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+INFO  fchmodat2_symlink_not_followed would SIGSYS without the shim's protection (caught here so the suite could continue) — expected at baseline
+PASS  passthrough_getpid           getpid() == syscall(SYS_getpid)
+PASS  passthrough_read_write       pipe write/read unaffected
+FAIL  splice_eof_is_zero           moved=3 drained=3 eof_call=-1 errno=Broken pipe (want 3/3/0) (errno=32 Broken pipe)
+PASS  splice_real_epipe_preserved  rc=-1 Broken pipe (want -1/EPIPE, never 0)
+FAIL  splice_wakes_poll_waiter     moved=3 poll=0 (timed out, never woken) drained=-1 (want 3/>0/3) (errno=32 Broken pipe)
+PASS  epoll_wait_timeout_honored   rc=0 elapsed=700ms (want rc=0, elapsed>=600)
+PASS  epoll_pwait_infinite_no_zero premature_zero=0 final_rc=1 (want 0/1)
+PASS  epoll_wait_backoff_deadline  rc=0 elapsed=2200ms (want rc=0, 2100<=elapsed<=2500)
+PASS  epoll_pipe_backoff_reset     round1_rc=1 round2_rc=1 round2_detect=0ms (want both rc=1, round2 detect <600ms -- comfortably above 250ms+jitter, below a still-grown >=500ms interval)
+PASS  poll_infinite_fifo_still_works premature_return=0 final_rc=1 revents=0x1 (want !premature, rc=1, POLLIN set)
+FAIL  epoll_oneshot_tty            first=1 refire=1 (want first=1, refire=0 -- exactly one delivery per arm) (errno=32 Broken pipe)
+SOME FAILED (7/43 checks failed)

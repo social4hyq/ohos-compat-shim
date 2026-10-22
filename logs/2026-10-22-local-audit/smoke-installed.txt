@@ -1,0 +1,4 @@
+PASS  close_range  fd closed via syscall(SYS_close_range)
+PASS  getpwuid_r   pw_name=hyq pw_dir=/storage/Users/currentUser
+PASS  tmpfile      wrote+closed
+ALL PASS (0 failures)

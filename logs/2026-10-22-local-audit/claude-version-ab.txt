@@ -1,0 +1,198 @@
+round=1 mode=baseline
+============================================================
+[0m[2mBun v1.4.4 (575938147) Linux arm64
+Linux Kernel v0.0.0 | musl
+CPU: neon fp aes crc32 atomics sve
+Args: "/storage/Users/currentUser/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" "--version"
+
+Elapsed: 158ms | User: 19ms | Sys: 6ms
+RSS: 11.1 MB | Peak: 11.1 MB | Commit: 19.60 MB | Faults: 307
+[0m
+[31mpanic[0m[2m: [0mabort() called
+oh no[0m[2m:[0m Bun has crashed. This indicates a bug in Bun, not your code.
+
+To send a redacted crash report to Bun's team,
+please file a GitHub issue using the link below:
+
+[36m https://bun.report/1.4.4/U_15759381AA+rkxD___mprphDu/6rjCu76tB_Aa
+[0m
+timeout: the monitored command dumped core
+bash: line 1:  6187 Aborted                    (core dumped) env -u LD_PRELOAD -u OHOS_COMPAT_SHIM_DISABLE timeout 15 "$target" --version
+exit=134
+round=1 mode=default
+2.1.306 (Claude Code)
+exit=0
+round=1 mode=no-stdio
+============================================================
+[0m[2mBun v1.4.4 (575938147) Linux arm64
+Linux Kernel v0.0.0 | musl
+CPU: neon fp aes crc32 atomics sve
+Args: "/storage/Users/currentUser/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" "--version"
+
+Elapsed: 168ms | User: 12ms | Sys: 18ms
+RSS: 11.11 MB | Peak: 11.11 MB | Commit: 19.60 MB | Faults: 318
+[0m
+[31mpanic[0m[2m: [0mabort() called
+oh no[0m[2m:[0m Bun has crashed. This indicates a bug in Bun, not your code.
+
+To send a redacted crash report to Bun's team,
+please file a GitHub issue using the link below:
+
+[36m https://bun.report/1.4.4/U_15759381AA+rkxD___mprphDu/6rjCu76tB_Aa
+[0m
+timeout: the monitored command dumped core
+bash: line 1:  6267 Aborted                    (core dumped) env OHOS_COMPAT_SHIM_DISABLE=std_streams LD_PRELOAD="$shim" timeout 15 "$target" --version
+exit=134
+round=1 mode=all-disabled
+============================================================
+[0m[2mBun v1.4.4 (575938147) Linux arm64
+Linux Kernel v0.0.0 | musl
+CPU: neon fp aes crc32 atomics sve
+Args: "/storage/Users/currentUser/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" "--version"
+
+Elapsed: 152ms | User: 5ms | Sys: 23ms
+RSS: 11.15 MB | Peak: 11.15 MB | Commit: 19.60 MB | Faults: 314
+[0m
+[31mpanic[0m[2m: [0mabort() called
+oh no[0m[2m:[0m Bun has crashed. This indicates a bug in Bun, not your code.
+
+To send a redacted crash report to Bun's team,
+please file a GitHub issue using the link below:
+
+[36m https://bun.report/1.4.4/U_15759381AA+rkxD___mprphDu/6rjCu76tB_Aa
+[0m
+timeout: the monitored command dumped core
+bash: line 1:  6293 Aborted                    (core dumped) env OHOS_COMPAT_SHIM_DISABLE=close_range,getpwuid_r,tmpfile,fchmodat2,linkat,link,splice,epoll_pipe,getaddrinfo,std_streams LD_PRELOAD="$shim" timeout 15 "$target" --version
+exit=134
+round=2 mode=baseline
+============================================================
+[0m[2mBun v1.4.4 (575938147) Linux arm64
+Linux Kernel v0.0.0 | musl
+CPU: neon fp aes crc32 atomics sve
+Args: "/storage/Users/currentUser/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" "--version"
+
+Elapsed: 156ms | User: 13ms | Sys: 14ms
+RSS: 11.1 MB | Peak: 11.1 MB | Commit: 19.60 MB | Faults: 305
+[0m
+[31mpanic[0m[2m: [0mabort() called
+oh no[0m[2m:[0m Bun has crashed. This indicates a bug in Bun, not your code.
+
+To send a redacted crash report to Bun's team,
+please file a GitHub issue using the link below:
+
+[36m https://bun.report/1.4.4/U_15759381AA+rkxD___mprphDu/6rjCu76tB_Aa
+[0m
+timeout: the monitored command dumped core
+bash: line 1:  6320 Aborted                    (core dumped) env -u LD_PRELOAD -u OHOS_COMPAT_SHIM_DISABLE timeout 15 "$target" --version
+exit=134
+round=2 mode=default
+2.1.306 (Claude Code)
+exit=0
+round=2 mode=no-stdio
+============================================================
+[0m[2mBun v1.4.4 (575938147) Linux arm64
+Linux Kernel v0.0.0 | musl
+CPU: neon fp aes crc32 atomics sve
+Args: "/storage/Users/currentUser/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" "--version"
+
+Elapsed: 150ms | User: 8ms | Sys: 20ms
+RSS: 11.1 MB | Peak: 11.1 MB | Commit: 19.60 MB | Faults: 313
+[0m
+[31mpanic[0m[2m: [0mabort() called
+oh no[0m[2m:[0m Bun has crashed. This indicates a bug in Bun, not your code.
+
+To send a redacted crash report to Bun's team,
+please file a GitHub issue using the link below:
+
+[36m https://bun.report/1.4.4/U_15759381AA+rkxD___mprphDu/6rjCu76tB_Aa
+[0m
+timeout: the monitored command dumped core
+bash: line 1:  6352 Aborted                    (core dumped) env OHOS_COMPAT_SHIM_DISABLE=std_streams LD_PRELOAD="$shim" timeout 15 "$target" --version
+exit=134
+round=2 mode=all-disabled
+============================================================
+[0m[2mBun v1.4.4 (575938147) Linux arm64
+Linux Kernel v0.0.0 | musl
+CPU: neon fp aes crc32 atomics sve
+Args: "/storage/Users/currentUser/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" "--version"
+
+Elapsed: 150ms | User: 1ms | Sys: 27ms
+RSS: 11.10 MB | Peak: 11.10 MB | Commit: 19.60 MB | Faults: 315
+[0m
+[31mpanic[0m[2m: [0mabort() called
+oh no[0m[2m:[0m Bun has crashed. This indicates a bug in Bun, not your code.
+
+To send a redacted crash report to Bun's team,
+please file a GitHub issue using the link below:
+
+[36m https://bun.report/1.4.4/U_15759381AA+rkxD___mprphDu/6rjCu76tB_Aa
+[0m
+timeout: the monitored command dumped core
+bash: line 1:  6380 Aborted                    (core dumped) env OHOS_COMPAT_SHIM_DISABLE=close_range,getpwuid_r,tmpfile,fchmodat2,linkat,link,splice,epoll_pipe,getaddrinfo,std_streams LD_PRELOAD="$shim" timeout 15 "$target" --version
+exit=134
+round=3 mode=baseline
+============================================================
+[0m[2mBun v1.4.4 (575938147) Linux arm64
+Linux Kernel v0.0.0 | musl
+CPU: neon fp aes crc32 atomics sve
+Args: "/storage/Users/currentUser/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" "--version"
+
+Elapsed: 148ms | User: 1ms | Sys: 27ms
+RSS: 11.0 MB | Peak: 11.0 MB | Commit: 19.60 MB | Faults: 305
+[0m
+[31mpanic[0m[2m: [0mabort() called
+oh no[0m[2m:[0m Bun has crashed. This indicates a bug in Bun, not your code.
+
+To send a redacted crash report to Bun's team,
+please file a GitHub issue using the link below:
+
+[36m https://bun.report/1.4.4/U_15759381AA+rkxD___mprphDu/6rjCu76tB_Aa
+[0m
+timeout: the monitored command dumped core
+bash: line 1:  6405 Aborted                    (core dumped) env -u LD_PRELOAD -u OHOS_COMPAT_SHIM_DISABLE timeout 15 "$target" --version
+exit=134
+round=3 mode=default
+2.1.306 (Claude Code)
+exit=0
+round=3 mode=no-stdio
+============================================================
+[0m[2mBun v1.4.4 (575938147) Linux arm64
+Linux Kernel v0.0.0 | musl
+CPU: neon fp aes crc32 atomics sve
+Args: "/storage/Users/currentUser/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" "--version"
+
+Elapsed: 151ms | User: 11ms | Sys: 17ms
+RSS: 11.1 MB | Peak: 11.1 MB | Commit: 19.60 MB | Faults: 314
+[0m
+[31mpanic[0m[2m: [0mabort() called
+oh no[0m[2m:[0m Bun has crashed. This indicates a bug in Bun, not your code.
+
+To send a redacted crash report to Bun's team,
+please file a GitHub issue using the link below:
+
+[36m https://bun.report/1.4.4/U_15759381AA+rkxD___mprphDu/6rjCu76tB_Aa
+[0m
+timeout: the monitored command dumped core
+bash: line 1:  6443 Aborted                    (core dumped) env OHOS_COMPAT_SHIM_DISABLE=std_streams LD_PRELOAD="$shim" timeout 15 "$target" --version
+exit=134
+round=3 mode=all-disabled
+============================================================
+[0m[2mBun v1.4.4 (575938147) Linux arm64
+Linux Kernel v0.0.0 | musl
+CPU: neon fp aes crc32 atomics sve
+Args: "/storage/Users/currentUser/.harmonybrew/var/claude-code.latest/2.1.306_3/claude" "--version"
+
+Elapsed: 148ms | User: 15ms | Sys: 13ms
+RSS: 11.14 MB | Peak: 11.14 MB | Commit: 19.60 MB | Faults: 317
+[0m
+[31mpanic[0m[2m: [0mabort() called
+oh no[0m[2m:[0m Bun has crashed. This indicates a bug in Bun, not your code.
+
+To send a redacted crash report to Bun's team,
+please file a GitHub issue using the link below:
+
+[36m https://bun.report/1.4.4/U_15759381AA+rkxD___mprphDu/6rjCu76tB_Aa
+[0m
+timeout: the monitored command dumped core
+bash: line 1:  6485 Aborted                    (core dumped) env OHOS_COMPAT_SHIM_DISABLE=close_range,getpwuid_r,tmpfile,fchmodat2,linkat,link,splice,epoll_pipe,getaddrinfo,std_streams LD_PRELOAD="$shim" timeout 15 "$target" --version
+exit=134
