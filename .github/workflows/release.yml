@@ -4,14 +4,20 @@ name: Release
 # GitHub-hosted x86 runner cross-compiles libohos_compat.so with the OHOS
 # NDK clang and self-signs it with ohos-selfsign's self-sign.py (the
 # device-only binary-sign-tool/ohos-signpost don't run on a stock cloud
-# runner). Only the smoke-test step needs a real HarmonyOS device, since
-# the cloud runner can't execute an OHOS binary itself — that step gates
-# both the GitHub Release and the npm publish.
+# runner). The cloud runner can't execute an OHOS binary, and this repo has no
+# self-hosted device runner, so the real-device check is the pre-release
+# `make smoke` / `make functional` run on a device. The smoke-test job below
+# is opt-in (manual dispatch) for when a device runner is registered.
 
 on:
   release:
     types: [created, edited]
   workflow_dispatch:
+    inputs:
+      device_smoke:
+        description: Run the smoke test on a self-hosted device runner
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -35,8 +41,8 @@ jobs:
       - name: Self-sign both artifacts
         run: |
           python3 scripts/ohos/self-sign.py libohos_compat.so
-          python3 scripts/ohos/self-sign.py smoke
-          chmod +x libohos_compat.so smoke
+          python3 scripts/ohos/self-sign.py test/smoke
+          chmod +x libohos_compat.so test/smoke
 
       - uses: actions/upload-artifact@v4
         with:
@@ -48,6 +54,7 @@ jobs:
   smoke-test:
     name: Real-device smoke test
     needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.device_smoke
     runs-on: self-hosted
     timeout-minutes: 10
     steps:
@@ -65,7 +72,7 @@ jobs:
           LD_PRELOAD="$(pwd)/libohos_compat.so" ./test/smoke
 
   release:
-    needs: [build, smoke-test]
+    needs: build
     runs-on: ubuntu-latest
     if: github.event_name == 'release'
     steps:
@@ -81,9 +88,11 @@ jobs:
 
   publish-npm:
     name: Publish @ohos-ports/compat-shim
-    needs: [build, smoke-test]
+    needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'release'
+    # Opt-in: set the repository variable PUBLISH_NPM=true and the NPM_TOKEN
+    # secret. Skipped by default; the package has never been published.
+    if: github.event_name == 'release' && vars.PUBLISH_NPM == 'true'
     permissions:
       id-token: write
     steps:
@@ -101,7 +110,10 @@ jobs:
           registry-url: https://registry.npmjs.org/
 
       - name: Prune smoke test binary from the npm payload
-        run: rm -f lib/smoke
+        run: rm -rf lib/test
+
+      - name: Set the package version from the release tag
+        run: npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
 
       - name: Publish to npm
         env:
