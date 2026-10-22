@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   build:
-    name: Build (musl + glibc)
+    name: Build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -28,29 +28,5 @@ jobs:
       - name: Setup OpenHarmony SDK
         uses: Boshen/setup-ohos-sdk@edb865a89a712f1f15dbad932dfa9cfce849d95c # v1.0.0
 
-      - name: make (musl library, tests and diagnostics)
+      - name: make (library, tests and diagnostics)
         run: make OHOS_NDK_HOME="${OHOS_SDK_NATIVE}" all
-
-      # `make glibc` also signs with the on-device binary-sign-tool, which a
-      # cloud runner does not have; build the same artifact without signing.
-      - name: Install aarch64 glibc headers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libc6-dev-arm64-cross
-
-      - name: make libohos_compat_glibc.so (glibc library)
-        run: |
-          make OHOS_NDK_HOME="${OHOS_SDK_NATIVE}" GLIBC_PREFIX=/usr/aarch64-linux-gnu libohos_compat_glibc.so
-
-      # The glibc preload is -nostdlib and must resolve every import against
-      # the runtime glibc. These two compiled fine but failed to load on
-      # Harmonybrew's glibc 2.39, so keep them from coming back.
-      - name: Check glibc library imports
-        run: |
-          readelf="${OHOS_SDK_NATIVE}/llvm/bin/llvm-readelf"
-          undefined="$("${readelf}" --dyn-syms -W libohos_compat_glibc.so | awk '$7 == "UND" {print $8}')"
-          echo "${undefined}"
-          if echo "${undefined}" | grep -E '^(__isoc23_|pthread_atfork)'; then
-            echo "::error::libohos_compat_glibc.so imports a symbol Harmonybrew's glibc does not export"
-            exit 1
-          fi

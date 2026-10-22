@@ -19,6 +19,3 @@ logs/data-*
 logs/delprobe-run/
 logs/fixed-run*/
 logs/ab/
-
-# Kernel header symlinks created by `make libohos_compat_glibc.so`
-build/
