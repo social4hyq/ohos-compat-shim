@@ -2,7 +2,7 @@
 
 用于 HarmonyOS / OpenHarmony 应用沙箱内 **动态链接的 aarch64/musl 程序**的 `LD_PRELOAD` 兼容库。它拦截部分 libc 函数和 `syscall()` 调用，在已知系统行为不兼容时尝试安全降级；不修改目标程序本身。
 
-设备、系统版本和沙箱策略会影响哪些修复仍然需要。安装后可运行 `ohos-shim check` 检查当前设备。完整的可拦截性分析见 [ohos-preload-shim-feasibility.md](../ohos-preflight/docs/ohos-preload-shim-feasibility.md)，各拦截点的去留依据见[审计记录](logs/polyfill-audit/verdicts.md)。
+设备、系统版本和沙箱策略会影响哪些修复仍然需要。安装后可运行 `ohos-shim check` 检查当前设备。各拦截点的去留依据见[审计记录](logs/polyfill-audit/verdicts.md)；更完整的可拦截性分析在本仓库之外的 ohos-preflight 工程里，不随本仓库发布。
 
 ## 支持的拦截点
 
@@ -17,10 +17,12 @@
 | `syscall(SYS_fchmodat2)` | 系统调用不可用时回退到 `fchmodat` | 保留 `AT_SYMLINK_NOFOLLOW`；不支持 `AT_EMPTY_PATH` 等无法由旧接口表达的标志 |
 | `splice` | 修正源端 EOF 被报为 `EPIPE`；向管道写入时使用缓冲复制以唤醒 poll/epoll 等待者 | 管道路径放弃零拷贝；真实目标端错误仍返回错误 |
 | epoll `EPOLLONESHOT` | 修正 FIFO 或 TTY/PTY 写端重复投递 `EPOLLOUT` 的已观察问题 | 对未登记的原始 syscall 调用，部分行为按事件形状识别 |
-| 标准流 COPY relocation | 避免特定预编译 musl 程序因标准流符号导致的启动崩溃 | 已确认加载本库可规避该崩溃，但具体生效机制尚未完全定位 |
+| 标准流 COPY relocation | 避免特定预编译 musl 程序因标准流符号导致的启动崩溃 | 在 claude-code 2.1.306 上实测，关闭该拦截点或只加载空的 `.so` 都会重现崩溃，显式补丁就是修复本身；更早的 2.1.283 上曾观察到关闭后仍正常，见[审计记录](logs/polyfill-audit/verdicts.md) |
 | `getaddrinfo` | 对非法主机名先本地快速拒绝；异步探测原生解析器行为 | 探测在进程首次调用 `getaddrinfo()` 时启动，不阻塞该次查询 |
 
 `pthread_cancel()` 在目标 musl 环境中是空桩实现，无法由 preload 库补入调用方缺少的协作式取消点，因此不在本项目处理范围内。已经移除的探针和修复见[审计记录](logs/polyfill-audit/verdicts.md)。
+
+除上表外，库加载时还会在 `TMPDIR` 未设置时把它默认设为 `/data/storage/el2/base/cache`（沙箱内 `/tmp` 只读）；已设置的值不会被改动。这一步无条件执行，没有对应的开关。
 
 ## 安装与使用
 
@@ -56,7 +58,13 @@ ohos-shim -- real-binary arg1 arg2
 export OHOS_COMPAT_SHIM_DISABLE=tmpfile,link
 ```
 
-可用名称：`close_range`、`getpwuid_r`、`tmpfile`、`fchmodat2`、`linkat`、`link`、`splice`、`epoll_pipe`、`getaddrinfo`、`std_streams`。没有对应的 `ENABLE` 变量；默认全部开启。关闭 `linkat`/`link` 可避免使用有损语义的复制降级；关闭 `close_range` 则可能让原调用再次触发 `SIGSYS`。
+可用名称共 10 个：`close_range`、`getpwuid_r`、`tmpfile`、`fchmodat2`、`linkat`、`link`、`splice`、`epoll_pipe`、`getaddrinfo`、`std_streams`。没有对应的 `ENABLE` 变量；默认全部开启。关闭 `linkat`/`link` 可避免使用有损语义的复制降级；关闭 `close_range` 则可能让原调用再次触发 `SIGSYS`。
+
+`ohos-shim check` 的行名与开关名并不总是一一对应：
+
+- `splice_eof`（EOF 被报为 `EPIPE`）和 `splice_wakeup`（写管道不唤醒 poll/epoll）是 `splice` 开关下的两个子检查，**没有独立开关**，只能用 `splice` 一起关闭。汇总行 `splice` 才对应开关：任一子检查复现即判"仍需要"；两项都没复现时也只会判"不确定"，不会判"可关闭"，因为唤醒问题是间歇性的，单次干净不代表已修复。
+- `std_streams` 有开关，但 `check` 的探针二进制没有 COPY relocation，只能报"不确定"，**不会出现在建议关闭的名单里**；是否需要只能用官方预编译二进制手工 A/B。
+- 其余行（`close_range`、`fchmodat2`、`getpwuid_r`、`tmpfile`、`linkat`、`link`、`epoll_pipe`、`getaddrinfo`）与开关同名。
 
 ## 检查当前设备
 
@@ -75,11 +83,12 @@ ohos-shim check --with-shim         # 同时检查加载 shim 后的结果
 - **可关闭**：基线行为正常，可考虑通过 `OHOS_COMPAT_SHIM_DISABLE` 关闭。
 - **不确定**：有限轮检查没有足够证据。未复现间歇性问题不等于系统已修复。
 
-`ohos-shim check` 还会报告若干相关平台能力，但这些项目不属于本 shim 的修复范围。详细平台矩阵见 [ohos-preflight](../ohos-preflight/docs/ohos-preload-shim-feasibility.md)。
+`ohos-shim check` 还会报告若干相关平台能力，但这些项目不属于本 shim 的修复范围。详细平台矩阵在本仓库之外的 ohos-preflight 工程里。
 
 ## 适用边界
 
 - 仅适用于动态链接程序；静态链接程序不会加载 `LD_PRELOAD` 库。
+- 仅提供 musl 构建。v0.8.0 和 v0.8.1 曾附带 glibc 变体（`libohos_compat_glibc.so`），v0.8.2 起已移除；需要的话停留在 v0.8.1。
 - 直接通过内联汇编发起、绕过可拦截符号的系统调用不受通用 libc 拦截覆盖，需在源码层处理。
 - `linkat`/`link` 的复制回退不保留硬链接语义；只应在原生调用因沙箱权限失败时作为兼容回退。
 - `fchmodat2` 回退只能表达旧 `fchmodat` 接口支持的语义。
@@ -103,7 +112,7 @@ make clean
 
 编译器优先使用 OHOS NDK 的 `llvm/bin/cc`，不存在时使用 `llvm/bin/clang`；不会回退到宿主机 PATH 中的编译器。可通过 `OHOS_NDK_HOME` 指定 SDK 根目录，也可通过 `OHOS_CC` 指定 NDK 中的编译器。需要执行测试的目标只签名各自用到的产物；`make sign` 会构建并签名全部目标。
 
-`make smoke`、`make functional` 和 `make bench` 会显式清除基线进程的 `LD_PRELOAD`，避免继承 shell 环境中已有的预加载库。`make ghost` 是使用模拟 epoll 实现的状态机测试，不是内核故障注入。发布工作流复用 Makefile 编译共享库和 smoke 程序，在云端签名后以真机 smoke 检查作为发布门禁。
+`make smoke`、`make functional` 和 `make bench` 会显式清除基线进程的 `LD_PRELOAD`，避免继承 shell 环境中已有的预加载库。`make ghost` 是使用模拟 epoll 实现的状态机测试，不是内核故障注入。发布工作流复用 Makefile 在云端编译并签名共享库；云端不能执行 OHOS 二进制，仓库也没有真机 runner，所以发版前的真机检查是在设备上手动跑 `make smoke` 和 `make functional`。工作流里的真机 smoke job 仅在手动触发并勾选 `device_smoke` 时运行。
 
 历史设备验证见[审计记录](logs/polyfill-audit/verdicts.md)和[epoll ONESHOT 调查](logs/2026-09-27-claude-code-musl-idle-spin.md)；这些结果不保证适用于其他设备。
 
