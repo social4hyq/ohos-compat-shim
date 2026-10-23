@@ -1017,7 +1017,7 @@ static void probe_splice(void)
 
 /* Real getaddrinfo() with a hostname carrying a character outside the
  * DNS/hostname alphabet (matching the shim's own hostname_has_invalid_chars()
- * gate: a-z A-Z 0-9 . - _ % :). glibc rejects these locally (EAI_NONAME,
+ * gate: a-z A-Z 0-9 . - _ % :). A resolver that checks the name rejects these locally (EAI_NONAME,
  * sub-millisecond); a resolver that instead forwards them to the network
  * hangs until the query times out. Run with a wall-clock deadline -- a
  * still-broken resolver on some device could take longer than any fixed
@@ -1060,7 +1060,7 @@ static void probe_getaddrinfo_badchars(void)
 	} else if (res.rc != 0 && elapsed_ms < GAI_BADCHARS_SLOW_MS) {
 		r->verdict = V_DROPPABLE;
 		snprintf(r->note, sizeof(r->note),
-			"Rejected locally in %d ms (%s), consistent with glibc",
+			"Rejected locally in %d ms (%s), consistent with a local name check",
 			elapsed_ms, gai_strerror(res.rc));
 	} else {
 		r->verdict = V_NEEDED;
@@ -1490,7 +1490,7 @@ static void run_b_group_probes(void)
 		"which LD_PRELOAD cannot intercept; requires a platform fix or source changes", child_openat2);
 	probe_b_generic("epoll_pwait2", "Nanosecond timeout in Bun's event loop; raw syscall",
 		child_epoll_pwait2);
-	probe_b_generic("clone3", "Preferred process creation interface in glibc and some toolchains", child_clone3);
+	probe_b_generic("clone3", "Preferred process creation interface in newer C libraries and some toolchains", child_clone3);
 	probe_b_generic("statx", "Extended stat information", child_statx);
 	probe_b_generic("renameat2", "Atomic rename / RENAME_NOREPLACE", child_renameat2);
 	probe_b_generic("copy_file_range", "In-kernel file copy", child_copy_file_range);
