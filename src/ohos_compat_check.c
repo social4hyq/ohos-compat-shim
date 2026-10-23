@@ -1084,11 +1084,12 @@ static void probe_getaddrinfo_badchars(void)
  * this probe can't actually test would be worse than admitting the gap.
  *
  * Does carry OHOS_COMPAT_SHIM_DISABLE=std_streams like every other
- * interceptor (SD_STD_STREAMS), but has_disable_flag stays 0 here: a
- * manual A/B found that disabling it does NOT restore the crash with the
- * shipped shim (see the README row) -- the toggle exists and is honored by
- * the code, but this check can't validate its real-world effect, so it
- * would be misleading to suggest it either way.
+ * interceptor (SD_STD_STREAMS), but has_disable_flag stays 0 here: this
+ * probe cannot test the real trigger, so it must never suggest disabling
+ * it. The manual A/B on claude-code 2.1.306 shows the explicit patch is the
+ * fix itself: the crash returns with the toggle off and with an empty
+ * preload. (An earlier A/B on 2.1.283 did not show that; see
+ * logs/polyfill-audit/verdicts.md.)
  */
 static void probe_std_streams(void)
 {
