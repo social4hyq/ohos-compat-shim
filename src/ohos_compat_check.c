@@ -1100,7 +1100,7 @@ static void probe_std_streams(void)
 	snprintf(r->note, sizeof(r->note),
 		"This probe binary has no R_AARCH64_COPY relocation to trigger the issue. "
 		"Cannot determine here; manually A/B test the official prebuilt claude-code binary "
-		"(see the std_streams section in README).");
+		"(see the std_streams row in the README interceptor table).");
 }
 
 static void run_a_group_probes(void)
