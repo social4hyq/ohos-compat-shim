@@ -88,7 +88,6 @@ ohos-shim check --with-shim         # 同时检查加载 shim 后的结果
 ## 适用边界
 
 - 仅适用于动态链接程序；静态链接程序不会加载 `LD_PRELOAD` 库。
-- 仅提供 musl 构建。v0.8.0 和 v0.8.1 曾附带 glibc 变体（`libohos_compat_glibc.so`），v0.8.2 起已移除；需要的话停留在 v0.8.1。
 - 直接通过内联汇编发起、绕过可拦截符号的系统调用不受通用 libc 拦截覆盖，需在源码层处理。
 - `linkat`/`link` 的复制回退不保留硬链接语义；只应在原生调用因沙箱权限失败时作为兼容回退。
 - `fchmodat2` 回退只能表达旧 `fchmodat` 接口支持的语义。

@@ -192,8 +192,8 @@ static int shim_disabled(int bit)
 /*
  * Dynamically-linked musl executables that reference stdout/stderr/stdin
  * get R_AARCH64_COPY relocations whose dynsym entries also *define* the
- * symbol at the copy target (a .bss slot) in the executable. glibc's ld.so
- * resolves the copy against the libc definition, but HarmonyOS's musl
+ * symbol at the copy target (a .bss slot) in the executable. A conforming
+ * dynamic linker resolves the copy against the libc definition, but HarmonyOS's musl
  * ld.so resolves it against the executable's own definition — an 8-byte
  * self-copy that leaves the slot at its .bss initial value NULL. The first
  * stdio call (e.g. bun's setvbuf(stdout, NULL, _IOLBF, 0)) then dies in
@@ -223,7 +223,7 @@ struct std_fixup {
 };
 
 /* dl_iterate_phdr visits the main program first; on musl its dlpi_name is
- * the exe path rather than glibc's "", so track the first reported phdr
+ * the exe path rather than an empty string, so track the first reported phdr
  * pointer instead of comparing names. */
 static int phdr_is_main_exe(const struct dl_phdr_info *info)
 {
@@ -990,7 +990,7 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
 /*     rejects a synthetic invalid hostname fast, this interceptor       */
 /*     becomes a pure passthrough for the rest of the process's life.    */
 /*     Until the probe resolves (or if it confirms the slow behavior),   */
-/*     a local syntax pre-check matching glibc's accepted alphabet       */
+/*     a local syntax pre-check matching the accepted hostname alphabet  */
 /*     stands in. Disable via OHOS_COMPAT_SHIM_DISABLE=getaddrinfo       */
 /*     (skips both the probe and the pre-check).                        */
 /* ==================================================================== */
@@ -1570,9 +1570,8 @@ static pthread_mutex_t g_ep_pipes_lock = PTHREAD_MUTEX_INITIALIZER;
  * epoll_pwait returns/s, 100% pure EPOLLOUT, on the official
  * claude-code linux-arm64-musl binary; see
  * logs/2026-09-27-claude-code-musl-idle-spin.md). EPOLLIN-bearing
- * registrations are deliberately NOT enforcement-eligible: they are the
- * existing synthesis repair's domain and no re-fire storm was ever
- * observed in that direction. */
+ * registrations are deliberately NOT enforcement-eligible: no re-fire
+ * storm was ever observed in that direction. */
 static int ep_reg_oneshot_watch(const ep_pipe_reg_t *r)
 {
 	return (r->ev.events & (EPOLLOUT | EPOLLONESHOT)) ==
@@ -1649,7 +1648,7 @@ static long long ep_now_ms(void)
  * down further. The CPU saving comes from not waking ~65k times/s, not
  * from a long sleep, so the cap is kept low: every sleep is added to the
  * keystroke-to-echo latency while a storm is active (a 32ms cap added
- * ~20ms on a glibc claude-code TUI, 8ms keeps idle CPU just as low). */
+ * ~20ms on a claude-code TUI, 8ms keeps idle CPU just as low). */
 #define EP_GHOST_SLEEP_MAX_NS 8000000LL
 #define EP_GHOST_STREAK_CAP 2 /* 2ms << 2 == 8ms == the cap above */
 
@@ -1780,8 +1779,8 @@ static void ep_storm_observe(int epfd, uint64_t data, int *suppress)
  * shim entry point can run there, so reinitializing unconditionally here is
  * safe even though the mutex was never destroyed -- POSIX doesn't strictly
  * sanction re-init of a non-destroyed mutex, but this is the standard,
- * widely-used pattern for exactly this problem (glibc's own malloc arena
- * locks do the same via their fork handlers). Registrations don't survive
+ * widely-used pattern for exactly this problem (allocators reset their
+ * arena locks the same way via fork handlers). Registrations don't survive
  * fork meaningfully anyway (the child's epfds/pipe fds are the same numbers
  * but a fresh execve is coming right behind close_range's cleanup in the
  * common case), so clearing the table alongside the lock is correct, not
