@@ -1017,7 +1017,7 @@ static void probe_splice(void)
 
 /* Real getaddrinfo() with a hostname carrying a character outside the
  * DNS/hostname alphabet (matching the shim's own hostname_has_invalid_chars()
- * gate: a-z A-Z 0-9 . - _ % :). A resolver that checks the name rejects these locally (EAI_NONAME,
+ * gate: an ASCII byte other than a-z A-Z 0-9 . - _ % :). A resolver that checks the name rejects these locally (EAI_NONAME,
  * sub-millisecond); a resolver that instead forwards them to the network
  * hangs until the query times out. Run with a wall-clock deadline -- a
  * still-broken resolver on some device could take longer than any fixed

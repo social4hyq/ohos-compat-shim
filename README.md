@@ -18,7 +18,7 @@
 | `splice` | 修正源端 EOF 被报为 `EPIPE`；向管道写入时使用缓冲复制以唤醒 poll/epoll 等待者 | 管道路径放弃零拷贝；真实目标端错误仍返回错误 |
 | epoll `EPOLLONESHOT` | 修正 FIFO 或 TTY/PTY 写端重复投递 `EPOLLOUT` 的已观察问题 | 对未登记的原始 syscall 调用，部分行为按事件形状识别 |
 | 标准流 COPY relocation | 避免特定预编译 musl 程序因标准流符号导致的启动崩溃 | 在 claude-code 2.1.306 上实测，关闭该拦截点或只加载空的 `.so` 都会重现崩溃，显式补丁就是修复本身；更早的 2.1.283 上曾观察到关闭后仍正常，见[审计记录](logs/polyfill-audit/verdicts.md) |
-| `getaddrinfo` | 对非法主机名先本地快速拒绝；异步探测原生解析器行为 | 探测在进程首次调用 `getaddrinfo()` 时启动，不阻塞该次查询 |
+| `getaddrinfo` | 对含 ASCII 非法字符的主机名先本地快速拒绝；异步探测原生解析器行为 | 非 ASCII 字节（原始 UTF-8 名字）不拦截，交给解析器；探测在进程首次调用 `getaddrinfo()` 时启动，不阻塞该次查询 |
 
 `pthread_cancel()` 在目标 musl 环境中是空桩实现，无法由 preload 库补入调用方缺少的协作式取消点，因此不在本项目处理范围内。已经移除的探针和修复见[审计记录](logs/polyfill-audit/verdicts.md)。
 
