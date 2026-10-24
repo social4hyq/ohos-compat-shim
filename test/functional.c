@@ -21,6 +21,9 @@
  *   8. epoll: EPOLLONESHOT|EPOLLOUT registrations on a FIFO/TTY write end
  *      are enforced (one delivery per arm) even though the kernel itself
  *      does not auto-disarm them.
+ *   9. getaddrinfo: a hostname with an invalid ASCII character is rejected
+ *      locally and fast; names with bytes >= 0x80 are not rejected by the
+ *      shim and still reach the real resolver.
  *
  * Run once without LD_PRELOAD and once with it (`make functional`).
  * Some checks only make sense — or only pass — under one of the two
@@ -32,6 +35,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
@@ -40,10 +44,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/epoll.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef __NR_close_range
@@ -709,6 +715,96 @@ static void test_getpwuid_r_idempotent(void)
 		     strcmp(pwd1.pw_dir, pwd2.pw_dir) == 0 &&
 		     pwd1.pw_uid == pwd2.pw_uid;
 	check(ok, "getpwuid_r_idempotent", "two calls return consistent data");
+}
+
+/* ==================================================================== */
+/*  getaddrinfo                                                          */
+/*                                                                        */
+/*  The shim's hostname pre-check runs before the real resolver, so a     */
+/*  name it rejects comes back as EAI_NONAME while a name it lets through */
+/*  reaches the real getaddrinfo(). To tell the two apart without any     */
+/*  DNS traffic, the high-byte checks pass an AI_* flag bit that does not  */
+/*  exist: the real resolver rejects it with EAI_BADFLAGS before looking   */
+/*  anything up, so EAI_BADFLAGS means "reached the resolver" and         */
+/*  EAI_NONAME means "rejected locally by the shim".                      */
+/* ==================================================================== */
+
+#define GAI_UNDEFINED_FLAG 0x40000000
+
+static int gai_call(const char *name, int flags, long *ms)
+{
+	struct addrinfo hints, *res = NULL;
+	struct timespec t0, t1;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_flags = flags;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	int rc = getaddrinfo(name, NULL, &hints, &res);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	if (rc == 0)
+		freeaddrinfo(res);
+	*ms = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+	return rc;
+}
+
+/* With the shim: a name containing an invalid ASCII character comes back
+ * as EAI_NONAME quickly. At baseline this takes seconds on a network whose
+ * DNS servers drop such queries, so a FAIL there is the defect being
+ * reproduced (on a network that answers quickly it also passes). */
+static void test_getaddrinfo_ascii_invalid_rejected_fast(void)
+{
+	long ms;
+	int rc = gai_call("bad host!", 0, &ms);
+	char detail[96];
+	snprintf(detail, sizeof(detail), "rc=%d (%s) in %ld ms (want EAI_NONAME, <500)",
+		 rc, gai_strerror(rc), ms);
+	check(rc == EAI_NONAME && ms < 500, "getaddrinfo_ascii_invalid_fast", detail);
+}
+
+/* Names with bytes >= 0x80 must not be rejected by the pre-check. Holds
+ * with or without the shim. */
+static void test_getaddrinfo_high_bytes_not_rejected(void)
+{
+	long ms;
+	if (gai_call("example.com", GAI_UNDEFINED_FLAG, &ms) != EAI_BADFLAGS) {
+		printf("SKIP  %-28s resolver does not reject an undefined flag first\n",
+		       "getaddrinfo_high_bytes");
+		return;
+	}
+	static const char *names[] = {
+		"\xe4\xbe\x8b\xe5\xad\x90.com",	/* UTF-8 CJK label */
+		"caf\xc3\xa9.example",		/* UTF-8 accented label */
+		"\xff",				/* lone high byte */
+	};
+	int ok = 1;
+	char detail[96] = "";
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		int rc = gai_call(names[i], GAI_UNDEFINED_FLAG, &ms);
+		if (rc != EAI_BADFLAGS) {
+			ok = 0;
+			snprintf(detail, sizeof(detail), "name #%zu: rc=%d (%s), want EAI_BADFLAGS",
+				 i, rc, gai_strerror(rc));
+			break;
+		}
+	}
+	if (ok)
+		snprintf(detail, sizeof(detail), "3 high-byte names reached the real resolver");
+	check(ok, "getaddrinfo_high_bytes", detail);
+}
+
+/* An invalid ASCII character mixed with high bytes is still rejected, so
+ * the relaxed pre-check did not turn into "any high byte disables it".
+ * No undefined flag here: the shim switches the pre-check off on a network
+ * whose resolver already rejects fast, and in that case the real resolver's
+ * quick EAI_NONAME is the same outcome. Like the ASCII case, this takes
+ * seconds at baseline on a network that drops such queries. */
+static void test_getaddrinfo_mixed_still_rejected(void)
+{
+	long ms;
+	int rc = gai_call("\xe4\xbe\x8b bad!.com", 0, &ms);
+	char detail[96];
+	snprintf(detail, sizeof(detail), "rc=%d (%s) in %ld ms (want EAI_NONAME, <500)",
+		 rc, gai_strerror(rc), ms);
+	check(rc == EAI_NONAME && ms < 500, "getaddrinfo_mixed", detail);
 }
 
 /* ==================================================================== */
@@ -1439,6 +1535,10 @@ int main(void)
 
 	test_getpwuid_r_erange();
 	test_getpwuid_r_idempotent();
+
+	test_getaddrinfo_ascii_invalid_rejected_fast();
+	test_getaddrinfo_high_bytes_not_rejected();
+	test_getaddrinfo_mixed_still_rejected();
 
 	test_tmpfile_roundtrip();
 	test_tmpfile_concurrent_no_crosstalk();

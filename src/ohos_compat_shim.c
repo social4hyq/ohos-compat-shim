@@ -990,7 +990,8 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
 /*     rejects a synthetic invalid hostname fast, this interceptor       */
 /*     becomes a pure passthrough for the rest of the process's life.    */
 /*     Until the probe resolves (or if it confirms the slow behavior),   */
-/*     a local syntax pre-check matching the accepted hostname alphabet  */
+/*     a local syntax pre-check for ASCII bytes outside the hostname     */
+/*     alphabet (bytes >= 0x80 are passed through to the resolver)       */
 /*     stands in. Disable via OHOS_COMPAT_SHIM_DISABLE=getaddrinfo       */
 /*     (skips both the probe and the pre-check).                        */
 /* ==================================================================== */
@@ -1007,10 +1008,16 @@ static getaddrinfo_fn gai_real(void)
 	return g_real_getaddrinfo;
 }
 
+/* Only ASCII bytes outside the hostname alphabet count as invalid. Bytes
+ * >= 0x80 (raw UTF-8 names) are left to the real resolver: some DNS servers
+ * answer such queries, so rejecting them here could hide a name that would
+ * have resolved. */
 static int hostname_has_invalid_chars(const char *node)
 {
 	for (const unsigned char *p = (const unsigned char *)node; *p; p++) {
 		unsigned char c = *p;
+		if (c >= 0x80)
+			continue;
 		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 		    (c >= '0' && c <= '9') || c == '.' || c == '-' ||
 		    c == '_' || c == '%' || c == ':')
