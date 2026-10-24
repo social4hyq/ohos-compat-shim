@@ -1,0 +1,120 @@
+1	direct	native	bad host!	4038	-2
+1	direct	native	nonexistent-gai-test.invalid	113	-2
+1	direct	native	example.com	0	0
+1	direct	shim	bad host!	0	-2
+1	proxy	native	bad host!	4035	-2
+1	proxy	native	nonexistent-gai-test.invalid	101	-2
+1	proxy	native	example.com	0	0
+1	proxy	shim	bad host!	0	-2
+2	proxy	native	bad host!	3733	-2
+2	proxy	native	nonexistent-gai-test.invalid	105	-2
+2	proxy	native	example.com	0	0
+2	proxy	shim	bad host!	0	-2
+2	direct	native	bad host!	3575	-2
+2	direct	native	nonexistent-gai-test.invalid	95	-2
+2	direct	native	example.com	0	0
+2	direct	shim	bad host!	0	-2
+3	direct	native	bad host!	3677	-2
+3	direct	native	nonexistent-gai-test.invalid	93	-2
+3	direct	native	example.com	0	0
+3	direct	shim	bad host!	0	-2
+3	proxy	native	bad host!	3718	-2
+3	proxy	native	nonexistent-gai-test.invalid	98	-2
+3	proxy	native	example.com	0	0
+3	proxy	shim	bad host!	0	-2
+4	proxy	native	bad host!	3689	-2
+4	proxy	native	nonexistent-gai-test.invalid	101	-2
+4	proxy	native	example.com	0	0
+4	proxy	shim	bad host!	0	-2
+4	direct	native	bad host!	3656	-2
+4	direct	native	nonexistent-gai-test.invalid	89	-2
+4	direct	native	example.com	0	0
+4	direct	shim	bad host!	0	-2
+5	direct	native	bad host!	3708	-2
+5	direct	native	nonexistent-gai-test.invalid	103	-2
+5	direct	native	example.com	1	0
+5	direct	shim	bad host!	0	-2
+5	proxy	native	bad host!	4049	-2
+5	proxy	native	nonexistent-gai-test.invalid	100	-2
+5	proxy	native	example.com	0	0
+5	proxy	shim	bad host!	0	-2
+6	proxy	native	bad host!	3738	-2
+6	proxy	native	nonexistent-gai-test.invalid	97	-2
+6	proxy	native	example.com	1	0
+6	proxy	shim	bad host!	0	-2
+6	direct	native	bad host!	3684	-2
+6	direct	native	nonexistent-gai-test.invalid	95	-2
+6	direct	native	example.com	0	0
+6	direct	shim	bad host!	0	-2
+7	direct	native	bad host!	3763	-2
+7	direct	native	nonexistent-gai-test.invalid	93	-2
+7	direct	native	example.com	1	0
+7	direct	shim	bad host!	0	-2
+7	proxy	native	bad host!	4042	-2
+7	proxy	native	nonexistent-gai-test.invalid	209	-2
+7	proxy	native	example.com	3	0
+7	proxy	shim	bad host!	0	-2
+8	proxy	native	bad host!	4048	-2
+8	proxy	native	nonexistent-gai-test.invalid	94	-2
+8	proxy	native	example.com	0	0
+8	proxy	shim	bad host!	0	-2
+8	direct	native	bad host!	3741	-2
+8	direct	native	nonexistent-gai-test.invalid	104	-2
+8	direct	native	example.com	1	0
+8	direct	shim	bad host!	0	-2
+9	direct	native	bad host!	3678	-2
+9	direct	native	nonexistent-gai-test.invalid	96	-2
+9	direct	native	example.com	1	0
+9	direct	shim	bad host!	0	-2
+9	proxy	native	bad host!	4035	-2
+9	proxy	native	nonexistent-gai-test.invalid	88	-2
+9	proxy	native	example.com	1	0
+9	proxy	shim	bad host!	0	-2
+10	proxy	native	bad host!	3621	-2
+10	proxy	native	nonexistent-gai-test.invalid	108	-2
+10	proxy	native	example.com	1	0
+10	proxy	shim	bad host!	0	-2
+10	direct	native	bad host!	3637	-2
+10	direct	native	nonexistent-gai-test.invalid	102	-2
+10	direct	native	example.com	1	0
+10	direct	shim	bad host!	0	-2
+11	direct	native	bad host!	4027	-2
+11	direct	native	nonexistent-gai-test.invalid	91	-2
+11	direct	native	example.com	1	0
+11	direct	shim	bad host!	0	-2
+11	proxy	native	bad host!	3664	-2
+11	proxy	native	nonexistent-gai-test.invalid	90	-2
+11	proxy	native	example.com	1	0
+11	proxy	shim	bad host!	0	-2
+12	proxy	native	bad host!	3665	-2
+12	proxy	native	nonexistent-gai-test.invalid	98	-2
+12	proxy	native	example.com	0	0
+12	proxy	shim	bad host!	0	-2
+12	direct	native	bad host!	3691	-2
+12	direct	native	nonexistent-gai-test.invalid	94	-2
+12	direct	native	example.com	1	0
+12	direct	shim	bad host!	0	-2
+13	direct	native	bad host!	3688	-2
+13	direct	native	nonexistent-gai-test.invalid	91	-2
+13	direct	native	example.com	0	0
+13	direct	shim	bad host!	0	-2
+13	proxy	native	bad host!	4048	-2
+13	proxy	native	nonexistent-gai-test.invalid	253	-2
+13	proxy	native	example.com	0	0
+13	proxy	shim	bad host!	0	-2
+14	proxy	native	bad host!	4051	-2
+14	proxy	native	nonexistent-gai-test.invalid	97	-2
+14	proxy	native	example.com	1	0
+14	proxy	shim	bad host!	0	-2
+14	direct	native	bad host!	4048	-2
+14	direct	native	nonexistent-gai-test.invalid	99	-2
+14	direct	native	example.com	0	0
+14	direct	shim	bad host!	0	-2
+15	direct	native	bad host!	3630	-2
+15	direct	native	nonexistent-gai-test.invalid	117	-2
+15	direct	native	example.com	0	0
+15	direct	shim	bad host!	0	-2
+15	proxy	native	bad host!	4047	-2
+15	proxy	native	nonexistent-gai-test.invalid	99	-2
+15	proxy	native	example.com	0	0
+15	proxy	shim	bad host!	0	-2

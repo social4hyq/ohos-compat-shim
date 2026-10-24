@@ -1,0 +1,15 @@
+# python3 -I dnsq.py 6   (raw UDP queries, 6 each, 6 s timeout)
+114.114.114.114  bad host!                      answered=0/6  rtt_ms=-  {'TIMEOUT': 6}
+114.114.114.114  nonexistent-gai-test.invalid   answered=6/6  rtt_ms=34..40  {'NXDOMAIN': 6}
+114.114.114.114  example.com                    answered=6/6  rtt_ms=33..39  {'NOERROR': 6}
+8.8.8.8          bad host!                      answered=0/6  rtt_ms=-  {'TIMEOUT': 6}
+8.8.8.8          nonexistent-gai-test.invalid   answered=6/6  rtt_ms=184..538  {'NXDOMAIN': 6}
+8.8.8.8          example.com                    answered=6/6  rtt_ms=282..719  {'NOERROR': 6}
+
+# raw UTF-8 label "例子.com", 3 queries each
+114.114.114.114 : TIMEOUT, TIMEOUT, TIMEOUT
+8.8.8.8         : 471ms NXDOMAIN, 512ms NXDOMAIN, 513ms NXDOMAIN
+
+# through getaddrinfo (gai_once "例子.com"), installed 0.8.3 library
+native: 4010 ms rc=-3   shim: 0 ms rc=-2
+native: 4087 ms rc=-3   shim: 0 ms rc=-2
