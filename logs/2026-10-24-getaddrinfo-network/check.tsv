@@ -1,0 +1,10 @@
+1	direct	NEEDED | Returned after 4035 ms (rc=-2); likely forwarded to the network instead of rejecting locally
+1	proxy	NEEDED | Returned after 4044 ms (rc=-2); likely forwarded to the network instead of rejecting locally
+2	proxy	NEEDED | Returned after 4051 ms (rc=-2); likely forwarded to the network instead of rejecting locally
+2	direct	NEEDED | Returned after 4055 ms (rc=-2); likely forwarded to the network instead of rejecting locally
+3	direct	NEEDED | Returned after 4127 ms (rc=-2); likely forwarded to the network instead of rejecting locally
+3	proxy	NEEDED | Returned after 4143 ms (rc=-2); likely forwarded to the network instead of rejecting locally
+4	proxy	NEEDED | Returned after 4075 ms (rc=-2); likely forwarded to the network instead of rejecting locally
+4	direct	NEEDED | Returned after 4116 ms (rc=-2); likely forwarded to the network instead of rejecting locally
+5	direct	NEEDED | Returned after 4101 ms (rc=-2); likely forwarded to the network instead of rejecting locally
+5	proxy	NEEDED | Returned after 4079 ms (rc=-2); likely forwarded to the network instead of rejecting locally
